@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JobScan</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <h1>JobScan</h1>
+  <nav class="counts">
+    <a href="/?status=new" class="{{ 'on' if params.status=='new' }}">review <b>{{ counts.new }}</b></a>
+    <a href="/?status=applied" class="{{ 'on' if params.status=='applied' }}">applied <b>{{ counts.applied }}</b></a>
+    <a href="/?status=interviewing" class="{{ 'on' if params.status=='interviewing' }}">interviewing <b>{{ counts.interviewing }}</b></a>
+    <a href="/?status=skip" class="{{ 'on' if params.status=='skip' }}">skip <b>{{ counts.skip }}</b></a>
+    <a href="/?status=rejected" class="{{ 'on' if params.status=='rejected' }}">rejected <b>{{ counts.rejected }}</b></a>
+    <a href="/?status=all" class="{{ 'on' if params.status=='all' }}">all <b>{{ total_roles }}</b></a>
+  </nav>
+  <div class="runinfo">
+    {% if run %}
+      last scan {{ run.run_at[:16] }} · fetched {{ run.n_fetched }} · new {{ run.n_new }}
+      {% if run.n_errors %}<span class="err" title="{% for k,v in run.details.items() %}{% if v.error is defined %}{{ k }}: {{ v.error }}&#10;{% endif %}{% endfor %}">· {{ run.n_errors }} fetch error(s)</span>{% endif %}
+    {% else %}
+      no scan yet — run <code>python -m app.scan</code>
+    {% endif %}
+  </div>
+</header>
+
+<details class="settings">
+  <summary>⚙ hidden companies ({{ applied_companies|length }})</summary>
+  <div class="co-chips">
+    {% for c in applied_companies %}
+      <span class="chip">{{ c }} <button class="co-remove" data-name="{{ c }}" title="unhide">×</button></span>
+    {% else %}<span class="dim">none — add a company to hide all its roles</span>{% endfor %}
+    <form id="add-co"><input placeholder="company name…"><button>hide</button></form>
+  </div>
+</details>
+
+<form id="filters" method="get" action="/">
+  <input type="hidden" name="status" value="{{ params.status }}">
+  <input name="q" value="{{ params.q }}" placeholder="search company / title…">
+  <select name="company">
+    <option value="">company: all</option>
+    {% for c in companies %}<option value="{{ c }}" {{ 'selected' if params.company==c }}>{{ c }}</option>{% endfor %}
+  </select>
+  <select name="seen">
+    {% for v, label in [('all','seen: any time'), ('today','new today'), ('week','this week')] %}
+      <option value="{{ v }}" {{ 'selected' if params.seen==v }}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  <select name="verdict">
+    <option value="">verdict: all</option>
+    {% for v in ['strong','consider','weak'] %}<option value="{{ v }}" {{ 'selected' if params.verdict==v }}>{{ v }}</option>{% endfor %}
+  </select>
+  <select name="seniority">
+    <option value="">level: all</option>
+    <option value="mid" {{ 'selected' if params.seniority=='mid' }}>mid</option>
+    <option value="senior" {{ 'selected' if params.seniority=='senior' }}>senior</option>
+  </select>
+  <select name="remote">
+    <option value="">location: all</option>
+    <option value="remote" {{ 'selected' if params.remote=='remote' }}>remote only</option>
+  </select>
+  <input name="min_score" type="number" min="0" max="100" step="5" value="{{ params.min_score }}" placeholder="min score">
+  <select name="sort">
+    {% for v, label in [('score','sort: score'), ('first_seen','sort: newest'), ('company','sort: company')] %}
+      <option value="{{ v }}" {{ 'selected' if params.sort==v }}>{{ label }}</option>
+    {% endfor %}
+  </select>
+  <button>filter</button>
+  <span class="dim">{{ rows|length }} shown · keys: j/k move · Enter JD · a applied · s skip · x rejected · i interviewing · n new</span>
+</form>
+
+<table id="roles">
+<thead><tr>
+  <th>company</th><th>title</th><th>location</th><th class="num">score</th>
+  <th>s·c·d·w</th><th>verdict</th><th>signals</th><th>seen</th><th>status</th><th>notes</th>
+</tr></thead>
+<tbody>
+{% for r in rows %}
+<tr data-job-id="{{ r.job_id }}">
+  <td class="co">{{ r.company }}</td>
+  <td class="title">
+    <span class="title-link" title="show JD">{{ r.title }}</span>
+    {% if r.seniority == 'senior' %}<span class="chip sr" title="senior-titled role">sr</span>{% endif %}
+    {% if r.badge_ref %}<span class="chip warn" title="you marked {{ r.badge_ref.status }} on the same title ({{ r.badge_ref.job_id }}{% if r.badge_ref.date %}, {{ r.badge_ref.date }}{% endif %})">⚠ applied before</span>{% endif %}
+    {% if r.hidden_company %}<span class="chip hide" title="company is in the hidden list">co-hidden</span>{% endif %}
+    {% if r.tailor_status and r.tailor_status != 'none' %}<span class="chip tailor">{{ r.tailor_status }}</span>{% endif %}
+    <a class="apply" href="{{ r.apply_url }}" target="_blank" rel="noopener" title="open application page">↗</a>
+  </td>
+  <td class="loc">{% if r.is_remote %}<span class="chip remote">remote</span>{% endif %}<span title="{{ r.location }}">{{ r.location|truncate(34, True) }}</span></td>
+  <td class="num score"><b>{{ '%.0f'|format(r.weighted_score or 0) }}</b></td>
+  <td class="chips" title="stability {{ r.s_stability }} · culture {{ r.s_culture }} · depth {{ r.s_depth }} · wlb {{ r.s_wlb }}">
+    {{ r.s_stability }}·{{ r.s_culture }}·{{ r.s_depth }}·{{ r.s_wlb }}
+  </td>
+  <td><span class="verdict v-{{ r.verdict }}">{{ r.verdict }}</span></td>
+  <td class="signals">
+    {% if r.why %}<div class="why" title="{{ r.why }}">{{ r.why|truncate(60, True) }}</div>{% endif %}
+    {% if r.caution %}<div class="caution" title="{{ r.caution }}">{{ r.caution|truncate(60, True) }}</div>{% endif %}
+  </td>
+  <td class="seen">{{ r.first_seen }}{% if r.first_seen == today %} <span class="chip new">today</span>{% endif %}</td>
+  <td class="actions">
+    <span class="status-chip" data-status="{{ r.status }}">{{ r.status }}</span>
+    <select class="variant" title="resume variant recorded when marking applied">
+      {% for v in resume_variants %}<option>{{ v }}</option>{% endfor %}
+    </select>
+    <button data-act="applied" title="mark applied (a)">✓</button>
+    <button data-act="skip" title="skip (s)">–</button>
+    <button data-act="rejected" title="rejected (x)">✕</button>
+    <select class="more" title="other status">
+      <option value=""></option>
+      <option value="interviewing">interviewing</option>
+      <option value="new">back to new</option>
+    </select>
+  </td>
+  <td class="notes-cell" title="click to edit notes">{{ r.notes or '+' }}</td>
+</tr>
+{% else %}
+<tr><td colspan="10" class="empty">nothing here — adjust filters, or run <code>python -m app.scan</code></td></tr>
+{% endfor %}
+</tbody>
+</table>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
