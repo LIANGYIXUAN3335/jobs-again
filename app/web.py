@@ -2,14 +2,17 @@
 Usage: python -m app.web  →  http://127.0.0.1:8787"""
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from . import config as cfgmod
-from . import store
+from . import ingest as ingestmod
+from . import store, tailoring
 
 cfg = cfgmod.load_config()
 app = FastAPI(title="JobScan")
@@ -75,6 +78,10 @@ class CompanyIn(BaseModel):
     name: str
 
 
+class QueueIn(BaseModel):
+    angle: str | None = None
+
+
 @app.post("/api/roles/{job_id}/status")
 def api_set_status(job_id: str, body: StatusIn, conn=Depends(view_conn)):
     if body.status not in store.STATUSES:
@@ -99,6 +106,36 @@ def api_get_role(job_id: str, conn=Depends(view_conn)):
     if not role:
         raise HTTPException(404, "unknown job_id")
     return role
+
+
+@app.post("/api/roles/{job_id}/queue-tailoring")
+def api_queue_tailoring(job_id: str, body: QueueIn, conn=Depends(view_conn)):
+    if not store.get_role(conn, job_id):
+        raise HTTPException(404, "unknown job_id")
+    try:
+        path = tailoring.write_prompt(cfg, conn, job_id, body.angle)
+    except FileNotFoundError:
+        raise HTTPException(500, f"base résumé missing ({tailoring.BASE_PATH})")
+    return {"ok": True, "prompt_path": str(path),
+            "hint": "open this file in VS Code and run Claude Code, then click Ingest"}
+
+
+@app.post("/api/ingest")
+def api_ingest(conn=Depends(view_conn)):
+    seen: dict = {}
+    n = ingestmod._scan_once(cfg, seen, force=True)
+    return {"ok": True, "ingested": n}
+
+
+@app.get("/api/roles/{job_id}/resume.pdf")
+def api_resume_pdf(job_id: str, conn=Depends(view_conn)):
+    role = store.get_role(conn, job_id)
+    if not role:
+        raise HTTPException(404, "unknown job_id")
+    p = role.get("tailored_resume_path")
+    if not p or not Path(p).exists():
+        raise HTTPException(404, "no tailored PDF yet")
+    return FileResponse(p, media_type="application/pdf", filename=Path(p).name)
 
 
 @app.get("/api/applied-companies")
