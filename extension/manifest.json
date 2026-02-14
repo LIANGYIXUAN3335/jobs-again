@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "JobScan Apply Helper",
+  "version": "0.1.0",
+  "description": "Pre-fills Greenhouse/Lever/Ashby application forms with your profile and the tailored résumé from your local JobScan. Stops before submit.",
+  "permissions": ["activeTab", "scripting"],
+  "host_permissions": [
+    "http://127.0.0.1:8787/*",
+    "http://localhost:8787/*",
+    "*://job-boards.greenhouse.io/*",
+    "*://boards.greenhouse.io/*",
+    "*://*.greenhouse.io/*",
+    "*://jobs.ashbyhq.com/*",
+    "*://jobs.lever.co/*",
+    "*://jobs.eu.lever.co/*"
+  ],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "JobScan Apply Helper" },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://job-boards.greenhouse.io/*",
+        "*://boards.greenhouse.io/*",
+        "*://jobs.ashbyhq.com/*",
+        "*://jobs.lever.co/*",
+        "*://jobs.eu.lever.co/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

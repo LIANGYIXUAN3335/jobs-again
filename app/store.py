@@ -347,6 +347,26 @@ def fetch_view(
     }
 
 
+def lookup_role_by_ids(conn: sqlite3.Connection, candidates: list[str]) -> dict | None:
+    """Find a role whose raw ATS id (last segment of job_id) matches any candidate
+    pulled from an application-page URL. Prefer one that already has a tailored PDF."""
+    hits = []
+    for cand in candidates:
+        for r in conn.execute(
+            "SELECT r.*, s.status AS own_status, s.tailor_status, s.tailored_resume_path"
+            " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
+            " WHERE r.job_id LIKE ?",
+            (f"%:{cand}",),
+        ):
+            hits.append(dict(r))
+    if not hits:
+        return None
+    hits.sort(key=lambda d: 0 if d.get("tailored_resume_path") else 1)
+    d = hits[0]
+    d["status"] = d.pop("own_status") or "new"
+    return d
+
+
 def get_role(conn: sqlite3.Connection, job_id: str) -> dict | None:
     r = conn.execute(
         "SELECT r.*, s.status AS own_status, s.notes, s.applied_date,"

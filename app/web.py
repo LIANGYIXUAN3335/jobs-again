@@ -2,9 +2,11 @@
 Usage: python -m app.web  →  http://127.0.0.1:8787"""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -16,6 +18,27 @@ from . import store, tailoring
 
 cfg = cfgmod.load_config()
 app = FastAPI(title="JobScan")
+# The browser extension's service worker calls this local API. Server binds 127.0.0.1
+# only, so a permissive CORS policy here is not remotely reachable.
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+)
+
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def url_candidates(url: str) -> list[str]:
+    """Raw ATS ids that might appear in an application-page URL."""
+    c: list[str] = []
+    for pat in (r"gh_jid=(\d+)", r"[?&]token=(\d+)", r"/jobs/(\d+)"):
+        c += re.findall(pat, url)
+    c += _UUID.findall(url)
+    seen, out = set(), []
+    for x in c:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 app.mount("/static", StaticFiles(directory=str(cfgmod.ROOT / "static")), name="static")
 templates = Jinja2Templates(directory=str(cfgmod.ROOT / "templates"))
 
@@ -125,6 +148,23 @@ def api_ingest(conn=Depends(view_conn)):
     seen: dict = {}
     n = ingestmod._scan_once(cfg, seen, force=True)
     return {"ok": True, "ingested": n}
+
+
+@app.get("/api/lookup")
+def api_lookup(url: str, conn=Depends(view_conn)):
+    """The extension asks 'what role is this application page?' Returns role + profile."""
+    role = store.lookup_role_by_ids(conn, url_candidates(url))
+    if not role:
+        raise HTTPException(404, "no matching role for this URL")
+    has_pdf = bool(role.get("tailored_resume_path")
+                   and Path(role["tailored_resume_path"]).exists())
+    return {
+        "job_id": role["job_id"], "company": role["company"], "title": role["title"],
+        "status": role["status"], "tailor_status": role.get("tailor_status") or "none",
+        "has_tailored_pdf": has_pdf,
+        "resume_variant": "tailored" if has_pdf else "base",
+        "profile": cfg.get("profile") or {},
+    }
 
 
 @app.get("/api/roles/{job_id}/resume.pdf")
