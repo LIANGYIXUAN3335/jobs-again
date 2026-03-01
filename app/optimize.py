@@ -70,7 +70,8 @@ def optimize(cfg: dict, conn, job_id: str, max_rounds: int = 6) -> dict:
 
 
 def sc_gate(cfg: dict) -> float:
-    return float((cfg.get("resume_scoring") or {}).get("gate", 80))
+    rs = cfg.get("resume_scoring") or {}
+    return float(rs.get("target", rs.get("gate", 80)))      # loop target = the "apply" bar
 
 
 def main(argv: list[str]) -> None:
@@ -84,12 +85,12 @@ def main(argv: list[str]) -> None:
     if not jobs:
         print("usage: python -m app.optimize <job_id> | --all"); return
     gate = sc_gate(cfg)
+    mark = {"strong": "🟢", "apply": "✅", "improve": "🟡", "drop": "⏸️ "}
     for jid in jobs:
         r = optimize(cfg, conn, jid)
-        flag = "✅" if r["overall"] >= gate else "⏸️ "
-        print(f"\n{flag} {r['company']:16} {r['line']}   (+{r['surfaced']} surfaced)")
+        print(f"\n{mark.get(r['verdict'], '  ')} {r['company']:16} {r['line']}   (+{r['surfaced']} surfaced)")
         if r["overall"] < gate and r["true_gaps"]:
-            print(f"    need human confirm — do you actually have any of these? "
+            print(f"    to reach {gate:.0f} you'd need — confirm any you actually have: "
                   f"{', '.join(r['true_gaps'])}")
 
 
