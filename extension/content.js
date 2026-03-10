@@ -103,42 +103,49 @@
 
   // ---- floating panel ----
   function panel(role) {
-    const box = document.createElement("div");
-    box.id = "jobscan-panel";
-    box.innerHTML = `
+    // Shadow DOM so the host page's CSS can't bleed in and overlap our text.
+    const host = document.createElement("div");
+    host.id = "jobscan-panel";
+    const shadow = host.attachShadow({ mode: "open" });
+    shadow.innerHTML = `
       <style>
-        #jobscan-panel{position:fixed;right:16px;bottom:16px;z-index:2147483647;width:290px;
-          font:13px/1.4 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;color:#1a1d21;
-          background:#fff;border:1px solid #cfd3d8;border-radius:10px;box-shadow:0 6px 24px rgba(0,0,0,.18);overflow:hidden}
-        #jobscan-panel .hd{background:#12314f;color:#fff;padding:8px 10px;display:flex;justify-content:space-between;align-items:center}
-        #jobscan-panel .hd b{font-size:13px}
-        #jobscan-panel .bd{padding:10px}
-        #jobscan-panel .role{font-weight:600;margin-bottom:2px}
-        #jobscan-panel .muted{color:#6b7280;font-size:12px}
-        #jobscan-panel button{font:inherit;cursor:pointer;border:1px solid #cfd3d8;border-radius:6px;background:#f6f8fb;padding:6px 10px;margin-top:8px;width:100%}
-        #jobscan-panel button.primary{background:#12314f;color:#fff;border-color:#12314f}
-        #jobscan-panel button.ok{background:#14632c;color:#fff;border-color:#14632c}
-        #jobscan-panel .x{cursor:pointer;background:none;border:none;color:#fff;width:auto;margin:0;font-size:16px;padding:0 2px}
-        #jobscan-panel .log{margin-top:8px;font-size:12px;max-height:120px;overflow:auto;white-space:pre-wrap}
-        #jobscan-panel .warn{color:#b3261e}
+        :host{ all: initial; position:fixed; right:16px; bottom:16px; z-index:2147483647; }
+        *{ box-sizing:border-box; margin:0; padding:0; }
+        .wrap{ width:290px; font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+          color:#1a1d21; background:#fff; border:1px solid #cfd3d8; border-radius:10px;
+          box-shadow:0 6px 24px rgba(0,0,0,.18); overflow:hidden; }
+        .hd{ background:#12314f; color:#fff; padding:8px 10px; display:flex; justify-content:space-between; align-items:center; }
+        .hd b{ font-size:13px; font-weight:600; }
+        .bd{ padding:10px; }
+        .role{ font-weight:600; margin-bottom:3px; }
+        .muted{ color:#6b7280; font-size:12px; margin-bottom:2px; }
+        button{ display:block; font:inherit; cursor:pointer; border:1px solid #cfd3d8; border-radius:6px;
+          background:#f6f8fb; color:#1a1d21; padding:7px 10px; margin-top:8px; width:100%; text-align:center; }
+        button.primary{ background:#12314f; color:#fff; border-color:#12314f; }
+        button.ok{ background:#14632c; color:#fff; border-color:#14632c; }
+        .x{ cursor:pointer; background:none; border:none; color:#fff; width:auto; margin:0; font-size:16px; line-height:1; padding:0 2px; }
+        .log{ margin-top:8px; font-size:12px; line-height:1.45; max-height:120px; overflow:auto; white-space:pre-wrap; }
+        .warn{ color:#b3261e; }
       </style>
-      <div class="hd"><b>JobScan</b><button class="x" title="close">×</button></div>
-      <div class="bd">
-        <div class="role"></div>
-        <div class="muted resume"></div>
-        <button class="primary fill">Fill this application</button>
-        <button class="ok submitted">✓ I submitted this</button>
-        <div class="log"></div>
+      <div class="wrap">
+        <div class="hd"><b>JobScan</b><button class="x" title="close">×</button></div>
+        <div class="bd">
+          <div class="role"></div>
+          <div class="muted resume"></div>
+          <button class="primary fill">Fill this application</button>
+          <button class="ok submitted">✓ I submitted this</button>
+          <div class="log"></div>
+        </div>
       </div>`;
-    document.body.appendChild(box);
-    const $ = (s) => box.querySelector(s);
+    document.body.appendChild(host);
+    const $ = (s) => shadow.querySelector(s);
     $(".role").textContent = `${role.company} — ${role.title}`;
     $(".resume").textContent = role.has_tailored_pdf
       ? "tailored résumé PDF ready to attach"
       : "no tailored résumé yet — text fields only";
     const log = (m, warn) => { const d = document.createElement("div"); if (warn) d.className = "warn"; d.textContent = m; $(".log").appendChild(d); };
 
-    $(".x").onclick = () => box.remove();
+    $(".x").onclick = () => host.remove();
 
     $(".fill").onclick = async () => {
       $(".log").textContent = "";
@@ -162,7 +169,7 @@
       if (res && res.ok) { log("marked applied in JobScan ✓ (" + role.resume_variant + ")"); $(".submitted").disabled = true; }
       else log("mark-applied failed: " + (res && res.error), true);
     };
-    return box;
+    return host;
   }
 
   // ---- boot: the form on Ashby/Greenhouse loads LATE (SPA), so we can't just check
