@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
+from . import ai as aimod
 from . import config as cfgmod
 from . import ingest as ingestmod
 from . import store, tailoring
@@ -163,6 +164,7 @@ def api_lookup(url: str, conn=Depends(view_conn)):
         "status": role["status"], "tailor_status": role.get("tailor_status") or "none",
         "has_tailored_pdf": has_pdf,
         "resume_variant": "tailored" if has_pdf else "base",
+        "ai_enabled": aimod.available(cfg),
         "profile": cfg.get("profile") or {},
     }
 
@@ -176,6 +178,26 @@ def api_resume_pdf(job_id: str, conn=Depends(view_conn)):
     if not p or not Path(p).exists():
         raise HTTPException(404, "no tailored PDF yet")
     return FileResponse(p, media_type="application/pdf", filename=Path(p).name)
+
+
+class AnswerIn(BaseModel):
+    job_id: str
+    questions: list[str]
+
+
+@app.post("/api/answer")
+def api_answer(body: AnswerIn, conn=Depends(view_conn)):
+    """Draft AI answers for open-ended application questions of one role. Opt-in; needs a key."""
+    if not aimod.available(cfg):
+        raise HTTPException(503, "AI autofill disabled (set ai.enabled + secrets.yaml key)")
+    role = store.get_role(conn, body.job_id)
+    if not role:
+        raise HTTPException(404, "unknown job_id")
+    try:
+        answers = aimod.answer_questions(cfg, role, body.questions)
+    except Exception as e:  # surface a clean message to the extension panel
+        raise HTTPException(502, f"AI answer failed: {type(e).__name__}: {e}")
+    return {"answers": answers}
 
 
 @app.get("/api/applied-companies")

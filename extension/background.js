@@ -34,6 +34,20 @@ async function resumeBase64(jobId) {
   return { b64: btoa(binary), name: r.headers.get("x-filename") || "resume.pdf" };
 }
 
+async function answer(jobId, questions) {
+  const r = await apiFetch(`/api/answer`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job_id: jobId, questions }),
+  });
+  if (!r.ok) {
+    let detail = `answer ${r.status}`;
+    try { detail = (await r.json()).detail || detail; } catch (e) { /* keep default */ }
+    throw new Error(detail);
+  }
+  return r.json(); // { answers: {question: text} }
+}
+
 async function markApplied(jobId, variant) {
   const r = await apiFetch(`/api/roles/${encodeURIComponent(jobId)}/status`, {
     method: "POST",
@@ -49,6 +63,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     try {
       if (msg.type === "lookup") sendResponse(await lookup(msg.url));
       else if (msg.type === "resume") sendResponse({ ok: true, ...(await resumeBase64(msg.jobId)) });
+      else if (msg.type === "answer") sendResponse({ ok: true, ...(await answer(msg.jobId, msg.questions)) });
       else if (msg.type === "markApplied") sendResponse({ ok: true, ...(await markApplied(msg.jobId, msg.variant)) });
       else sendResponse({ ok: false, error: "unknown message" });
     } catch (e) {

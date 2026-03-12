@@ -101,6 +101,29 @@
     return bytes;
   }
 
+  // ---- open-ended question detection (for AI autofill) ----
+  function questionLabel(el) {
+    const byFor = el.id && document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+    const wrap = el.closest("label");
+    const box = el.closest(".field, .form-field, [class*=field], [class*=question]");
+    const boxLabel = box && box.querySelector("label, legend, .label, [class*=label]");
+    const cand = [el.getAttribute("aria-label"), byFor && byFor.innerText,
+      wrap && wrap.innerText, boxLabel && boxLabel.innerText, el.placeholder];
+    for (const c of cand) { const s = (c || "").replace(/\s+/g, " ").trim(); if (s) return s.slice(0, 300); }
+    return "";
+  }
+
+  function openQuestions() {
+    const out = [];
+    for (const el of document.querySelectorAll("textarea")) {
+      if (el.disabled || el.readOnly || (el.value || "").trim()) continue;
+      if (EXCLUDE.test(fieldText(el))) continue;      // never AI-answer EEO / legal / work-auth
+      const label = questionLabel(el);
+      if (label.length >= 8) out.push({ el, label });  // needs a real question
+    }
+    return out;
+  }
+
   // ---- floating panel ----
   function panel(role) {
     // Shadow DOM so the host page's CSS can't bleed in and overlap our text.
@@ -109,30 +132,45 @@
     const shadow = host.attachShadow({ mode: "open" });
     shadow.innerHTML = `
       <style>
-        :host{ all: initial; position:fixed; right:16px; bottom:16px; z-index:2147483647; }
+        :host{ all: initial; position:fixed; right:20px; bottom:20px; z-index:2147483647; }
         *{ box-sizing:border-box; margin:0; padding:0; }
-        .wrap{ width:290px; font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
-          color:#1a1d21; background:#fff; border:1px solid #cfd3d8; border-radius:10px;
-          box-shadow:0 6px 24px rgba(0,0,0,.18); overflow:hidden; }
-        .hd{ background:#12314f; color:#fff; padding:8px 10px; display:flex; justify-content:space-between; align-items:center; }
-        .hd b{ font-size:13px; font-weight:600; }
-        .bd{ padding:10px; }
-        .role{ font-weight:600; margin-bottom:3px; }
-        .muted{ color:#6b7280; font-size:12px; margin-bottom:2px; }
-        button{ display:block; font:inherit; cursor:pointer; border:1px solid #cfd3d8; border-radius:6px;
-          background:#f6f8fb; color:#1a1d21; padding:7px 10px; margin-top:8px; width:100%; text-align:center; }
+        .wrap{ width:320px; font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+          color:#0f172a; background:#fff; border:1px solid #e2e8f0; border-radius:14px;
+          box-shadow:0 12px 32px rgba(15,23,42,.22); overflow:hidden; }
+        .hd{ background:linear-gradient(135deg,#1d4470,#0f2942); color:#fff; padding:11px 14px;
+          display:flex; justify-content:space-between; align-items:center; }
+        .brand{ display:flex; align-items:center; gap:8px; font-weight:700; letter-spacing:.2px; font-size:14px; }
+        .dot{ width:9px; height:9px; border-radius:50%; background:#4ade80; box-shadow:0 0 0 3px rgba(74,222,128,.25); }
+        .x{ cursor:pointer; background:transparent; border:0; color:#cbd5e1; font-size:18px; line-height:1;
+          padding:2px 4px; border-radius:6px; }
+        .x:hover{ background:rgba(255,255,255,.14); color:#fff; }
+        .bd{ padding:14px; }
+        .role{ font-weight:650; font-size:14px; line-height:1.35; margin-bottom:8px; }
+        .chip{ display:inline-block; font-size:11.5px; font-weight:600; padding:3px 9px; border-radius:999px; }
+        .chip.ready{ background:#e7f6ec; color:#15803d; }
+        .chip.none{ background:#fdecea; color:#b42318; }
+        button{ display:flex; align-items:center; justify-content:center; gap:7px; font:inherit; font-weight:600;
+          cursor:pointer; border:1px solid #e2e8f0; border-radius:9px; background:#f8fafc; color:#0f172a;
+          padding:9px 12px; margin-top:9px; width:100%; transition:filter .12s, background .12s; }
+        button:hover{ filter:brightness(.97); }
+        button:active{ transform:translateY(.5px); }
+        button:disabled{ opacity:.55; cursor:default; }
         button.primary{ background:#12314f; color:#fff; border-color:#12314f; }
-        button.ok{ background:#14632c; color:#fff; border-color:#14632c; }
-        .x{ cursor:pointer; background:none; border:none; color:#fff; width:auto; margin:0; font-size:16px; line-height:1; padding:0 2px; }
-        .log{ margin-top:8px; font-size:12px; line-height:1.45; max-height:120px; overflow:auto; white-space:pre-wrap; }
-        .warn{ color:#b3261e; }
+        button.ai{ background:linear-gradient(135deg,#6d5efc,#8b5cf6); color:#fff; border:0; }
+        button.ok{ background:#15803d; color:#fff; border-color:#15803d; }
+        .log{ margin-top:11px; font-size:12px; line-height:1.5; max-height:150px; overflow:auto;
+          white-space:pre-wrap; color:#334155; border-top:1px solid #eef2f6; padding-top:9px; }
+        .log:empty{ display:none; }
+        .log .warn{ color:#b42318; }
+        .log .good{ color:#15803d; }
       </style>
       <div class="wrap">
-        <div class="hd"><b>JobScan</b><button class="x" title="close">×</button></div>
+        <div class="hd"><span class="brand"><span class="dot"></span>JobScan</span><button class="x" title="close">×</button></div>
         <div class="bd">
           <div class="role"></div>
-          <div class="muted resume"></div>
-          <button class="primary fill">Fill this application</button>
+          <div class="status"></div>
+          <button class="primary fill">Fill standard fields + résumé</button>
+          <button class="ai" hidden>✨ AI-answer open questions</button>
           <button class="ok submitted">✓ I submitted this</button>
           <div class="log"></div>
         </div>
@@ -140,10 +178,10 @@
     document.body.appendChild(host);
     const $ = (s) => shadow.querySelector(s);
     $(".role").textContent = `${role.company} — ${role.title}`;
-    $(".resume").textContent = role.has_tailored_pdf
-      ? "tailored résumé PDF ready to attach"
-      : "no tailored résumé yet — text fields only";
-    const log = (m, warn) => { const d = document.createElement("div"); if (warn) d.className = "warn"; d.textContent = m; $(".log").appendChild(d); };
+    $(".status").innerHTML = role.has_tailored_pdf
+      ? '<span class="chip ready">tailored résumé ready</span>'
+      : '<span class="chip none">no tailored résumé — text only</span>';
+    const log = (m, cls) => { const d = document.createElement("div"); if (cls) d.className = cls; d.textContent = m; $(".log").appendChild(d); };
 
     $(".x").onclick = () => host.remove();
 
@@ -156,18 +194,40 @@
         const res = await send({ type: "resume", jobId: role.job_id });
         if (res && res.ok) {
           const ok = attachResume(b64ToBytes(res.b64), res.name);
-          log(ok ? "résumé PDF attached ✓" : "couldn't find a résumé upload field", !ok);
+          log(ok ? "résumé PDF attached ✓" : "couldn't find a résumé upload field", ok ? "good" : "warn");
         } else {
-          log("résumé fetch failed: " + (res && res.error), true);
+          log("résumé fetch failed: " + (res && res.error), "warn");
         }
       }
       log("— review everything, then submit yourself.");
     };
 
+    // AI answer button — only when the local JobScan has AI enabled + a key.
+    if (role.ai_enabled) {
+      const aiBtn = $(".ai");
+      aiBtn.hidden = false;
+      aiBtn.onclick = async () => {
+        const qs = openQuestions();
+        if (!qs.length) { log("no open-ended questions found on this page"); return; }
+        aiBtn.disabled = true; const orig = aiBtn.textContent; aiBtn.textContent = "✨ drafting…";
+        log(`drafting ${qs.length} answer(s) with AI — legal/EEO questions are skipped…`);
+        const res = await send({ type: "answer", jobId: role.job_id, questions: qs.map((q) => q.label) });
+        aiBtn.disabled = false; aiBtn.textContent = orig;
+        if (!res || !res.ok) { log("AI answer failed: " + (res && res.error), "warn"); return; }
+        const answers = res.answers || {};
+        let n = 0;
+        for (const { el, label } of qs) {
+          const a = answers[label];
+          if (a && !(el.value || "").trim()) { setNativeValue(el, a); n++; }
+        }
+        log(n ? `filled ${n} answer(s) ✓ — read & edit each before submitting` : "nothing filled (legal/EEO skipped, or no draft)", n ? "good" : "warn");
+      };
+    }
+
     $(".submitted").onclick = async () => {
       const res = await send({ type: "markApplied", jobId: role.job_id, variant: role.resume_variant });
-      if (res && res.ok) { log("marked applied in JobScan ✓ (" + role.resume_variant + ")"); $(".submitted").disabled = true; }
-      else log("mark-applied failed: " + (res && res.error), true);
+      if (res && res.ok) { log("marked applied in JobScan ✓ (" + role.resume_variant + ")", "good"); $(".submitted").disabled = true; }
+      else log("mark-applied failed: " + (res && res.error), "warn");
     };
     return host;
   }
