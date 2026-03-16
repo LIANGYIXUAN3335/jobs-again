@@ -8,6 +8,9 @@
   window.__jobscanLoaded = true;
 
   const send = (msg) => new Promise((res) => chrome.runtime.sendMessage(msg, res));
+  // Human-like pacing between field fills so forms don't flag the burst as a bot.
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const humanPause = () => sleep(450 + Math.floor(Math.random() * 250)); // ~0.45–0.7s
 
   // ---- form helpers ----
   function setNativeValue(el, value) {
@@ -62,7 +65,9 @@
     }[key] || "";
   }
 
-  function fillFields(profile) {
+  // Fills one standard field at a time with a human-like pause between each, so the form's
+  // anti-spam heuristics don't flag an instant burst. `onField(key)` reports progress.
+  async function fillFields(profile, onField) {
     const filled = [];
     const skipped = [];
     const inputs = document.querySelectorAll(
@@ -74,8 +79,12 @@
       const val = valueFor(key, profile);
       if (!val) continue;
       if ((el.value || "").trim()) { skipped.push(key + " (already filled)"); continue; }
+      if (filled.length) await humanPause();          // pace between fields (skip before the first)
+      el.focus();
       setNativeValue(el, val);
+      el.blur();
       filled.push(key);
+      if (onField) onField(key);
     }
     return { filled, skipped };
   }
@@ -185,12 +194,18 @@
 
     $(".x").onclick = () => host.remove();
 
-    $(".fill").onclick = async () => {
+    const fillBtn = $(".fill");
+    fillBtn.onclick = async () => {
       $(".log").textContent = "";
-      const { filled, skipped } = fillFields(role.profile || {});
-      log(filled.length ? "filled: " + filled.join(", ") : "no standard fields matched");
+      fillBtn.disabled = true; const orig = fillBtn.textContent; fillBtn.textContent = "filling…";
+      const line = document.createElement("div"); $(".log").appendChild(line);
+      const { filled, skipped } = await fillFields(role.profile || {}, (k) => {
+        line.textContent = "filled: " + (line.textContent.replace(/^filled: /, "") ? line.textContent.replace(/^filled: /, "") + ", " : "") + k;
+      });
+      if (!filled.length) line.textContent = "no standard fields matched";
       if (skipped.length) log("left as-is: " + skipped.join(", "));
       if (role.has_tailored_pdf) {
+        await humanPause();
         const res = await send({ type: "resume", jobId: role.job_id });
         if (res && res.ok) {
           const ok = attachResume(b64ToBytes(res.b64), res.name);
@@ -199,6 +214,7 @@
           log("résumé fetch failed: " + (res && res.error), "warn");
         }
       }
+      fillBtn.disabled = false; fillBtn.textContent = orig;
       log("— review everything, then submit yourself.");
     };
 
