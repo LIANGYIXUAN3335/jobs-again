@@ -33,7 +33,10 @@
   }
 
   const PATTERNS = [
-    ["first_name", /\bfirst name\b|\bgiven name\b/],
+    // preferred/nickname MUST come before first_name (a "preferred first name" field
+    // contains "first name" and would otherwise match legal first_name).
+    ["preferred_name", /\bpreferred (first )?name\b|\bnickname\b|\bgoes by\b|\bpreferred\b/],
+    ["first_name", /\bfirst name\b|\bgiven name\b|\blegal first\b/],
     ["last_name", /\blast name\b|\bfamily name\b|\bsurname\b/],
     ["full_name", /\bfull name\b|\byour name\b|\blegal name\b|^\s*name\b/],
     ["email", /\be-?mail\b/],
@@ -56,9 +59,14 @@
   }
 
   function valueFor(key, profile) {
-    const full = [profile.first_name, profile.last_name].filter(Boolean).join(" ");
+    // "First name" / "Full name" / "Legal name" on applications want the LEGAL name (Alex);
+    // Casey is the preferred name, used only for an explicit preferred/nickname field.
+    const legalFirst = profile.legal_first_name || profile.first_name;
+    const preferred = profile.preferred_name || profile.first_name;
+    const legalFull = [legalFirst, profile.last_name].filter(Boolean).join(" ");
     return {
-      first_name: profile.first_name, last_name: profile.last_name, full_name: full,
+      first_name: legalFirst, last_name: profile.last_name,
+      preferred_name: preferred, full_name: legalFull,
       email: profile.email, phone: profile.phone, linkedin: profile.linkedin,
       github: profile.github, website: profile.website,
       location: profile.location, country: profile.country,
