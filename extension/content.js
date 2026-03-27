@@ -149,7 +149,7 @@
     const shadow = host.attachShadow({ mode: "open" });
     shadow.innerHTML = `
       <style>
-        :host{ all: initial; position:fixed; right:20px; bottom:20px; z-index:2147483647; }
+        :host{ all: initial; display:block; }
         *{ box-sizing:border-box; margin:0; padding:0; }
         .wrap{ width:320px; font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
           color:#0f172a; background:#fff; border:1px solid #e2e8f0; border-radius:14px;
@@ -196,7 +196,12 @@
           <div class="log"></div>
         </div>
       </div>`;
-    document.body.appendChild(host);
+    // Pin it top-right via inline !important (beats page CSS and survives :host all:initial),
+    // and mount on <html> not <body> so a transformed ancestor can't turn `fixed` into
+    // scroll-with-page. Top-right keeps it high, visible, and clear of the bottom Submit button.
+    host.style.cssText = "position:fixed !important; top:20px !important; right:20px !important;" +
+      "left:auto !important; bottom:auto !important; z-index:2147483647 !important; margin:0 !important;";
+    document.documentElement.appendChild(host);
     const $ = (s) => shadow.querySelector(s);
     $(".role").textContent = `${role.company} — ${role.title}`;
     $(".status").innerHTML = role.has_tailored_pdf
@@ -220,11 +225,11 @@
       if (e.target.closest("button")) return;           // don't start a drag from the ×/– buttons
       const r = host.getBoundingClientRect();
       const dx = e.clientX - r.left, dy = e.clientY - r.top;
-      host.style.right = "auto"; host.style.bottom = "auto";
-      host.style.left = r.left + "px"; host.style.top = r.top + "px";
+      const set = (k, v) => host.style.setProperty(k, v, "important"); // must beat the !important pin
+      set("right", "auto"); set("bottom", "auto");
       const move = (ev) => {
-        host.style.left = Math.max(0, Math.min(innerWidth - 40, ev.clientX - dx)) + "px";
-        host.style.top = Math.max(0, Math.min(innerHeight - 30, ev.clientY - dy)) + "px";
+        set("left", Math.max(0, Math.min(innerWidth - 40, ev.clientX - dx)) + "px");
+        set("top", Math.max(0, Math.min(innerHeight - 30, ev.clientY - dy)) + "px");
       };
       const up = () => { document.removeEventListener("mousemove", move); document.removeEventListener("mouseup", up); };
       document.addEventListener("mousemove", move);
