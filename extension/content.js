@@ -64,10 +64,13 @@
     const legalFirst = profile.legal_first_name || profile.first_name;
     const preferred = profile.preferred_name || profile.first_name;
     const legalFull = [legalFirst, profile.last_name].filter(Boolean).join(" ");
+    // Phone: drop the leading country code (+1 / 1) — many forms have a separate country/dial-code
+    // selector, so a leading "+1" duplicates it. Keep just the national number.
+    const phone = (profile.phone || "").replace(/^\s*\+?\s*1[\s.\-]+/, "").trim();
     return {
       first_name: legalFirst, last_name: profile.last_name,
       preferred_name: preferred, full_name: legalFull,
-      email: profile.email, phone: profile.phone, linkedin: profile.linkedin,
+      email: profile.email, phone: phone, linkedin: profile.linkedin,
       github: profile.github, website: profile.website,
       location: profile.location, country: profile.country,
     }[key] || "";
@@ -132,11 +135,16 @@
 
   function openQuestions() {
     const out = [];
-    for (const el of document.querySelectorAll("textarea")) {
+    // textareas AND short-answer text inputs (job title, employer, school, "years of X", …).
+    const els = document.querySelectorAll(
+      'textarea, input[type=text], input[type=search], input:not([type])');
+    for (const el of els) {
       if (el.disabled || el.readOnly || (el.value || "").trim()) continue;
       if (EXCLUDE.test(fieldText(el))) continue;      // never AI-answer EEO / legal / work-auth
+      if (classify(el)) continue;                     // standard profile fields → the Fill button's job
       const label = questionLabel(el);
-      if (label.length >= 8) out.push({ el, label });  // needs a real question
+      if (label.length >= 4 && /[a-z]/i.test(label)) out.push({ el, label });
+      if (out.length >= 15) break;                    // don't blow up the prompt on huge forms
     }
     return out;
   }
