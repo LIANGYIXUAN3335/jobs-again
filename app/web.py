@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from . import ai as aimod
 from . import config as cfgmod
 from . import ingest as ingestmod
+from . import mailcode as mailmod
 from . import store, tailoring
 
 cfg = cfgmod.load_config()
@@ -165,6 +166,7 @@ def api_lookup(url: str, conn=Depends(view_conn)):
         "has_tailored_pdf": has_pdf,
         "resume_variant": "tailored" if has_pdf else "base",
         "ai_enabled": aimod.available(cfg),
+        "mailcode_enabled": mailmod.available(cfg),
         "profile": cfg.get("profile") or {},
     }
 
@@ -198,6 +200,17 @@ def api_answer(body: AnswerIn, conn=Depends(view_conn)):
     except Exception as e:  # surface a clean message to the extension panel
         raise HTTPException(502, f"AI answer failed: {type(e).__name__}: {e}")
     return {"answers": answers}
+
+
+@app.get("/api/email-code")
+def api_email_code():
+    """Fetch the newest email verification code (opt-in; reads inbox over IMAP)."""
+    if not mailmod.available(cfg):
+        raise HTTPException(503, "email-code disabled (set mailcode.enabled + gmail_app_password)")
+    try:
+        return mailmod.fetch_latest_code(cfg)
+    except Exception as e:
+        raise HTTPException(502, f"email-code failed: {type(e).__name__}: {e}")
 
 
 @app.get("/api/applied-companies")
