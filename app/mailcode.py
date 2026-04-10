@@ -15,12 +15,43 @@ import yaml
 
 from . import config as cfgmod
 
-# A digit run (4–8) sitting near a verification keyword — the reliable signal.
-_CODE_NEAR = re.compile(
-    r"(?:verification|verify|one[\s-]?time|passcode|security|confirm(?:ation)?|access|otp|pin|code)"
-    r"[^0-9]{0,40}(\d{4,8})", re.IGNORECASE)
-_CODE_ANY = re.compile(r"\b(\d{4,8})\b")
-_VERIFYISH = re.compile(r"verif|one[\s-]?time|passcode|confirm|security|\botp\b|\bcode\b", re.IGNORECASE)
+# Skip provider notification emails that aren't codes (e.g. Google's login alert).
+_SKIP_SUBJECT = re.compile(r"security alert|new sign-?in|was signed in|critical security|"
+                           r"suspicious sign|password (?:was )?changed|2-?step verification|"
+                           r"verification (?:turned on|is on|enabled|was turned on)|turned on|"
+                           r"recovery (?:email|phone)|account (?:was )?(?:created|recovered)", re.IGNORECASE)
+# Strong: a 4–8 digit code sitting right next to a real verification phrase (both orders).
+_STRONG = re.compile(
+    r"(?:verification code|one[\s-]?time (?:code|passcode|password|pin)|passcode|security code|"
+    r"access code|confirmation code|your code is|use code|enter (?:the )?code|code[:\s]+is|\botp\b)"
+    r"[^0-9]{0,20}(\d{4,8})", re.IGNORECASE)
+_STRONG_REV = re.compile(
+    r"(\d{4,8})[^0-9]{0,20}(?:is your (?:verification|one[\s-]?time|security|login) |"
+    r"verification code|one[\s-]?time (?:code|passcode))", re.IGNORECASE)
+_VERIFYISH = re.compile(r"verif|one[\s-]?time|passcode|confirm your|\botp\b|log ?in code", re.IGNORECASE)
+
+
+def _is_year(s: str) -> bool:
+    return len(s) == 4 and (s.startswith("19") or s.startswith("20"))
+
+
+def _is_junk(s: str) -> bool:
+    return _is_year(s) or len(set(s)) == 1        # 2026 (year) or 000000/111111 (placeholder)
+
+
+def _extract_code(text: str):
+    cand = [m.group(1) for m in _STRONG.finditer(text)] + [m.group(1) for m in _STRONG_REV.finditer(text)]
+    cand = [c for c in cand if not _is_junk(c)]
+    for length in (6, 5, 7, 8, 4):                       # OTPs are usually 6 digits — prefer them
+        for c in cand:
+            if len(c) == length:
+                return c
+    # weak fallback: clearly a verification email AND exactly one non-year 6-digit number
+    if _VERIFYISH.search(text):
+        sixes = {n for n in re.findall(r"\b\d{6}\b", text) if not _is_junk(n)}
+        if len(sixes) == 1:
+            return next(iter(sixes))
+    return None
 
 
 def _cfg(cfg: dict):
@@ -87,10 +118,10 @@ def fetch_latest_code(cfg: dict) -> dict:
             if idate and idate < cutoff:
                 break                                    # everything older follows → stop
             subject = _decode(msg.get("Subject"))
+            if _SKIP_SUBJECT.search(subject):
+                continue                                  # provider login/security notice, not a code
             hay = subject + " " + _body_text(msg)
-            m = _CODE_NEAR.search(hay)
-            code = m.group(1) if m else (
-                (_CODE_ANY.search(hay).group(1)) if _VERIFYISH.search(hay) and _CODE_ANY.search(hay) else None)
+            code = _extract_code(hay)
             if code:
                 return {"code": code, "subject": subject, "from": _decode(msg.get("From")),
                         "date": idate.isoformat() if idate else None}
