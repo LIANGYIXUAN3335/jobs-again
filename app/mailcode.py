@@ -42,7 +42,7 @@ def _is_junk(s: str) -> bool:
 def _extract_code(text: str):
     cand = [m.group(1) for m in _STRONG.finditer(text)] + [m.group(1) for m in _STRONG_REV.finditer(text)]
     cand = [c for c in cand if not _is_junk(c)]
-    for length in (6, 5, 7, 8, 4):                       # OTPs are usually 6 digits — prefer them
+    for length in (6, 8, 5, 7, 4):                       # 6 and 8 digits are the common OTP lengths
         for c in cand:
             if len(c) == length:
                 return c
