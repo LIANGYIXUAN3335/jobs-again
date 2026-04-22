@@ -88,6 +88,177 @@
     return false;
   }
 
+  // ---- common eligibility / logistics answers (deterministic, from the profile) ----
+  // Unlike EEO/demographic questions (which stay the user's to answer), these are factual
+  // questions we CAN answer for her — work authorization, sponsorship, residency, onsite/
+  // remote/relocate, "have you worked here before". Answered without the LLM: fast + correct.
+  const clean = (s) => (s || "").replace(/\s+/g, " ").trim().slice(0, 300);
+  const short = (s) => clean(s).slice(0, 52);
+
+  // Fields that must NEVER be auto-answered — demographics, comp, criminal history. (Work
+  // authorization / sponsorship are deliberately NOT here: those we answer from the profile.)
+  const SENSITIVE = /gender|ethnic|hispanic|latin|\brace\b|racial|veteran|disab|pronoun|sexual orientation|lgbt|demographic|self.?identif|equal employment|\beeo\b|salary|compensation|desired pay|felony|conviction|criminal|background check|how did you hear|referr/i;
+
+  function fullLoc(p) {
+    const city = ((p.location || "").split(",")[0] || "San Jose").trim();
+    return `${city}, California, United States`;
+  }
+
+  // Returns {yesno:"yes"|"no"} for a Yes/No question, {text, choice} for a value question,
+  // or null when we have no confident answer (→ falls through to the AI for open questions).
+  function commonAnswer(label, profile) {
+    const t = clean(label).toLowerCase();
+    if (!t) return null;
+    const YES = { yesno: "yes" }, NO = { yesno: "no" };
+    const US = profile.country || "United States";
+    // eligibility / logistics (Yes/No)
+    if (/\bspons/.test(t)) return NO;                                       // need sponsorship? → No
+    if (/authori[sz]|legally (allowed|entitled|eligible|authorized)|eligible to work|right to work|permitted to work|work permit|legally.*work/.test(t)) return YES;
+    if (/(ever|previously|before|prior|former|formerly).{0,40}(employ|work)/.test(t) || /(employ|work(ed)?)\b.{0,25}(for us|by us|here before|at (this|our) (compan|organi)|our compan|current or former)/.test(t) || /current or former (employee|worker|contractor)/.test(t)) return NO;
+    if (/relocat/.test(t)) return YES;
+    if (/\bremot/.test(t)) return YES;
+    if (/on-?site|onsite|in[- ]office|in person|\bhybrid\b|commut/.test(t)) return YES;
+    if (/able to travel|willing.*travel/.test(t)) return YES;
+    if (/\b18\b.*(older|age)|at least 18|over 18|of legal age|legally an adult/.test(t)) return YES;
+    // residency / country / location (value)
+    if (/(which )?country.*(resid|live|based|located|from|in)|(resid|live|based).*country|country of (residence|origin)/.test(t)) return { text: US, choice: US };
+    if (/\bcountry\b/.test(t)) return { text: US, choice: US };
+    if (/current (city|location)|city\/state|where are you (based|located|currently)|your (current )?location|based in|current residence/.test(t)) return { text: fullLoc(profile) };
+    if ((/^\s*state\b|\bstate\/province|\bprovince\b/.test(t)) && !/united states|statement/.test(t)) return { text: "California", choice: "California" };
+    if (/able to work (at|in|from)|can you work (at|in|from)|position is (located|based)|role is (in|located|based)|work (at|from) (this|the) (location|office)/.test(t)) return YES;
+    return null;
+  }
+
+  // The question text for a select / radio group / combobox (fieldset legend, label[for],
+  // or the enclosing question container) — richer than fieldText, used for common answers.
+  function controlLabel(el) {
+    const fs = el.closest("fieldset");
+    if (fs) { const lg = fs.querySelector("legend"); if (lg && lg.innerText.trim()) return clean(lg.innerText); }
+    const byFor = el.id && document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+    if (byFor && byFor.innerText.trim()) return clean(byFor.innerText);
+    const box = el.closest('.field, .form-field, [class*=field], [class*=question i], [data-qa], [class*=application]');
+    if (box) { const lab = box.querySelector('label, legend, .label, [class*=label i]'); if (lab && lab.innerText.trim()) return clean(lab.innerText); }
+    return clean(el.getAttribute("aria-label") || questionLabel(el));
+  }
+
+  function fillSelect(sel, want) {
+    const opts = [...sel.options];
+    let target;
+    if (want.yesno) {
+      const yn = want.yesno === "yes" ? /^\s*y(es)?\b/i : /^\s*no?\b/i;
+      target = opts.find((o) => yn.test(o.text));
+    }
+    if (!target && want.choice) {
+      const c = want.choice.toLowerCase();
+      target = opts.find((o) => o.text.trim().toLowerCase() === c)
+        || opts.find((o) => o.text.toLowerCase().includes(c))
+        || (/united states/.test(c) && opts.find((o) => /united states|\bu\.?s\.?a?\.?\b/i.test(o.text)));
+    }
+    if (!target) return false;
+    sel.value = target.value;
+    sel.dispatchEvent(new Event("input", { bubbles: true }));
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }
+
+  function radioLabel(r) {
+    const l = r.id && document.querySelector(`label[for="${CSS.escape(r.id)}"]`);
+    return ((l && l.innerText) || (r.closest("label") || {}).innerText || r.value || r.getAttribute("aria-label") || "").trim();
+  }
+  function fillRadio(radios, want) {
+    let target;
+    if (want.yesno) {
+      const yn = want.yesno === "yes" ? /^\s*y(es)?\b/i : /^\s*no?\b/i;
+      target = radios.find((r) => yn.test(radioLabel(r)));
+    }
+    if (!target && want.choice) {
+      const c = want.choice.toLowerCase();
+      target = radios.find((r) => radioLabel(r).toLowerCase().includes(c));
+    }
+    if (!target) return false;
+    target.click();                                     // click drives framework onChange handlers
+    return true;
+  }
+
+  // Best-effort for custom dropdowns (Greenhouse react-select, Ashby comboboxes): open it,
+  // type the value to filter, then click the matching option. Flaky by nature — logs on miss.
+  async function fillCombobox(control, want) {
+    control.scrollIntoView({ block: "center" });
+    control.click();
+    const input = control.querySelector("input") || control.parentElement.querySelector("input");
+    if (input) input.focus();
+    await sleep(140);
+    const wantText = want.choice || (want.yesno === "yes" ? "Yes" : "No");
+    if (input) setNativeValue(input, wantText);
+    await sleep(240);
+    const opts = [...document.querySelectorAll('.select__option, [role=option], [class*="option" i]')]
+      .filter((o) => o.offsetParent !== null && o.textContent.trim());
+    const c = wantText.toLowerCase();
+    const opt = opts.find((o) => o.textContent.trim().toLowerCase() === c)
+      || opts.find((o) => o.textContent.toLowerCase().includes(c));
+    if (opt) { opt.click(); return true; }
+    if (input) input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    return false;
+  }
+
+  // Deterministic pass over selects / radio groups / custom dropdowns / value text-fields.
+  // Applies profile-based answers to the common questions and RETURNS the truly-open text
+  // questions ({el,label}) that are left for the AI.
+  async function fillCommon(profile, log) {
+    const leftover = [];
+    let acted = false;
+    const pace = async () => { if (acted) await humanPause(); acted = true; };
+
+    for (const sel of document.querySelectorAll("select")) {
+      if (sel.disabled) continue;
+      const label = controlLabel(sel);
+      if (SENSITIVE.test(label)) continue;
+      const ans = commonAnswer(label, profile);
+      if (!ans) continue;
+      if (sel.selectedIndex > 0 && (sel.value || "").trim()) continue;   // already chosen
+      await pace();
+      if (fillSelect(sel, ans)) log("selected: " + short(label), "good");
+    }
+
+    const seen = new Set();
+    for (const r of document.querySelectorAll('input[type=radio]')) {
+      if (r.disabled || !r.name || seen.has(r.name)) continue;
+      seen.add(r.name);
+      const group = [...document.querySelectorAll(`input[type=radio][name="${CSS.escape(r.name)}"]`)];
+      if (group.some((x) => x.checked)) continue;                        // already answered
+      const label = controlLabel(r);
+      if (SENSITIVE.test(label)) continue;
+      const ans = commonAnswer(label, profile);
+      if (!ans || !ans.yesno) continue;
+      await pace();
+      if (fillRadio(group, ans)) log("answered: " + short(label), "good");
+    }
+
+    for (const ctl of document.querySelectorAll('.select__control, [class*="select__control"], [role=combobox]')) {
+      const label = controlLabel(ctl);
+      if (!label || SENSITIVE.test(label)) continue;
+      const ans = commonAnswer(label, profile);
+      if (!ans || !(ans.choice || ans.yesno)) continue;
+      if (/\S/.test((ctl.querySelector('[class*="single-value" i], [class*="value" i]') || {}).textContent || "")) continue; // already chosen
+      await pace();
+      const ok = await fillCombobox(ctl, ans);
+      log(ok ? "selected: " + short(label) : "dropdown — pick manually: " + short(label), ok ? "good" : "warn");
+    }
+
+    for (const el of document.querySelectorAll('textarea, input[type=text], input[type=search], input:not([type])')) {
+      if (el.disabled || el.readOnly || (el.value || "").trim()) continue;
+      if (classify(el)) continue;                       // standard profile field — fillFields did it
+      const label = questionLabel(el);
+      if (!label || label.length < 4 || !/[a-z]/i.test(label)) continue;
+      const ans = commonAnswer(label, profile);
+      if (ans && ans.text) { await pace(); el.focus(); setNativeValue(el, ans.text); el.blur(); log("filled: " + short(label), "good"); continue; }
+      if (SENSITIVE.test(fieldText(el))) continue;      // sensitive & no known answer → user handles
+      leftover.push({ el, label });
+      if (leftover.length >= 15) break;
+    }
+    return leftover;
+  }
+
   // Fills one standard field at a time with a human-like pause between each, so the form's
   // anti-spam heuristics don't flag an instant burst. `onField(key)` reports progress.
   async function fillFields(profile, onField) {
@@ -145,22 +316,6 @@
       wrap && wrap.innerText, boxLabel && boxLabel.innerText, el.placeholder];
     for (const c of cand) { const s = (c || "").replace(/\s+/g, " ").trim(); if (s) return s.slice(0, 300); }
     return "";
-  }
-
-  function openQuestions() {
-    const out = [];
-    // textareas AND short-answer text inputs (job title, employer, school, "years of X", …).
-    const els = document.querySelectorAll(
-      'textarea, input[type=text], input[type=search], input:not([type])');
-    for (const el of els) {
-      if (el.disabled || el.readOnly || (el.value || "").trim()) continue;
-      if (EXCLUDE.test(fieldText(el))) continue;      // never AI-answer EEO / legal / work-auth
-      if (classify(el)) continue;                     // standard profile fields → the Fill button's job
-      const label = questionLabel(el);
-      if (label.length >= 4 && /[a-z]/i.test(label)) out.push({ el, label });
-      if (out.length >= 15) break;                    // don't blow up the prompt on huge forms
-    }
-    return out;
   }
 
   // ---- email verification-code field ----
@@ -243,8 +398,7 @@
         <div class="bd">
           <div class="role"></div>
           <div class="status"></div>
-          <button class="primary fill">Fill standard fields + résumé</button>
-          <button class="ai" hidden>✨ AI-answer open questions</button>
+          <button class="primary fill">Fill application</button>
           <button class="code" hidden>📧 Get email code</button>
           <button class="ok submitted">✓ I submitted this</button>
           <div class="log"></div>
@@ -295,12 +449,21 @@
     fillBtn.onclick = async () => {
       $(".log").textContent = "";
       fillBtn.disabled = true; const orig = fillBtn.textContent; fillBtn.textContent = "filling…";
+      const profile = role.profile || {};
+
+      // 1) standard text fields (name / email / phone / links / location)
       const line = document.createElement("div"); $(".log").appendChild(line);
-      const { filled, skipped } = await fillFields(role.profile || {}, (k) => {
-        line.textContent = "filled: " + (line.textContent.replace(/^filled: /, "") ? line.textContent.replace(/^filled: /, "") + ", " : "") + k;
+      const { filled, skipped } = await fillFields(profile, (k) => {
+        const cur = line.textContent.replace(/^fields: /, "");
+        line.textContent = "fields: " + (cur ? cur + ", " : "") + k;
       });
-      if (!filled.length) line.textContent = "no standard fields matched";
+      if (!filled.length) line.textContent = "no standard text fields matched";
       if (skipped.length) log("left as-is: " + skipped.join(", "));
+
+      // 2) common eligibility / logistics (dropdowns, Yes/No radios, country, location…)
+      const leftover = await fillCommon(profile, log);
+
+      // 3) tailored résumé PDF
       if (role.has_tailored_pdf) {
         await humanPause();
         const res = await send({ type: "resume", jobId: role.job_id });
@@ -311,31 +474,28 @@
           log("résumé fetch failed: " + (res && res.error), "warn");
         }
       }
+
+      // 4) truly-open questions → AI (only if enabled). Common/EEO questions never reach here.
+      if (role.ai_enabled && leftover.length) {
+        fillBtn.textContent = "✨ drafting…";
+        log(`drafting ${leftover.length} open answer(s) with AI…`);
+        const res = await send({ type: "answer", jobId: role.job_id, questions: leftover.map((q) => q.label) });
+        if (!res || !res.ok) { log("AI answer failed: " + (res && res.error), "warn"); }
+        else {
+          const answers = res.answers || {}; let n = 0;
+          for (const { el, label } of leftover) {
+            const a = answers[label];
+            if (a && !(el.value || "").trim()) { await humanPause(); el.focus(); setNativeValue(el, a); el.blur(); n++; }
+          }
+          log(n ? `AI drafted ${n} answer(s) ✓ — read & edit each` : "no AI answers (declined or already filled)", n ? "good" : "warn");
+        }
+      } else if (leftover.length) {
+        log(`${leftover.length} open question(s) left for you (AI is off)`);
+      }
+
       fillBtn.disabled = false; fillBtn.textContent = orig;
       log("— review everything, then submit yourself.");
     };
-
-    // AI answer button — only when the local JobScan has AI enabled + a key.
-    if (role.ai_enabled) {
-      const aiBtn = $(".ai");
-      aiBtn.hidden = false;
-      aiBtn.onclick = async () => {
-        const qs = openQuestions();
-        if (!qs.length) { log("no open-ended questions found on this page"); return; }
-        aiBtn.disabled = true; const orig = aiBtn.textContent; aiBtn.textContent = "✨ drafting…";
-        log(`drafting ${qs.length} answer(s) with AI — legal/EEO questions are skipped…`);
-        const res = await send({ type: "answer", jobId: role.job_id, questions: qs.map((q) => q.label) });
-        aiBtn.disabled = false; aiBtn.textContent = orig;
-        if (!res || !res.ok) { log("AI answer failed: " + (res && res.error), "warn"); return; }
-        const answers = res.answers || {};
-        let n = 0;
-        for (const { el, label } of qs) {
-          const a = answers[label];
-          if (a && !(el.value || "").trim()) { setNativeValue(el, a); n++; }
-        }
-        log(n ? `filled ${n} answer(s) ✓ — read & edit each before submitting` : "nothing filled (legal/EEO skipped, or no draft)", n ? "good" : "warn");
-      };
-    }
 
     // Email verification-code button — only when mailcode is configured (app password present).
     if (role.mailcode_enabled) {
