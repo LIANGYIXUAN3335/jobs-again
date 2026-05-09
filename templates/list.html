@@ -17,6 +17,7 @@
     <a href="/?status=skip" class="{{ 'on' if params.status=='skip' }}">skip <b>{{ counts.skip }}</b></a>
     <a href="/?status=rejected" class="{{ 'on' if params.status=='rejected' }}">rejected <b>{{ counts.rejected }}</b></a>
     <a href="/?status=all" class="{{ 'on' if params.status=='all' }}">all <b>{{ total_roles }}</b></a>
+    <a href="/replies" style="margin-left:auto">📥 replies</a>
   </nav>
   <div class="runinfo">
     {% if run %}
