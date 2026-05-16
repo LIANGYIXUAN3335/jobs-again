@@ -81,14 +81,11 @@ def free_slots(cfg: dict, days: int = 6, count: int = 3) -> list[str]:
         if day.weekday() < 5:                       # Mon–Fri only
             t = datetime.datetime.combine(day, datetime.time(start_h), tzinfo=tz)
             end_of_day = datetime.datetime.combine(day, datetime.time(end_h), tzinfo=tz)
-            while t + datetime.timedelta(minutes=dur) <= end_of_day and len(slots) < count:
+            while t + datetime.timedelta(minutes=dur) <= end_of_day:
                 e = t + datetime.timedelta(minutes=dur)
                 if t >= win_start and not overlaps(t, e):
-                    s1 = t.strftime("%a %b %-d, %-I:%M")
-                    s2 = e.strftime("%-I:%M %p")
-                    slots.append(f"{s1}–{s2} {label}")
-                    t = e + datetime.timedelta(minutes=30)   # spread proposals out
-                else:
-                    t += datetime.timedelta(minutes=30)
+                    slots.append(f"{t.strftime('%a %b %-d, %-I:%M')}–{e.strftime('%-I:%M %p')} {label}")
+                    break                                    # one proposal per day → spread across days
+                t += datetime.timedelta(minutes=30)
         day += datetime.timedelta(days=1)
     return slots
