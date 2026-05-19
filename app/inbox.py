@@ -20,8 +20,28 @@ from . import store
 # Header-level skips — cheap, avoid a full fetch + LLM call for obvious non-actionables.
 _SKIP_SUBJECT = re.compile(
     r"application (was )?(received|submitted|reviewed)|thank you for applying|thanks for applying|"
-    r"we('| ha)ve received your application|security code|verification code|verify your email|"
-    r"unsubscribe|newsletter|your job alert|new jobs|weekly digest|password", re.I)
+    r"we('| ha)ve received your application|thank you for your (interest|application)|"
+    r"security code|verification code|verify your email|2-?step verification|security alert|"
+    r"unsubscribe|newsletter|your job alert|job alerts?|new jobs?|weekly digest|password|"
+    # LinkedIn/aggregator/course/promo notifications — never need a reply
+    r"is hiring|new matches|impressions|visited your profile|new invitation|invitation to connect|"
+    r"want to connect|posts? got|take the next step|next step in your career|new features?|"
+    r"webinar|conference program|\bsurvey\b|subscription will renew|is now part of|"
+    r"prepare for your upcoming visit|explore their network|cert(ificate)? with|"
+    r"take the .* course|ready:|new videos?|just messaged you|sent new messages?|"
+    r"latest .* jobs|career opportunities|register today|deadline|savings expire|"
+    r"world cup|live demo|crash course|roundup|cheat sheet", re.I)
+# Automated senders whose mail is never a personal reply. NOTE: LinkedIn 'hit-reply' /
+# 'inmail' addresses ARE real recruiter messages — those are deliberately NOT matched here.
+_SKIP_SENDER = re.compile(
+    r"jobalerts|jobs-?noreply|jobs-?listings|job-?alerts|notifications-?noreply|"
+    r"messages-?noreply|invitations?@linked|updates-?noreply@linked|invite@linked|"
+    r"@udemy|coursera|glassdoor|@fidelity|teladoc|taskrabbit|meeboss|@simplify|"
+    r"enotice@|ieee|@arrow|jackandjill|newsletter@|survey@|@m\.learn|"
+    r"@nvidia|educative|@courses\.m|deeplearning|aaai|levels\.fyi|tickerkey|peeref|"
+    r"@huntr|@expo\.dev|googlepixel|@email\.openai|@e\.link|redditmail|@reply\.snowflake|"
+    r"editors-?noreply@linked|newsletters?-?n|news-?noreply|militaryonesource|"
+    r"mydocbill|prudential|mailer-daemon|via LinkedIn <newsletters", re.I)
 _REJECT = re.compile(
     r"not (moving|move) forward|regret to inform|unfortunately,? (we|after)|decided (to move|not to)|"
     r"pursuing other candidates|will not be (moving|proceeding)|no longer under consideration|"
@@ -128,20 +148,26 @@ def _star(cfg, uid):
         pass
 
 
-def triage(cfg: dict, max_llm: int = 12) -> dict:
-    """Scan recent inbox, queue emails that need a reply. Returns a summary dict."""
+def triage(cfg: dict, max_llm: int = 12, days: int | None = None, limit: int = 60) -> dict:
+    """Scan recent inbox, queue emails that need a reply. Returns a summary dict.
+    `days` overrides the config poll window (owner wants a 28-day first sweep)."""
     inbox_cfg = cfg.get("inbox") or {}
-    days = int(inbox_cfg.get("poll_days", 3))
+    if days is None:
+        days = int(inbox_cfg.get("poll_days", 3))
     mode = inbox_cfg.get("autosend_mode", "gated")     # gated | all | off
     conn = store.connect_user(cfg)
 
-    heads = mail.search_recent(cfg, days=days, limit=50)
+    heads = mail.search_recent(cfg, days=days, limit=limit)
     examples = _sent_examples(cfg)
     slots = gcal.free_slots(cfg) if gcal.available(cfg) else []
+    # No calendar connected → offer the owner's stated availability so scheduling replies still
+    # propose real times instead of leaving a [[AVAILABILITY]] placeholder.
+    if not slots and inbox_cfg.get("availability"):
+        slots = [inbox_cfg["availability"]]
 
     queued, armed, llm_used = 0, 0, 0
     for h in heads:
-        if _SKIP_SUBJECT.search(h["subject"] or ""):
+        if _SKIP_SUBJECT.search(h["subject"] or "") or _SKIP_SENDER.search(h["from"] or ""):
             continue
         full = mail.get_message(cfg, h["uid"])
         mid = full.get("message_id") or f"uid:{h['uid']}"
