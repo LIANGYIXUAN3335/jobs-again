@@ -33,9 +33,15 @@ def run_scan(cfg: dict, only: set[str] | None = None, mode: str = "local") -> di
     totals = Counter()
     rows_out: list[dict] = []
 
+    cooldowns = cfgmod.active_cooldowns(cfg)
     for c in cfg.get("companies", []):
         name, ats, slug = c["name"], c["ats"], str(c.get("slug", ""))
         if only and slug.lower() not in only and name.lower() not in only:
+            continue
+        cd = cooldowns.get(cfgmod.norm_key(name))
+        if cd:
+            details[name] = {"skipped": f"cooldown until {cd['until']} ({cd['reason']})"}
+            print(f"{name:<16} skipped — cooldown until {cd['until']}")
             continue
         if ats not in FETCHERS:
             details[name] = {"skipped": str(c.get("note", ats))}
@@ -60,9 +66,22 @@ def run_scan(cfg: dict, only: set[str] | None = None, mode: str = "local") -> di
 
         comp_notes = scoring.notes_for(name, notes_all)
         n_new = 0
+        n_jd_fetched = 0
         for p, seniority in kept:
-            h = scoring.jd_hash(p.jd_text)
             prev = existing.get(p.job_id)
+            # Lazy-JD boards (Workday/Rippling/SmartRecruiters): the list endpoint has no
+            # JD, so fetch the detail only for postings that survived the filters — and
+            # reuse the stored JD for roles we already have, so daily scans stay cheap.
+            if not p.jd_text and p.fetch_jd is not None:
+                if prev is not None and prev["jd_text"]:
+                    p.jd_text = prev["jd_text"]
+                else:
+                    try:
+                        p.jd_text = p.fetch_jd()
+                        n_jd_fetched += 1
+                    except Exception as exc:  # noqa: BLE001 — score on title alone
+                        print(f"  jd fetch failed {p.job_id}: {exc}", file=sys.stderr)
+            h = scoring.jd_hash(p.jd_text)
             if prev is not None and not rescore_all and prev["jd_hash"] == h:
                 sc = {k: prev[k] for k in (
                     "s_stability", "s_culture", "s_depth", "s_wlb",
@@ -92,6 +111,8 @@ def run_scan(cfg: dict, only: set[str] | None = None, mode: str = "local") -> di
             "fetched": len(postings), "kept": len(kept), "new": n_new,
             "dropped": dict(drop_reasons),
         }
+        if n_jd_fetched:
+            details[name]["jd_fetched"] = n_jd_fetched
         totals["fetched"] += len(postings)
         totals["kept"] += len(kept)
         totals["new"] += n_new

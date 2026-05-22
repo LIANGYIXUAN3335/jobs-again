@@ -40,6 +40,20 @@ def norm_title(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
 
 
+def active_cooldowns(cfg: dict, today: str | None = None) -> dict[str, dict]:
+    """Companies under an application cooldown (some ATSes cap apps per window, e.g. Plaid on
+    Ashby: 3 per 60 days). Returns {norm_key: {until, reason}} for cooldowns not yet expired.
+    While active, the scanner skips the company and the UI hides its roles."""
+    import datetime
+    today = today or datetime.date.today().isoformat()
+    out: dict[str, dict] = {}
+    for name, cd in (cfg.get("cooldowns") or {}).items():
+        until = str((cd or {}).get("until", ""))
+        if until and until >= today:
+            out[norm_key(name)] = {"until": until, "reason": (cd or {}).get("reason", "")}
+    return out
+
+
 def load_company_notes(cfg: dict) -> dict[str, dict]:
     p = resolve_path(cfg.get("company_notes", "company_notes.yaml"))
     if not p.exists():
