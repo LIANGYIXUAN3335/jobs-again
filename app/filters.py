@@ -61,6 +61,13 @@ def classify(posting: Posting, filters_cfg: dict) -> FilterResult:
     if senior and not filters_cfg.get("keep_senior_titles", True):
         return FilterResult(False, "seniority:senior")
 
+    # Clearance requirements may appear in the job description.
+    if filters_cfg.get("drop_clearance", True):
+        hay = f"{title} {(posting.jd_text or '').lower()}"
+        hit = _first_hit(filters_cfg.get("clearance_exclude", []), hay)
+        if hit:
+            return FilterResult(False, f"clearance:{hit}")
+
     # --- pure-SRE-oncall rule ---
     if filters_cfg.get("drop_sre_titles", True) and (
         "site reliability" in title or _hit("sre", title)
