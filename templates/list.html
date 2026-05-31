@@ -75,6 +75,13 @@
   <span class="dim">{{ rows|length }} shown · keys: j/k move · Enter JD · a applied · s skip · x rejected · i interviewing · n new</span>
 </form>
 
+{% if cap_info %}
+<div class="cap-note" title="{% for co, c in cap_info.items() %}{{ co }}: showing {{ c.shown }}, {{ c.held }} held since {{ c.since }}&#10;{% endfor %}">
+  📦 per-company cap: showing top 15 each ·
+  {{ cap_info|length }} compan{{ 'y' if cap_info|length == 1 else 'ies' }} capped,
+  {{ cap_info.values()|sum(attribute='held') }} roles held for later (hover for detail; they're under <b>all</b>)
+</div>
+{% endif %}
 <table id="roles">
 <thead><tr>
   <th>company</th><th>title</th><th>location</th><th class="num">score</th>
