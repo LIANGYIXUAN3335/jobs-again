@@ -49,11 +49,60 @@ _REJECT = re.compile(
 _NOREPLY = re.compile(r"no[-_.]?reply|do[-_.]?not[-_.]?reply|donotreply|mailer-daemon|automated@", re.I)
 
 
+def _convo_key(from_addr: str, subject: str) -> str:
+    """Stable conversation id: sender email + subject with Re:/Fwd: stripped. Lets us treat
+    all messages in one recruiter thread as the same conversation, so dismissing/sending once
+    stops the whole thread from being re-drafted."""
+    import email.utils
+    addr = email.utils.parseaddr(from_addr or "")[1].lower()
+    subj = re.sub(r"^\s*(re|fwd|fw)\s*:\s*", "", (subject or "").strip(), flags=re.I)
+    subj = re.sub(r"\s+", " ", subj).lower()
+    return f"{addr}|{subj}"
+
+
 def _client(cfg):
     mc, addr, pw = mail._creds(cfg)
     M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"))
     M.login(addr, pw)
     return M, addr
+
+
+_MID = re.compile(r"<[^<>@\s]+@[^<>\s]+>")
+
+
+def _replied_mids(cfg, days: int = 45) -> set[str]:
+    """Message-IDs the user has ALREADY replied to — collected from her Sent Mail's
+    In-Reply-To/References headers over the last `days`. A thread whose newest inbound
+    message is in this set is done; we must not re-draft a reply for it. Cheap: one
+    header-only pass over Sent Mail, no LLM."""
+    try:
+        M, _ = _client(cfg)
+    except Exception:
+        return set()
+    out: set[str] = set()
+    try:
+        M.select('"[Gmail]/Sent Mail"')
+        since = (datetime.datetime.now(datetime.timezone.utc)
+                 - datetime.timedelta(days=days)).strftime("%d-%b-%Y")
+        typ, data = M.search(None, f"(SINCE {since})")
+        ids = (data[0] or b"").split()[-500:]         # cap the scan to the recent window
+        if ids:
+            # ONE batched fetch (not 500 round-trips) — headers only, fast.
+            typ, d = M.fetch(b",".join(ids), "(BODY.PEEK[HEADER.FIELDS (IN-REPLY-TO REFERENCES)])")
+            for part in (d or []):
+                blob = part[1] if isinstance(part, tuple) else part
+                if not blob:
+                    continue
+                hdr = blob.decode("utf-8", "ignore") if isinstance(blob, (bytes, bytearray)) else str(blob)
+                out.update(m.group(0) for m in _MID.finditer(hdr))
+    except Exception:
+        pass
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+    return out
 
 
 def _sent_examples(cfg, limit=4) -> list[str]:
@@ -115,7 +164,9 @@ def _classify_and_draft(cfg, msg, slots, examples):
     if not key:
         return None
     ex = "\n\n".join(f"Example of her past reply:\n{e}" for e in examples) or "(no past replies on file)"
-    slot_txt = ("Available slots to offer: " + "; ".join(slots)) if slots else "No calendar slots available."
+    slot_txt = (("Her real availability windows to offer (phrase them naturally, don't dump "
+                 "the whole list — pick the best 2–3 and invite them to pick a time):\n- "
+                 + "\n- ".join(slots)) if slots else "No calendar availability available.")
     user = (
         f"{ex}\n\n---\nIncoming email:\nFrom: {msg['from']}\nSubject: {msg['subject']}\n\n"
         f"{msg['body'][:4000]}\n\n---\n{slot_txt}\n\nTriage and draft the reply as JSON."
@@ -159,19 +210,43 @@ def triage(cfg: dict, max_llm: int = 12, days: int | None = None, limit: int = 6
 
     heads = mail.search_recent(cfg, days=days, limit=limit)
     examples = _sent_examples(cfg)
-    slots = gcal.free_slots(cfg) if gcal.available(cfg) else []
+    replied = _replied_mids(cfg, days=max(days, 45))    # threads she's already answered
+    # Conversations she already dismissed or sent a reply for — don't re-draft their follow-ups.
+    closed = {_convo_key(r["from_addr"], r["subject"]) for r in store.queue_closed_rows(conn)}
+    # Prefer broad availability windows (whole day / morning / afternoon) — easier for a
+    # recruiter to arrange around than three narrow 45-min slots. Fall back to slots, then
+    # to the owner's stated availability.
+    slots = []
+    if gcal.available(cfg):
+        offer = (cfg.get("calendar") or {}).get("offer", "windows")
+        slots = gcal.free_windows(cfg) if offer == "windows" else gcal.free_slots(cfg)
     # No calendar connected → offer the owner's stated availability so scheduling replies still
     # propose real times instead of leaving a [[AVAILABILITY]] placeholder.
     if not slots and inbox_cfg.get("availability"):
         slots = [inbox_cfg["availability"]]
 
-    queued, armed, llm_used = 0, 0, 0
+    queued, armed, skipped_replied, llm_used = 0, 0, 0, 0
     for h in heads:
         if _SKIP_SUBJECT.search(h["subject"] or "") or _SKIP_SENDER.search(h["from"] or ""):
             continue
         full = mail.get_message(cfg, h["uid"])
         mid = full.get("message_id") or f"uid:{h['uid']}"
         if store.queue_has(conn, mid):
+            continue
+        # Same conversation already dismissed/sent → skip the whole thread (her explicit
+        # "I'm done with this one" — don't keep re-drafting its follow-up messages).
+        if _convo_key(full["from"], full["subject"]) in closed:
+            skipped_replied += 1
+            continue
+        # Already answered? If her Sent Mail replied to THIS message, it's handled — skip it
+        # (a later inbound message in the same thread has its own Message-ID and still surfaces).
+        if full.get("message_id") and full["message_id"].strip() in replied:
+            skipped_replied += 1
+            continue
+        # No-reply "type": nothing to answer if we can't actually reply to the sender. Skip
+        # before spending an LLM call.
+        repliable = bool(full.get("reply_to")) and not _NOREPLY.search(full.get("reply_to") or "")
+        if not repliable:
             continue
         if _REJECT.search(full["body"][:2000]):
             continue
@@ -182,7 +257,6 @@ def triage(cfg: dict, max_llm: int = 12, days: int | None = None, limit: int = 6
         if not r or not r.get("needs_reply"):
             continue
 
-        repliable = bool(full.get("reply_to")) and not _NOREPLY.search(full.get("reply_to") or "")
         low_risk = (r.get("category") == "scheduling" and r.get("confidence") == "high"
                     and repliable and slots and "[[AVAILABILITY]]" not in (r.get("draft") or ""))
         auto = (mode == "all" and repliable) or (mode == "gated" and low_risk)
@@ -202,7 +276,7 @@ def triage(cfg: dict, max_llm: int = 12, days: int | None = None, limit: int = 6
             armed += 1
         _star(cfg, h["uid"])
     return {"scanned": len(heads), "llm_used": llm_used, "queued": queued,
-            "armed": armed, "calendar": bool(slots)}
+            "armed": armed, "skipped_replied": skipped_replied, "calendar": bool(slots)}
 
 
 def send_due(cfg: dict) -> list[dict]:
