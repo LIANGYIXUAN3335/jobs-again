@@ -172,16 +172,19 @@ def _classify_and_draft(cfg, msg, slots, examples):
         f"{msg['body'][:4000]}\n\n---\n{slot_txt}\n\nTriage and draft the reply as JSON."
     )
     ai = cfg.get("ai") or {}
+    # Triage runs every 30 min on the API key — use a cheap model (inbox.model, default Haiku).
+    # Résumé tailoring keeps Opus (it runs on the subscription, separately). Email classify +
+    # short draft doesn't need Opus. Haiku 4.5 does NOT support adaptive thinking, so only add
+    # thinking/effort for the Opus/Sonnet family.
+    model = (cfg.get("inbox") or {}).get("model") or ai.get("model", "claude-haiku-4-5")
     import anthropic
     client = anthropic.Anthropic(api_key=key)
-    resp = client.messages.create(
-        model=ai.get("model", "claude-opus-4-8"),
-        max_tokens=1500,
-        thinking={"type": "adaptive"},
-        output_config={"effort": ai.get("effort", "high")},
-        system=_SYSTEM,
-        messages=[{"role": "user", "content": user}],
-    )
+    kwargs = {"model": model, "max_tokens": 1500, "system": _SYSTEM,
+              "messages": [{"role": "user", "content": user}]}
+    if "haiku" not in model:
+        kwargs["thinking"] = {"type": "adaptive"}
+        kwargs["output_config"] = {"effort": ai.get("effort", "high")}
+    resp = client.messages.create(**kwargs)
     text = "".join(b.text for b in resp.content if b.type == "text")
     try:
         return json.loads(aimod._extract_json(text))
