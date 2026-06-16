@@ -374,7 +374,10 @@ def fetch_view(
                     }
         r["hidden_sig"] = hidden_sig
 
-        in_review = eff == "new" and not r["hidden_company"] and not hidden_sig and not cd
+        # verdict 'drop' (over the years ceiling / non-US) is a dead-end — keep it out of the
+        # review queue entirely (it still shows under 'all'), and never auto-tailored.
+        in_review = (eff == "new" and not r["hidden_company"] and not hidden_sig and not cd
+                     and r["verdict"] != "drop")
         r["in_review"] = in_review
         if in_review:
             counts["new"] += 1
