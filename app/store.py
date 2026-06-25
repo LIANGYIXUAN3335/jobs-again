@@ -16,6 +16,15 @@ LA = ZoneInfo("America/Los_Angeles")
 STATUSES = ["new", "applied", "interviewing", "skip", "rejected"]
 CLOSED_STATUSES = {"applied", "skip", "rejected"}
 
+# What happened AFTER applying. `status` answers "is this still in my review queue"; these
+# answer "did it work", which is the only thing that can tell you whether the four-dimension
+# score predicts anything. Ordered — a role's stage only ever moves right.
+STAGES = ["applied", "responded", "screen", "interview", "onsite", "offer"]
+STAGE_RANK = {s: i for i, s in enumerate(STAGES)}
+# Terminal results. "no_response" is the honest name for silence; it is set by hand or by the
+# funnel's staleness rule, never guessed from an absence of email.
+OUTCOMES = ["in_progress", "rejected", "no_response", "offer", "hired", "declined", "withdrawn"]
+
 ROLE_COLS = [
     "job_id", "ats", "company", "company_norm", "title", "title_norm", "department",
     "location", "is_remote", "seniority", "apply_url", "jd_text", "jd_hash",
@@ -47,7 +56,17 @@ CREATE TABLE IF NOT EXISTS role_state (
   status TEXT NOT NULL DEFAULT 'new',
   status_updated_at TEXT, applied_date TEXT, applied_with_resume TEXT,
   notes TEXT DEFAULT '',
-  tailor_status TEXT DEFAULT 'none', prompt_path TEXT, tailored_resume_path TEXT
+  tailor_status TEXT DEFAULT 'none', prompt_path TEXT, tailored_resume_path TEXT,
+  -- outcome half: what happened after the application went in (see STAGES / OUTCOMES)
+  stage TEXT, outcome TEXT, outcome_note TEXT DEFAULT '',
+  first_response_at TEXT, last_contact_at TEXT
+);
+-- One row per follow-up nudge actually drafted, so the "has this gone quiet" maths and the
+-- two-per-application ceiling survive a restart. Draft-only: sent_at is stamped by hand.
+CREATE TABLE IF NOT EXISTS followups (
+  job_id TEXT, seq INTEGER, drafted_at TEXT, sent_at TEXT,
+  channel TEXT, to_addr TEXT, subject TEXT, body TEXT,
+  PRIMARY KEY (job_id, seq)
 );
 CREATE TABLE IF NOT EXISTS applied_companies (
   name_norm TEXT PRIMARY KEY, display_name TEXT, added_at TEXT
@@ -158,9 +177,30 @@ def connect_jobs(cfg: dict) -> sqlite3.Connection:
     return conn
 
 
+# Columns added to role_state after the table already existed in the wild. CREATE TABLE IF NOT
+# EXISTS is a no-op on an existing table, so they have to be ALTERed in. Additive only —
+# nothing here ever drops or rewrites a column, so an old DB keeps every status she has set.
+_USER_MIGRATIONS = [
+    ("role_state", "stage", "TEXT"),
+    ("role_state", "outcome", "TEXT"),
+    ("role_state", "outcome_note", "TEXT DEFAULT ''"),
+    ("role_state", "first_response_at", "TEXT"),
+    ("role_state", "last_contact_at", "TEXT"),
+]
+
+
+def _migrate_user(conn: sqlite3.Connection) -> None:
+    for table, col, decl in _USER_MIGRATIONS:
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if col not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+    conn.commit()
+
+
 def connect_user(cfg: dict) -> sqlite3.Connection:
     conn = _connect(user_db_path(cfg))
     conn.executescript(USER_SCHEMA)
+    _migrate_user(conn)
     return conn
 
 
@@ -233,9 +273,12 @@ def meta_set(conn, key: str, value: str) -> None:
 
 # ---------- user side (user_state db) ----------
 
+# EVERY column of role_state must be listed here: upsert_state writes with INSERT OR REPLACE,
+# so a column left out would be silently reset to NULL on the next status change.
 _STATE_COLS = [
     "job_id", "status", "status_updated_at", "applied_date", "applied_with_resume",
     "notes", "tailor_status", "prompt_path", "tailored_resume_path",
+    "stage", "outcome", "outcome_note", "first_response_at", "last_contact_at",
 ]
 
 
@@ -273,6 +316,76 @@ def set_status(conn, job_id: str, status: str, resume_variant: str | None = None
 
 def set_notes(conn, job_id: str, notes: str) -> dict:
     return upsert_state(conn, job_id, notes=notes)
+
+
+def record_signal(conn, job_id: str, *, stage: str | None = None, outcome: str | None = None,
+                  note: str = "", when: str | None = None) -> dict:
+    """Record something that happened to an application after it went out.
+
+    Monotonic on purpose: `stage` only advances (a scheduling email arriving after an onsite
+    must not demote the row back to 'responded'), and `first_response_at` is written once —
+    it is the funnel's key measurement and a later contact must not overwrite it. Notes are
+    appended with their date, never replaced, so re-running a scan can't erase history.
+    """
+    when = when or la_today()
+    row = conn.execute("SELECT * FROM role_state WHERE job_id=?", (job_id,)).fetchone()
+    cur = dict(row) if row else {}
+    fields: dict = {"last_contact_at": when}
+
+    if stage:
+        if stage not in STAGE_RANK:
+            raise ValueError(f"invalid stage {stage!r}")
+        if STAGE_RANK[stage] > STAGE_RANK.get(cur.get("stage") or "applied", -1):
+            fields["stage"] = stage
+        if stage != "applied" and not cur.get("first_response_at"):
+            fields["first_response_at"] = when      # write-once
+        # A real reply means the row is no longer just "applied" in the review UI either.
+        if stage in ("screen", "interview", "onsite") and cur.get("status") == "applied":
+            fields["status"] = "interviewing"
+    if outcome:
+        if outcome not in OUTCOMES:
+            raise ValueError(f"invalid outcome {outcome!r}")
+        fields["outcome"] = outcome
+        if outcome == "rejected" and (cur.get("status") or "new") != "rejected":
+            fields["status"] = "rejected"
+        if outcome in ("offer", "hired") and STAGE_RANK.get(cur.get("stage") or "", -1) < STAGE_RANK["offer"]:
+            fields["stage"] = "offer"
+        if outcome != "in_progress" and not cur.get("first_response_at") and outcome != "no_response":
+            fields["first_response_at"] = when
+    if note:
+        prev = (cur.get("outcome_note") or "").strip()
+        fields["outcome_note"] = f"{prev}\n{when}: {note}".strip()
+    return upsert_state(conn, job_id, **fields)
+
+
+# ---------- follow-ups (draft-only; nothing here sends) ----------
+
+def followups_for(conn, job_id: str) -> list[dict]:
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM followups WHERE job_id=? ORDER BY seq", (job_id,))]
+
+
+def followup_counts(conn) -> dict[str, int]:
+    return {r["job_id"]: r["n"] for r in conn.execute(
+        "SELECT job_id, COUNT(*) n FROM followups GROUP BY job_id")}
+
+
+def followup_add(conn, job_id: str, *, channel: str, to_addr: str | None,
+                 subject: str, body: str) -> int:
+    seq = (conn.execute("SELECT COALESCE(MAX(seq),0) m FROM followups WHERE job_id=?",
+                        (job_id,)).fetchone()["m"]) + 1
+    conn.execute(
+        "INSERT INTO followups (job_id, seq, drafted_at, sent_at, channel, to_addr, subject, body)"
+        " VALUES (?,?,?,?,?,?,?,?)",
+        (job_id, seq, la_today(), None, channel, to_addr, subject, body))
+    conn.commit()
+    return seq
+
+
+def followup_mark_sent(conn, job_id: str, seq: int) -> None:
+    conn.execute("UPDATE followups SET sent_at=? WHERE job_id=? AND seq=?",
+                 (la_today(), job_id, seq))
+    conn.commit()
 
 
 def set_tailor(conn, job_id: str, **fields) -> dict:
