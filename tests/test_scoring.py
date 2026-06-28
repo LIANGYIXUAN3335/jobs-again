@@ -30,13 +30,13 @@ def test_depth_rewards_backend_keywords():
 def test_layoffs_penalty_and_caution():
     notes = {"size": "large", "recent_layoffs": 2026}
     s = scoring.score(mk(DEEP_JD), notes, CFG)
-    assert s.s_stability == 2.0  # 3.0 + 0.5 (large) - 1.5 (layoffs)
+    assert s.s_stability == 2.4  # 3.0 + 0.5 (large) - 1.5 (layoffs) + 0.4 (payments)
     assert "layoffs" in s.caution
 
 
-def test_stability_prior_overrides_derivation():
+def test_stability_prior_replaces_notes_but_keeps_jd_signal():
     s = scoring.score(mk(DEEP_JD), {"stability_prior": 2.5, "recent_layoffs": 2026}, CFG)
-    assert s.s_stability == 2.5
+    assert s.s_stability == 2.9
 
 
 def test_wlb_prior_dominates_and_jd_capped():

@@ -14,15 +14,20 @@ def parse_job(company: str, slug: str, j: dict) -> Posting:
     parts = [loc] + [o for o in offices if o and o != loc]
     location = " · ".join(p for p in parts if p)
     departments = "; ".join(d.get("name", "") for d in (j.get("departments") or []) if d.get("name"))
+    raw_id = str(j["id"])
     return Posting(
         ats="greenhouse",
         company=company,
         slug=slug,
-        raw_id=str(j["id"]),
+        raw_id=raw_id,
         title=(j.get("title") or "").strip(),
         location=location,
         jd_text=strip_html(j.get("content") or ""),
-        apply_url=j.get("absolute_url") or "",
+        # NOT absolute_url — many companies (MongoDB, Stripe, Databricks…) set it to a vanity
+        # careers domain that either 403s (MongoDB/CloudFront) or redirects away from greenhouse,
+        # AND the browser extension only fires on greenhouse.io. The ATS-hosted embed form loads
+        # reliably, stays on greenhouse, and is the exact page the extension is verified against.
+        apply_url=f"https://job-boards.greenhouse.io/embed/job_app?for={slug}&token={raw_id}",
         department=departments,
         is_remote="remote" in location.lower(),
     )
