@@ -10,6 +10,9 @@ from __future__ import annotations
 import datetime
 import email
 import imaplib
+import mimetypes
+import pathlib
+import re
 import smtplib
 import ssl
 from email.header import decode_header, make_header
@@ -117,32 +120,49 @@ def get_message(cfg: dict, uid: str) -> dict:
             pass
 
 
+def _hdr(v: str) -> str:
+    """Header-safe: strip CR/LF and collapse runs of whitespace. Some senders wrap long
+    Subjects across lines (OpenArt's had a literal newline), which SMTP rejects in a header."""
+    return re.sub(r"\s+", " ", (v or "").replace("\r", " ").replace("\n", " ")).strip()
+
+
 def _re_subject(subject: str) -> str:
-    s = (subject or "").strip()
+    s = _hdr(subject)
     return s if s.lower().startswith("re:") else f"Re: {s}"
 
 
 def send_reply(cfg: dict, to_addr: str, subject: str, body: str,
                in_reply_to: str | None = None, references: str | None = None,
-               from_name: str = "Casey Example") -> dict:
+               from_name: str = "Casey Example", attachments: list[str] | None = None,
+               new_thread: bool = False) -> dict:
     """Send a reply via SMTP. Threads via In-Reply-To/References when the original headers
-    are passed. NEVER call this without the user having reviewed and approved the draft."""
+    are passed (unless new_thread). Optional `attachments` = list of file paths to attach (e.g. a
+    résumé PDF). NEVER call this without the user having reviewed and approved the draft."""
     mc, addr, pw = _creds(cfg)
     msg = EmailMessage()
     msg["From"] = formataddr((from_name, addr))
-    msg["To"] = to_addr
-    msg["Subject"] = _re_subject(subject)
+    msg["To"] = _hdr(to_addr)
+    msg["Subject"] = _hdr(subject) if new_thread else _re_subject(subject)
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid()
-    if in_reply_to:
-        msg["In-Reply-To"] = in_reply_to
-        msg["References"] = (references + " " + in_reply_to).strip() if references else in_reply_to
+    if in_reply_to and not new_thread:
+        msg["In-Reply-To"] = _hdr(in_reply_to)
+        msg["References"] = _hdr((references + " " + in_reply_to) if references else in_reply_to)
     msg.set_content(body)
+    attached = []
+    for path in (attachments or []):
+        p = pathlib.Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"attachment not found: {path}")
+        ctype, _ = mimetypes.guess_type(p.name)
+        maintype, subtype = (ctype.split("/", 1) if ctype else ("application", "octet-stream"))
+        msg.add_attachment(p.read_bytes(), maintype=maintype, subtype=subtype, filename=p.name)
+        attached.append(p.name)
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL(mc.get("smtp_host", "smtp.gmail.com"), int(mc.get("smtp_port", 465)), context=ctx) as s:
         s.login(addr, pw)
         s.send_message(msg)
-    return {"sent": True, "to": to_addr, "subject": msg["Subject"]}
+    return {"sent": True, "to": to_addr, "subject": msg["Subject"], "attachments": attached}
 
 
 def smtp_check(cfg: dict) -> bool:
