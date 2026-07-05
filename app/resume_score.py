@@ -22,8 +22,18 @@ from dataclasses import dataclass, field
 # Each canonical skill matches if ANY variant appears as a whole word/phrase.
 _HARD_SKILLS: dict[str, list[str]] = {
     # languages
-    "Go": ["go", "golang"], "Java": ["java"], "Python": ["python"],
-    "C++": [r"c\+\+", "cpp"], "Rust": ["rust"], "C": [r"\bc\b(?!\+)"],
+    # "Go" is case-SENSITIVE: JDs write the language as "Go", prose writes "go to market",
+    # "as we go". Without that, ~every JD looked like it asked for Go (see _find's (?-i:…) note).
+    "Go": [r"(?-i:\bGo\b)", "golang"], "Java": ["java"], "Python": ["python"],
+    "C++": [r"c\+\+", "cpp"], "Rust": ["rust"],
+    # "C" the language, and ONLY that. The old `\bc\b(?!\+)` also fired on C#, Objective-C,
+    # "C-suite", "(C&SI)" and "Washington D.C." — 509 roles (18%) grew a phantom C requirement she can never
+    # meet, which is a pure, permanent skills_coverage penalty. Case-sensitive + neighbours
+    # excluded on both sides, and a JD that writes the pair ("C/C++", "C, or C++", "C++ or C")
+    # counts as C++ ONLY — she HAS C++, so billing that as an unmet C requirement double-
+    # punished a skill she has. 509 → 130 roles; the survivors genuinely list C on its own.
+    "C": [r"(?-i:(?<![\w+#&.-])(?<!C\+\+/)(?<!C\+\+, )(?<!C\+\+ or )(?<!C\+\+ and )"
+          r"C(?![\s,/]*(?:or|and)?[\s,/]*C\+\+)(?![\w+#&-]))"],
     "SQL": ["sql"], "TypeScript": ["typescript"], "JavaScript": ["javascript"],
     "Scala": ["scala"], "Kotlin": ["kotlin"], "Ruby": ["ruby"],
     # databases / storage / streaming
@@ -54,7 +64,9 @@ _HARD_SKILLS: dict[str, list[str]] = {
     "backup & restore": ["backup", "restore"], "disaster recovery": ["disaster recovery"],
     "bulk ingestion": ["bulk ingestion", "bulk load", "ingestion"],
     # security
-    "encryption": ["encryption", "encrypt"], "cryptography": ["cryptograph", "crypto"],
+    # NOT bare "crypto" — that matched "cryptocurrency"/"crypto assets", so every fintech JD
+    # (Ripple, Circle, Coinbase…) looked like it demanded cryptography she doesn't have.
+    "encryption": ["encryption", "encrypt"], "cryptography": ["cryptograph"],
     "TLS": ["tls"], "X.509": ["x.509", "x509"], "PKI": ["pki"],
     "authentication": ["authentication", "authn"], "authorization": ["authorization", "authz"],
     "security": ["security", "secure"], "compliance": ["compliance", "compliant"],
@@ -64,7 +76,8 @@ _HARD_SKILLS: dict[str, list[str]] = {
     "Terraform": ["terraform"], "CI/CD": ["ci/cd", "cicd", "continuous integration"],
     "Linux": ["linux"], "Infrastructure as Code": ["infrastructure as code", "infrastructure-as-code", "iac"],
     # frameworks / data
-    "GraphQL": ["graphql"], "Node.js": ["node.js", "nodejs", "node"], "Spring": ["spring"],
+    # bare "node" dropped: it matched "leader node", "each node in the cluster".
+    "GraphQL": ["graphql"], "Node.js": ["node.js", "nodejs"], "Spring": ["spring"],
     "Pandas": ["pandas"], "PyTorch": ["pytorch"],
 }
 
@@ -78,6 +91,43 @@ _SOFT_SKILLS: dict[str, list[str]] = {
     "problem-solving": ["problem-solving", "problem solving"],
 }
 
+# How a canonical skill should READ when the optimize loop surfaces it into a résumé's skills
+# list. The canonical keys are matching tokens, not résumé prose — an "Additional Relevant
+# Skills: ownership, self-directed" line looks like keyword stuffing to the human who reads it
+# after the ATS does. Anything not listed here surfaces under its own name, which is already fine
+# ("Kafka", "PostgreSQL"). Every phrase here still matches its canonical variants, so relabeling
+# can't cost coverage.
+SURFACE_AS: dict[str, str] = {
+    "ownership": "end-to-end ownership",
+    "self-directed": "self-directed execution",
+    "fault tolerance": "fault-tolerant design",
+    "high availability": "high-availability systems",
+    "high throughput": "high-throughput systems",
+    "low latency": "low-latency systems",
+    "concurrency": "concurrency",
+    "event-driven": "event-driven architecture",
+    "bulk ingestion": "data ingestion",
+    "message queue": "message queues",
+    "database internals": "database internals",
+    "API design": "API design",
+    "REST APIs": "REST APIs",
+    "code review": "code review",
+    "testing": "automated testing",
+    "debugging": "debugging & troubleshooting",
+    "monitoring": "monitoring & alerting",
+    "backup & restore": "backup & restore",
+    "scalability": "scalability",
+    "collaboration": "cross-functional collaboration",
+    "communication": "technical communication",
+    "problem-solving": "problem-solving",
+}
+
+
+def surface_label(canon: str) -> str:
+    """Résumé-facing wording for a canonical skill (see SURFACE_AS)."""
+    return SURFACE_AS.get(canon, canon)
+
+
 # JD role phrases → the resume should echo the role family.
 _TITLE_TERMS = ["software engineer", "backend", "back-end", "back end", "distributed",
                 "platform", "infrastructure", "systems", "server", "member of technical staff",
@@ -85,6 +135,9 @@ _TITLE_TERMS = ["software engineer", "backend", "back-end", "back end", "distrib
 
 
 def _find(text: str, variants: list[str]) -> bool:
+    """A variant containing regex metacharacters is used as a raw pattern — that's the escape
+    hatch for the ambiguous tokens. Matching is case-insensitive overall, so a variant that
+    must be case-SENSITIVE (the "Go"/"go" and "C"/"c" problem) wraps itself in `(?-i:…)`."""
     for v in variants:
         if re.search(r"[\\()\[\].+]", v):        # regex-y variants used raw
             pat = v
