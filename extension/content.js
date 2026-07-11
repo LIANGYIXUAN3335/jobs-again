@@ -30,7 +30,15 @@
   const isContextDead = (r) => !!r && r.error === CONTEXT_DEAD;
   // Human-like pacing between field fills so forms don't flag the burst as a bot.
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const humanPause = () => sleep(180 + Math.floor(Math.random() * 140)); // ~0.18–0.32s
+  // Stop button: while filling, clicking the button again sets this. humanPause runs between
+  // almost every field, so throwing there stops the fill promptly at the next field boundary.
+  let abortFill = false;
+  const ABORT = "__jobscan_abort__";
+  const humanPause = async () => {
+    if (abortFill) throw new Error(ABORT);
+    await sleep(180 + Math.floor(Math.random() * 140));         // ~0.18–0.32s
+    if (abortFill) throw new Error(ABORT);
+  };
 
   // ---- form helpers ----
   function setNativeValue(el, value) {
@@ -49,7 +57,11 @@
     if (el.getAttribute("role") === "combobox") return true;
     if (el.getAttribute("aria-haspopup") || el.getAttribute("aria-autocomplete")) return true;
     if (el.hasAttribute("aria-expanded") || el.hasAttribute("aria-controls")) return true;
-    if (el.closest('[class*="select__control"],[class*="select__value"],[role=combobox],[role=listbox]')) return true;
+    // ANY react-select subnode (…select__… — control, value, AND the hidden form input react-
+    // select renders with no role), an Ashby/MUI select wrapper, or a listbox. The hidden input
+    // is why Samsara's "AI Policy" dropdown got a typed paragraph — it slipped past the old
+    // `select__control`-only check into the AI text path.
+    if (el.closest('[class*="select__"],[class*="_select"],[role=combobox],[role=listbox]')) return true;
     return false;
   }
 
@@ -176,19 +188,62 @@
   function commonAnswer(label, profile) {
     const t = clean(label).toLowerCase();
     if (!t) return null;
+    // WORK AUTHORIZATION & SPONSORSHIP are ALWAYS eligibility toggles — decide them BEFORE the
+    // essay/length guard below can nuke a long-worded one (the box text on Workday runs past 120
+    // chars, which used to fall through to a default that answered authorization as "No"). She IS
+    // authorized (EAD/AOS) and needs NO sponsorship. Authorization is checked first, so a combined
+    // "authorized to work WITHOUT sponsorship?" reads correctly as Yes.
+    if (/authori[sz]ed to work|authori[sz]ation to work|legally (authorized|allowed|entitled|eligible)\b.{0,20}\bwork|(right|eligible|permitted|permission) to work|work authoriz/.test(t))
+      return { yesno: "yes" };
+    if (/\bsponsor/.test(t)) return { yesno: "no" };
+    // OPEN-ENDED essay questions must NEVER get a Yes/No or canned value — they go to the AI.
+    // "Tell us about your experience working remote…" contains "remote", which used to trigger a
+    // stray "Yes". A prompt that asks you to narrate is not an eligibility toggle.
+    if (/\b(tell us|describe|walk (us|me)|share (your|a|some)|explain|elaborate|in your own words|give (us |me )?(an )?example)\b/.test(t)
+        || /\byour experience\b/.test(t)
+        || /\bwhat\b.{0,30}\b(challenge|experience|approach|practice|excite|draw|motivat|interest|learn|proud|accomplish)/.test(t)
+        || /\b(what|how|why|when|where)\b.{0,60}\byou\b.{0,40}\?/.test(t)   // "what … do you …?" narrative
+        || t.length > 120) return null;
     const YES = { yesno: "yes" }, NO = { yesno: "no" };
     const US = profile.country || "United States";
     // eligibility / logistics (Yes/No)
-    if (/\bspons/.test(t)) return NO;                                       // need sponsorship? → No
+    // Harmless required opt-ins (marketing / personalization / job recommendations / alerts) —
+    // no "right" answer and won't affect the application, so just satisfy the field. Decline
+    // (No) is the tidy default: fewer marketing emails. Owner's rule: "just pick one."
+    if (/personali[sz]e|job recommendation|recommended content|marketing (email|communication)|promotional|stay up to date|receive (updates|alerts|newsletter)|opt.?in/.test(t)) return NO;
+    // Don't let them contact the CURRENT employer (job-search confidentiality) — a past/previous
+    // employer is fine. "may we contact your current employer / present employer" → No.
+    if (/(may we |can we |okay to )?contact.{0,30}(current|present)\s*employer|current employer.{0,20}contact/.test(t)) return NO;
+    // Order matters: a question can mention BOTH "authorized" and "sponsor" ("are you authorized
+    // to work WITHOUT sponsorship?" → Yes). Decide the specific "do you NEED sponsorship?" case
+    // first (No), THEN "are you authorized?" (Yes), and only a bare stray "sponsor" falls to No.
+    if (/(require|need|request|seek).{0,25}sponsor|sponsor.{0,20}(require|need)|will you (now|ever|in the future).{0,30}sponsor/.test(t)) return NO;
     if (/authori[sz]|legally (allowed|entitled|eligible|authorized)|eligible to work|right to work|permitted to work|work permit|legally.*work/.test(t)) return YES;
+    if (/\bspons/.test(t)) return NO;                                       // any other sponsorship mention → No
     if (/(ever|previously|before|prior|former|formerly).{0,40}(employ|work)/.test(t) || /(employ|work(ed)?)\b.{0,25}(for us|by us|here before|at (this|our) (compan|organi)|our compan|current or former)/.test(t) || /current or former (employee|worker|contractor)/.test(t)) return NO;
+    // Employed by / affiliated with a university, government, or public-sector entity → No (none
+    // of these apply to her; this is the standard screening answer). Guarded so it never steps on
+    // a work-authorization or "United States" phrasing.
+    if ((/(employ\w*|work\w*|affiliat\w*|officer|official|contractor)\b.{0,45}(universit|college|government|federal|state agenc|state government|public sector|public office|regulatory)/.test(t)
+         || /\b(government|public)\s+(official|employee|officer|entity|agenc)/.test(t)) && !/authori[sz]|united states/.test(t)) return NO;
+    // Citizenship / residency in an export-controlled or sanctioned country → No.
+    if (/(citizen|resident|national|permanent resident)\b.{0,80}(cuba|syria|iran|north korea|crimea|donetsk|luhansk|sanction)/.test(t)
+        || /\bexport[- ]control|sanctioned (countr|region|nation)/.test(t)) return NO;
+    // Related to / knows a current employee of the company → No.
+    if (/\brelated to (a |an |any |current |anyone|someone)/.test(t)
+        || /(family member|relative|spouse|friend)\b.{0,30}(work|employ)|do you (have|know)\b.{0,30}(relative|family member).{0,20}(work|employ)/.test(t)) return NO;
     if (/relocat/.test(t)) return YES;
+    // Do you use / have experience with the company's OWN product or system → Yes (favorable and
+    // truthful — she's an engineer; owner's rule: answer toward getting the interview).
+    if (/(do you|have you|are you)\b.{0,45}(use|used|using|work(ed|ing)? (on|with)|experience (with|using)|familiar with|hands.?on|knowledge of)\b.{0,55}(workday|servicenow|our (product|platform|software|system|tool|technolog)|the (product|platform|system|software)|this (product|platform|system))/.test(t)) return YES;
     if (/\bremot/.test(t)) return YES;
     if (/on-?site|onsite|in[- ]office|in person|\bhybrid\b|commut/.test(t)) return YES;
     if (/able to travel|willing.*travel/.test(t)) return YES;
+    // Generic favorable "are you willing / able to …" → Yes (aim for the interview).
+    if (/are you (willing|able|comfortable|prepared|ready|open|available)\b.{0,40}(to|for|work)|can you (start|begin|commit|work|commute|attend)|willing to (start|commit|undergo|travel)/.test(t)) return YES;
     if (/\b18\b.*(older|age)|at least 18|over 18|of legal age|legally an adult/.test(t)) return YES;
     // acknowledgements / confirmations the form needs a Yes on
-    if (/\b(do you |please )?(accept|confirm|acknowledge|agree)\b/.test(t) && !/decline/.test(t)) return YES;
+    if (/\b(do you |please |i )?(accept|confirm|acknowledge|agree|certif(y|ies)|consent)\b/.test(t) && !/decline/.test(t)) return YES;
     // "how/where did you hear about this job" — answer LinkedIn (owner's pick)
     if (/(how|where) did you (hear|learn|find)|hear about (us|this)|source of (this )?(job|opportunity|application)/.test(t))
       return { text: "LinkedIn", choice: "LinkedIn" };
@@ -279,8 +334,11 @@
     const t = label.toLowerCase();
     if (/gender identity/.test(t)) return "gender_identity";
     if (/gender/.test(t)) return "gender";
-    if (/hispanic|latin/.test(t)) return "hispanic_latino";
+    // race BEFORE hispanic: a "Race" question lists "Hispanic or Latino" as an OPTION, so its
+    // block text contains "hispanic" — keying on that would mislabel the Race question. A
+    // standalone "Are you Hispanic or Latino?" has no "race"/"ethnic" word, so it still keys right.
     if (/\brace\b|racial|ethnic/.test(t)) return "race";
+    if (/hispanic|latin/.test(t)) return "hispanic_latino";
     if (/veteran/.test(t)) return "veteran";
     if (/disab/.test(t)) return "disability";
     return null;
@@ -329,6 +387,24 @@
     return { ok: true, picked: now() };
   }
 
+  // Pick the FIRST real option of a react-select (skipping the "Select…" placeholder). Used as
+  // the last resort for "how did you hear about us?" when the form lists no LinkedIn — owner's
+  // rule is "just pick one" for that harmless required field.
+  async function pickAnyOption(control, input) {
+    if (!control || !input) return { ok: false };
+    if (input.getAttribute("aria-expanded") !== "true") { coordSeq(control); }
+    let options = [];
+    for (let i = 0; i < 10 && !options.length; i++) {
+      await sleep(80);
+      const menu = document.getElementById(input.getAttribute("aria-controls") || "");
+      if (menu) options = [...menu.querySelectorAll("[role=option]")].filter((o) => o.textContent.trim() && !/^\s*select\b|^\s*please|^\s*choose|^\s*—\s*$/i.test(o.textContent));
+    }
+    if (!options.length) { input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); return { ok: false }; }
+    coordSeq(options[0]);
+    await sleep(200);
+    return { ok: true, picked: (control.innerText || "").replace(/\s+/g, " ").trim() };
+  }
+
   // Async typeahead (location/city pickers): the suggestions are fetched only AFTER you type,
   // and they come back worded differently from what we typed ("San Jose, CA" → "San Jose, CA,
   // USA"), so an exact match would always miss. Type to filter, wait for the fetch, take the
@@ -373,11 +449,44 @@
     return pickReactSelect(control, input, want, wantDecline ? null : DECLINE);
   }
 
+  // EEO rendered as RADIO groups (Ashby: Gender/Race/Veteran/Disability are radio dots, not the
+  // react-select dropdowns Greenhouse uses — that's why they weren't detected). One question per
+  // block; match the owner's eeo preference to a radio label and click it.
+  function radioText(r) {
+    if (r.id) { const l = document.querySelector(`label[for="${CSS.escape(r.id)}"]`); if (l && l.innerText.trim()) return l.innerText.replace(/\s+/g, " ").trim(); }
+    return (r.closest("label")?.innerText || r.getAttribute("aria-label") || r.value || "").replace(/\s+/g, " ").trim();
+  }
+  function fillEeoRadios(prefs, log) {
+    prefs = prefs || {};
+    let did = 0;
+    const seenBlocks = new Set();
+    for (const block of document.querySelectorAll('[class*="_fieldEntry"],fieldset,[class*="field"]')) {
+      if (!block.offsetParent) continue;
+      const radios = [...block.querySelectorAll('input[type=radio]')].filter((r) => r.offsetParent);
+      if (radios.length < 2) continue;
+      const txt = (block.innerText || "").replace(/\s+/g, " ").trim();
+      if (!DEMOGRAPHIC.test(txt) || seenBlocks.has(txt.slice(0, 25))) continue;
+      seenBlocks.add(txt.slice(0, 25));
+      if (radios.some((r) => r.checked)) continue;                 // already answered
+      const key = eeoKey(txt);
+      const pref = key && prefs[key] != null ? String(prefs[key]).trim() : "";
+      const wantDecline = !pref || DECLINE.test(pref);
+      let want;
+      if (wantDecline) want = DECLINE;
+      else { const yn = /^(yes|no)\b/i.exec(pref); want = yn ? new RegExp("^\\s*" + yn[1], "i") : new RegExp(escapeRe(pref), "i"); }
+      let target = radios.find((r) => want.test(radioText(r)));
+      if (!target && !wantDecline) target = radios.find((r) => DECLINE.test(radioText(r)));  // value absent → decline
+      if (target) { target.scrollIntoView({ block: "center" }); target.click(); did++; log("self-ID: " + short(key || txt.slice(0, 20)) + " → " + short(radioText(target)), "good"); }
+    }
+    return did;
+  }
+
   async function fillDemographics(prefs, log) {
     prefs = prefs || {};
     let acted = false;
     let did = 0;                    // count for untilSettled — some forms reveal race only
     const seen = new Set();         // after Hispanic/Latino is answered
+    did += fillEeoRadios(prefs, log);   // radio-based EEO (Ashby et al.) — combobox EEO below
     for (const input of document.querySelectorAll("input[role=combobox]")) {
       const label = comboLabel(input);
       if (!label || !DEMOGRAPHIC.test(label) || seen.has(label)) continue;
@@ -467,7 +576,16 @@
 
       const ans = commonAnswer(label, profile);
       let done = false;
-      if (ans && (ans.choice || ans.yesno)) {
+      // "How did you hear about us?" — prefer LinkedIn, but many forms don't list it. Owner's
+      // rule: if LinkedIn isn't there, just pick any option. Try LinkedIn → common sources →
+      // the FIRST real option, so a required field never blocks on a missing LinkedIn.
+      if (!done && /how (did|do) you hear|where did you (hear|learn|find)|hear about (us|this)|source of (this )?(job|opportunity|application)|referral source/.test(label.toLowerCase())) {
+        await pace();
+        let r = await pickReactSelect(control, input, /linkedin/i, /online|internet|company (web)?site|job board|social media|search engine|google|other/i);
+        if (!r.ok) r = await pickAnyOption(control, input);   // still nothing → first real option
+        if (r.ok) { log("how did you hear → " + short(r.picked), "good"); done = true; }
+      }
+      if (!done && ans && (ans.choice || ans.yesno)) {
         const want = ans.yesno ? (ans.yesno === "yes" ? /^\s*yes\b/i : /^\s*no\b/i)
           : new RegExp(escapeRe(ans.choice), "i");
         await pace();
@@ -487,6 +605,10 @@
     for (const el of document.querySelectorAll('textarea, input[type=text], input[type=search], input:not([type])')) {
       if (el.disabled || el.readOnly || (el.value || "").trim()) continue;
       if (classify(el)) continue;                       // standard profile field — fillFields did it
+      // A react-select's inner box is an input[type=text]; it's a DROPDOWN, not an essay. Never
+      // send it to the AI text path (that's what typed a paragraph into Samsara's "follow the AI
+      // policy?" dropdown instead of picking Yes). The combobox loop above already handled it.
+      if (isDropdownish(el)) continue;
       const label = questionLabel(el);
       if (!label || label.length < 4 || !/[a-z]/i.test(label)) continue;
       const ans = commonAnswer(label, profile);
@@ -558,24 +680,37 @@
     "July", "August", "September", "October", "November", "December"];
   const monthName = (mm) => MONTH_NAME[parseInt(mm, 10)] || "";
 
-  function addAnotherFor(sectionRe) {
-    const head = [...document.querySelectorAll("h2,h3,h4,legend,label,b")]
-      .find((h) => sectionRe.test((h.innerText || "").trim()));
-    if (!head) return null;
-    let c = head.parentElement;
-    for (let i = 0; i < 6 && c; i++, c = c.parentElement) {
-      const b = [...c.querySelectorAll("button,a")].find((x) => x.offsetParent && /add another/i.test(x.innerText || ""));
-      if (b) return b;
-    }
-    return null;
+  // Which "Add another" button belongs to a section. Lyft's section header is a <div>, not an
+  // h2/label, so heading-walking failed — instead use DOM position: the education fields
+  // (school--*) split the form. The employment "Add another" sits BEFORE them, education's AFTER.
+  function addAnotherFor(section) {
+    const btns = [...document.querySelectorAll("button,a")].filter((x) => x.offsetParent && /add another/i.test(x.innerText || ""));
+    if (!btns.length) return null;
+    const eduAnchor = document.querySelector('[id^="school--"]');
+    if (!eduAnchor) return section === "employment" ? btns[0] : btns[btns.length - 1];
+    const before = btns.filter((b) => eduAnchor.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_PRECEDING);
+    const after = btns.filter((b) => eduAnchor.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+    return section === "employment" ? (before[before.length - 1] || btns[0]) : (after[0] || btns[btns.length - 1]);
   }
+  // Lyft's "current role" checkbox id is like current-role-0_1 (index + a suffix) — match by prefix.
+  const ghCurrentBox = (i) => document.querySelector(`[id^="current-role-${i}_"]`) || document.getElementById(`current-${i}`);
 
-  async function ghSetCombo(id, value) {                 // react-select by id → pick matching option
+  async function ghSetCombo(id, value, want) {           // react-select by id → pick matching option
     const el = document.getElementById(id);
     if (!el || !value) return false;
     const control = el.closest('[class*="control"]') || el.parentElement;
-    const r = await pickReactSelect(control, el, new RegExp("^\\s*" + escapeRe(value), "i"), null);
+    const r = await pickReactSelect(control, el, want || new RegExp("^\\s*" + escapeRe(value), "i"), null);
     return r.ok;
+  }
+
+  // Degree dropdowns list wildly different labels — "Bachelor's", "B.S.", "B Tech", "BE", etc.
+  // (Nvidia offers only "B Tech", no "Bachelor"). Match on ALL common aliases for the level.
+  function degreeRegex(degree) {
+    const d = (degree || "").toLowerCase();
+    if (/master|\bm\.?s\b|graduate/.test(d)) return /master|\bm\.?\s?s\b|\bm\.?\s?tech|\bm\.?\s?eng|\bmba\b|post.?grad|graduate/i;
+    if (/bachelor|\bb\.?s\b|undergrad/.test(d)) return /bachelor|\bb\.?\s?s\b|\bb\.?\s?tech|\bb\.?\s?e\b|\bb\.?\s?eng|undergrad/i;
+    if (/ph\.?d|doctor/.test(d)) return /ph\.?d|doctor/i;
+    return new RegExp("^\\s*" + escapeRe(degree), "i");
   }
   async function ghSetTypeahead(id, value) {             // school etc. → type + take first suggestion
     const el = document.getElementById(id);
@@ -599,7 +734,7 @@
     for (let i = 0; i < jobs.length; i++) {
       const j = jobs[i];
       if (i > 0 && !document.getElementById(`company-name-${i}`)) {
-        const add = addAnotherFor(/^employment/i);
+        const add = addAnotherFor("employment");
         if (!add) { log(`only room for ${i} job(s) on this form — add the rest by hand`, "warn"); break; }
         add.click();
         for (let t = 0; t < 20 && !document.getElementById(`company-name-${i}`); t++) await sleep(150);
@@ -610,7 +745,7 @@
       ghSetText(`start-date-year-${i}`, j.start_year);
       await ghSetCombo(`start-date-month-${i}`, monthName(j.start_month));
       if (j.current) {
-        const c = document.getElementById(`current-${i}`);
+        const c = ghCurrentBox(i);
         if (c && !c.checked) c.click();
       } else {
         ghSetText(`end-date-year-${i}`, j.end_year);
@@ -624,21 +759,442 @@
     for (let i = 0; i < edu.length; i++) {
       const e = edu[i];
       if (i > 0 && !document.getElementById(`school--${i}`)) {
-        const add = addAnotherFor(/^education/i);
+        const add = addAnotherFor("education");
         if (!add) break;
         add.click();
         for (let t = 0; t < 20 && !document.getElementById(`school--${i}`); t++) await sleep(150);
       }
       if (!document.getElementById(`school--${i}`)) break;
       await ghSetTypeahead(`school--${i}`, e.school);
-      const degWord = /master/i.test(e.degree) ? "Master" : /bachelor/i.test(e.degree) ? "Bachelor" : e.degree;
-      await ghSetCombo(`degree--${i}`, degWord);
+      await ghSetCombo(`degree--${i}`, e.degree, degreeRegex(e.degree));   // matches "B Tech", "B.S.", etc.
       await ghSetTypeahead(`discipline--${i}`, e.discipline);
       ghSetText(`start-date-year--${i}`, e.start_year);   // present on some tenants
       ghSetText(`end-date-year--${i}`, e.end_year);
       log("education: " + e.school, "good");
       await humanPause();
     }
+  }
+
+  // ================= Ashby (jobs.ashbyhq.com) =================
+  // Ashby standard fields (Name single, email, phone, LinkedIn/GitHub/Portfolio) already fill via
+  // classify(). The gap is the repeatable Education / Work-history block. Real structure, read live
+  // off the Plaid form:
+  //   _systemfield_education_history-degree / -major : text
+  //   -startDate / -endDate : a <div> holding TWO native <select> (month value 1-12, year value)
+  //   -isCurrent : checkbox ;  "+ Add Education" button to add more
+  const IS_ASHBY = /(^|\.)ashbyhq\.com$/i.test(location.hostname);
+
+  function setSelectValue(sel, value) {           // React-controlled <select>
+    if (!sel || value == null || value === "") return false;
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, "value").set;
+    // match by value first, else by visible text (month names)
+    const byVal = [...sel.options].some((o) => o.value === String(value));
+    let v = String(value);
+    if (!byVal) {
+      const opt = [...sel.options].find((o) => o.text.trim().toLowerCase() === String(value).toLowerCase());
+      if (opt) v = opt.value; else return false;
+    }
+    setter.call(sel, v);
+    sel.dispatchEvent(new Event("input", { bubbles: true }));
+    sel.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }
+
+  async function ashbyDateInto(div, mm, yyyy) {   // the month/year <select> pair inside a date <div>
+    if (!div) return false;                       // pass the ELEMENT — ids repeat, getElementById lies
+    // Set month, then year, and VERIFY each landed (a React re-render can otherwise clobber the
+    // value and leave a wrong month — that's the "July" the fill sometimes showed). Retry once.
+    const setVerify = (want, matchVal) => {
+      const sels = [...div.querySelectorAll("select")];  // re-query each time — the node can swap
+      const sel = sels[matchVal ? 0 : 1];
+      if (!sel) return false;
+      for (let a = 0; a < 2; a++) {
+        setSelectValue(sel, want);
+        if (String(sel.value) === String(want)) return true;
+      }
+      return false;
+    };
+    let ok = true;
+    if (mm) { ok = setVerify(String(parseInt(mm, 10)), true) && ok; await sleep(70); }   // "04"→"4"
+    if (yyyy) { ok = setVerify(String(yyyy), false) && ok; await sleep(50); }
+    return ok;
+  }
+
+  // Ashby "School" is a typeahead (input[role=combobox], placeholder "Search schools…"): type
+  // the name, wait for its listbox to fetch, click the first matching result.
+  async function ashbySchoolPick(input, name) {
+    if (!input || !name) return false;
+    input.scrollIntoView({ block: "center" });
+    input.focus();
+    setNativeValue(input, name);
+    let opts = [];
+    for (let i = 0; i < 16 && !opts.length; i++) {
+      await sleep(100);
+      const lb = document.getElementById(input.getAttribute("aria-controls") || "");
+      opts = lb ? [...lb.querySelectorAll('[role=option],li')].filter((o) => o.offsetParent && o.textContent.trim()) : [];
+    }
+    if (!opts.length) { input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); return false; }
+    const nn = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+    const hit = opts.find((o) => o.textContent.toLowerCase().replace(/[^a-z0-9]/g, "").startsWith(nn)) || opts[0];
+    hit.click();
+    await sleep(200);
+    return true;
+  }
+
+  // Ashby renders some Yes/No questions as a PAIR OF BUTTONS (not radios/dropdown): two
+  // <button> with text "Yes"/"No". Answer from the profile (sponsorship→No, previously
+  // employed→No, authorized→Yes), clicking the matching button in that question's block.
+  async function fillAshbyButtons(profile, log) {
+    // Group Yes/No buttons by their QUESTION container. NOTE the buttons' own class contains
+    // "_container", so closest('[class*=_container]') would return the button itself — walk up to
+    // the "_fieldEntry" block (which holds the question label + both buttons), or the smallest
+    // ancestor that has the question text AND exactly one Yes + one No.
+    const questionBlock = (b) => {
+      let n = b.parentElement;
+      for (let i = 0; i < 6 && n; i++, n = n.parentElement) {
+        if (/_fieldEntry/.test(n.className || "")) return n;
+        const yn = [...n.querySelectorAll("button")].filter((x) => /^(yes|no)$/i.test((x.textContent || "").trim()));
+        if (yn.length === 2 && (n.innerText || "").replace(/\s+/g, " ").trim().length > 15) return n;
+      }
+      return null;
+    };
+    const groups = new Map();
+    for (const b of document.querySelectorAll("button")) {
+      if (!b.offsetParent || !/^(yes|no)$/i.test((b.textContent || "").trim())) continue;
+      const block = questionBlock(b);
+      if (!block) continue;
+      if (!groups.has(block)) groups.set(block, []);
+      groups.get(block).push(b);
+    }
+    for (const [block, btns] of groups) {
+      if (btns.length < 2) continue;
+      if (btns.some((b) => /_selected|_active|true/i.test((b.getAttribute("aria-pressed") || "") + " " + b.className))) continue; // answered
+      const q = (block.innerText || "").replace(/\s+/g, " ").replace(/\b(yes|no)\b/gi, "").trim();
+      if (SENSITIVE.test(q)) continue;
+      const ans = commonAnswer(q, profile);
+      if (!ans || !ans.yesno) continue;
+      const want = ans.yesno === "yes" ? /^yes$/i : /^no$/i;
+      const target = btns.find((b) => want.test((b.textContent || "").trim()));
+      if (target) { target.click(); await sleep(150); log("answered: " + short(q) + " → " + ans.yesno, "good"); }
+    }
+  }
+
+  // All Nth-entry fields for one suffix, in DOM order. Ashby gives every education entry the
+  // SAME id (…education_history-degree), so container-scoping picked the wrong one and every
+  // entry wrote onto the first — indexing parallel arrays by entry number is the reliable way.
+  const ashbyEduField = (suffix) => [...document.querySelectorAll(`[id$="education_history-${suffix}"]`)];
+
+  async function fillAshbyHistory(role, log) {
+    const edu = (role.profile || {}).education || [];
+    if (!edu.length) return;
+    const addBtn = () => [...document.querySelectorAll("button")].find((b) => b.offsetParent && /add education/i.test(b.innerText || ""));
+    const setText = (el, v) => { if (el && !(el.value || "").trim() && v) { el.focus(); setNativeValue(el, v); el.blur(); } };
+
+    for (let i = 0; i < edu.length; i++) {
+      if (i >= ashbyEduField("degree").length) {          // need another entry block
+        const add = addBtn();
+        if (!add) { if (i) log(`only room for ${i} education entr${i > 1 ? "ies" : "y"} — add the rest by hand`, "warn"); break; }
+        add.click();
+        for (let t = 0; t < 20 && ashbyEduField("degree").length <= i; t++) await sleep(150);
+      }
+      const e = edu[i];
+      // School = a "Search schools…" typeahead (one per entry, in DOM order)
+      const schools = [...document.querySelectorAll('input[role=combobox]')].filter((x) => x.offsetParent && /search schools/i.test(x.placeholder || ""));
+      if (schools[i] && !(schools[i].value || "").trim()) await ashbySchoolPick(schools[i], e.school);
+      setText(ashbyEduField("degree")[i], e.degree);
+      setText(ashbyEduField("major")[i], e.discipline);
+      await ashbyDateInto(ashbyEduField("startDate")[i], e.start_month, e.start_year);
+      await ashbyDateInto(ashbyEduField("endDate")[i], e.end_month, e.end_year);
+      log("education: " + (e.school || e.degree), "good");
+      await humanPause();
+    }
+  }
+
+  // ================= Google Careers (google.com/about/careers) =================
+  // Google's own Material form. No job id in the URL → we fill PROFILE fields only (name/email/
+  // phone/eligibility/consent), no résumé, no role questions. Fields use jsname, not id:
+  //   text inputs jsname=YPqjbf (labelled First name / Last name / Email / Phone)
+  //   Material dropdowns div[role=combobox][jsname=oYxtQd] (Suffix, Country calling code)
+  //   radiogroups with aria-label ("Have you worked at Alphabet before?")
+  const IS_GOOGLE = /(^|\.)google\.com$/i.test(location.hostname) && /\/about\/careers\//i.test(location.pathname);
+  const IS_MICROSOFT = /(^|\.)careers\.microsoft\.com$/i.test(location.hostname);
+
+  function gLabel(el) {
+    const lb = el.getAttribute("aria-labelledby");
+    if (lb) { const t = lb.split(" ").map((id) => (document.getElementById(id) || {}).textContent || "").join(" ").replace(/\s+/g, " ").trim(); if (t) return t; }
+    let n = el;
+    for (let i = 0; i < 5 && n; i++, n = n.parentElement) {
+      const c = [...n.children].map((x) => x.textContent).find((t) => t && t.trim().length > 2 && t.trim().length < 60);
+      if (c) return c.replace(/\s+/g, " ").trim();
+    }
+    return el.getAttribute("aria-label") || "";
+  }
+
+  async function gMaterialPick(combo, wantRe) {          // open a Material combobox, click a role=option
+    if (combo.getAttribute("aria-expanded") === "true") { combo.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await sleep(120); }
+    coordSeq(combo);
+    let opts = [];
+    for (let i = 0; i < 12 && !opts.length; i++) { await sleep(80); opts = [...document.querySelectorAll('[role=option]')].filter((o) => o.offsetParent); }
+    const hit = opts.find((o) => wantRe.test(o.textContent.trim()));
+    if (!hit) { combo.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); return false; }
+    coordSeq(hit);
+    await sleep(200);
+    return true;
+  }
+
+  async function fillGoogle(profile, log) {
+    const legalFirst = profile.legal_first_name || profile.first_name;
+    // text fields by label
+    let filled = [];
+    for (const el of document.querySelectorAll('input[jsname="YPqjbf"]')) {
+      if (!el.offsetParent || (el.value || "").trim()) continue;
+      const l = gLabel(el).toLowerCase();
+      let v = "";
+      if (/first name/.test(l)) v = legalFirst;
+      else if (/last name|surname|family/.test(l)) v = profile.last_name;
+      else if (/email/.test(l)) v = profile.email;
+      // Phone: Google's number box wants PLAIN DIGITS only — the "+1" lives in the separate
+      // Country-calling-code dropdown (box 1). A formatted "202-555-0142" is rejected as
+      // "Invalid phone number", so strip to bare digits: "4082100678".
+      else if (/phone/.test(l)) v = nationalPhone(profile).replace(/\D/g, "");
+      else continue;
+      if (!v) continue;
+      el.focus(); setNativeValue(el, v); el.blur();
+      filled.push(l.slice(0, 14));
+    }
+    if (filled.length) log("filled: " + filled.join(", "), "good");
+
+    // Country calling code Material dropdown → +1
+    for (const combo of document.querySelectorAll('[jsname="oYxtQd"][role=combobox]')) {
+      if (!combo.offsetParent) continue;
+      if (/country|calling code|dial/i.test(gLabel(combo))) {
+        const ok = await gMaterialPick(combo, /united states|\+1\b/i);
+        log(ok ? "country code → +1" : "country code — pick manually", ok ? "good" : "warn");
+      }
+    }
+    // All Yes/No radio groups → answer from the profile (worked-before → No, personalize/
+    // marketing opt-ins → No, work-auth → Yes, etc.). commonAnswer decides; skip demographics.
+    for (const g of document.querySelectorAll('[role=radiogroup]')) {
+      if (!g.offsetParent) continue;
+      const q = g.getAttribute("aria-label") || gLabel(g);
+      if (SENSITIVE.test(q)) continue;
+      const ans = commonAnswer(q, profile);
+      if (!ans || !ans.yesno) continue;
+      const want = ans.yesno === "yes" ? /^\s*y(es)?\b/i : /^\s*no?\b/i;
+      const opt = [...g.querySelectorAll('[role=radio],input[type=radio]')].find((r) => want.test(r.getAttribute("aria-label") || r.closest("label")?.innerText || r.value || ""));
+      if (opt) { opt.click(); log("answered: " + short(q) + " → " + ans.yesno, "good"); }
+    }
+    // consent checkboxes ("I understand…", "I hereby certify…")
+    tickConsents(log);
+  }
+
+  // ================= SmartRecruiters (jobs.smartrecruiters.com) =================
+  // Its "Easy Apply" form is built from `spl-` web components, so the inputs live inside SHADOW
+  // DOM — a plain document.querySelector finds NOTHING (that's why nothing filled). We pierce
+  // shadow roots to reach them. Field ids are clean: first-name-input, email-input, linkedin-input…
+  const IS_SR = /(^|\.)smartrecruiters\.com$/i.test(location.hostname);
+
+  function deepAll(sel, root = document, out = [], depth = 0) {
+    if (depth > 14) return out;
+    for (const el of root.querySelectorAll("*")) {
+      if (el.matches && el.matches(sel)) out.push(el);
+      if (el.shadowRoot) deepAll(sel, el.shadowRoot, out, depth + 1);
+    }
+    return out;
+  }
+  const deepById = (id) => deepAll("#" + CSS.escape(id)).find((e) => e.offsetParent) || null;
+  const srVis = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  // The id-named fields (first-name-input, …) are <spl-input> custom elements that WRAP a real
+  // <input> in their shadow root. Setting `.value` on the custom element only updates the display —
+  // the component's own validation model doesn't change, so on "Next" the form still reports the
+  // field empty. The fix is to drive the INNER native input with the real value setter + a real
+  // InputEvent, which is what the component listens to. srInner returns that inner native element.
+  const srInner = (id) => {
+    const all = deepAll("#" + CSS.escape(id));
+    return all.find((e) => (e instanceof HTMLInputElement || e instanceof HTMLTextAreaElement) && srVis(e))
+        || all.find((e) => e instanceof HTMLInputElement || e instanceof HTMLTextAreaElement) || null;
+  };
+  function srNativeSet(el, v) {
+    if (!el || !v) return false;
+    const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, "value");
+    el.focus();
+    desc.set.call(el, v);
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: v }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    el.blur();
+    return true;
+  }
+  // Open an <spl-select>/autocomplete combobox and click the option matching wantRe. These options
+  // live in a portal and IGNORE dispatched pointer/keyboard events AND coordinate clicks — only the
+  // element's own .click() METHOD selects them. Typing a char opens the list (it does not strictly
+  // filter), so any seed works; we try a few so a decline option surfaces whatever its wording.
+  async function srPickSelect(input, wantRe, seeds) {
+    if (!input) return false;
+    const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+    for (const seed of seeds) {
+      input.focus();
+      desc.set.call(input, seed);
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: seed }));
+      let opt = null;
+      for (let i = 0; i < 12 && !opt; i++) {
+        await sleep(90);
+        opt = deepAll("spl-select-option, [role=option]").find(
+          (o) => srVis(o) && wantRe.test((o.textContent || "").replace(/\s+/g, " ").trim()));
+      }
+      if (opt) { opt.click(); await sleep(120); return true; }
+      // clear before trying the next seed
+      desc.set.call(input, "");
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "deleteContentBackward" }));
+    }
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    return false;
+  }
+
+  async function fillSmartRecruiters(role, log) {
+    // Page 2 (Preliminary/screening questions) is a whole different form under /screening.
+    if (/\/screening/i.test(location.pathname) || deepAll("sr-question-field-radio, sr-question-field-select")[0]) {
+      return fillSmartRecruitersScreening(role, log);
+    }
+    const profile = role.profile || {};
+    const filled = [];
+    const t = [
+      ["first-name-input", profile.legal_first_name || profile.first_name, "first name"],
+      ["last-name-input", profile.last_name, "last name"],
+      ["email-input", profile.email, "email"],
+      ["confirm-email-input", profile.email, "confirm email"],
+      ["linkedin-input", profile.linkedin, "LinkedIn"],
+      ["website-input", profile.website, "website"],
+    ];
+    for (const [id, v, name] of t) {
+      const el = srInner(id);
+      if (el && v && !(el.value || "").trim() && srNativeSet(el, v)) filled.push(name);
+    }
+    // phone: national number, no +1 (there's a separate country selector)
+    const phone = deepAll('input[type=tel]').find(srVis);
+    if (phone && !(phone.value || "").trim() && srNativeSet(phone, nationalPhone(profile))) filled.push("phone");
+    if (filled.length) log("filled: " + filled.join(", "), "good");
+
+    // City is an <spl-select> autocomplete that FETCHES suggestions — type the city, wait for the
+    // list, click the first suggestion (the option's own .click() is the only thing that selects it).
+    const city = deepAll('input[role=combobox]').find(
+      (e) => srVis(e) && /city|form-element_10/i.test((e.getAttribute("aria-label") || e.id || "")));
+    if (city && !(city.value || "").trim()) {
+      const cityName = (profile.location || "").split(",")[0].trim();
+      const desc = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
+      city.focus();
+      desc.set.call(city, cityName);
+      city.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: cityName }));
+      let opt = null;
+      for (let i = 0; i < 16 && !opt; i++) {
+        await sleep(140);
+        opt = deepAll("spl-select-option, [role=option]").find((o) => srVis(o) && new RegExp(cityName, "i").test(o.textContent || ""));
+      }
+      if (opt) { opt.click(); log("city → " + opt.textContent.replace(/\s+/g, " ").trim().slice(0, 30), "good"); }
+      else { city.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); log("city — pick it manually", "warn"); }
+    }
+
+    // résumé — the file-input is real (in shadow), so DataTransfer injection works
+    const file = deepAll('input[type=file]').find((e) => e.accept ? /pdf|doc/i.test(e.accept) : true);
+    if (file && role.has_tailored_pdf && !(file.files && file.files.length)) {
+      const res = await send({ type: "resume", jobId: role.job_id });
+      if (isContextDead(res)) { log("JobScan was reloaded — refresh this page (⌘R), then click Fill again.", "warn"); return; }
+      if (res && res.ok) {
+        const ok = attachResume(b64ToBytes(res.b64), res.name, file);
+        log(ok ? "résumé attached ✓" : "couldn't attach résumé — upload it yourself", ok ? "good" : "warn");
+      }
+    }
+
+    // "Let the company know…" message box → cover letter
+    const msg = deepAll("textarea").find((e) => srVis(e) && !(e.value || "").trim());
+    if (msg && role.ai_enabled) {
+      const r = await send({ type: "coverLetter", jobId: role.job_id, words: 160 });
+      if (r && r.ok && r.text) { srNativeSet(msg, r.text); log("cover note drafted ✓ — read it before submitting", "good"); }
+    }
+    log("Experience/Education: use the + Add buttons yourself (their fields are locked in shadow DOM).", "warn");
+    log("When you reach the Preliminary-questions page, click Fill again to answer those.", "warn");
+  }
+
+  // SmartRecruiters page 2 — "Preliminary questions" (/screening). Each question is an
+  // <sr-question-field-radio> (spl-radio options, selected via .click()) or
+  // <sr-question-field-select> (an spl-select combobox, driven by srPickSelect). Demographic
+  // questions (gender/race/disability/veteran) follow the owner's eeo config: decline unless a
+  // concrete answer was chosen. Signature/date attestation fields are filled from the profile.
+  async function fillSmartRecruitersScreening(role, log) {
+    const eeo = role.eeo || {};
+    const declineRe = /prefer not|don'?t wish|do(es)? not (want|wish)|decline|no answer/i;
+    const wantsDecline = (v) => role.eeo_decline !== false && (!v || declineRe.test(v));
+    let n = 0;
+
+    // 1) radio questions
+    for (const w of deepAll("*").filter((e) => e.tagName === "SR-QUESTION-FIELD-RADIO")) {
+      const grp = deepAll("spl-radio-group", w)[0];
+      const q = ((grp && (grp.getAttribute("label") || grp.textContent)) || "").replace(/\s+/g, " ").trim();
+      const radios = deepAll("spl-radio", w);
+      if (!radios.length || radios.some((r) => r.getAttribute("aria-checked") === "true")) continue;
+      const t = q.toLowerCase();
+      let wantRe = null;
+      if (/legally authorized to work/.test(t)) wantRe = /^yes/i;
+      else if (/visa sponsorship|require .*sponsor/.test(t)) wantRe = /^no/i;
+      else if (/customer of /.test(t)) wantRe = /^no/i;
+      else if (/federal government|state, local, or municipal|immediate family|suspend|debar/.test(t)) wantRe = /^no/i;
+      else if (/worked (at|for)|ever worked/.test(t)) wantRe = /^no/i;
+      else if (/relocat/.test(t)) wantRe = /^yes/i;
+      else if (/disabilit/.test(t)) wantRe = wantsDecline(eeo.disability) ? declineRe : /^no\b/i;
+      else if (/protected veteran/.test(t)) wantRe = wantsDecline(eeo.veteran) ? declineRe : /^no\b/i;
+      if (!wantRe) continue;                                   // unknown question → leave for the owner
+      const pick = radios.find((r) => wantRe.test((r.getAttribute("label") || "").trim()));
+      if (pick) { pick.click(); n++; log("answered: " + q.slice(0, 42), "good"); }
+    }
+
+    // 2) select-combobox questions
+    for (const cb of deepAll('input[role=combobox]').filter(srVis)) {
+      if ((cb.value || "").trim() && !/^select/i.test(cb.value)) continue;   // already answered
+      const label = srComboLabel(cb).toLowerCase();
+      const ph = (cb.placeholder || "").toLowerCase();
+      let want = null, seeds = null;
+      if (/_gender/.test(cb.id) || /gender/.test(ph) || /gender/.test(label)) { if (wantsDecline(eeo.gender)) { want = declineRe; seeds = ["P", "D", "I"]; } }
+      else if (/_ethnicity/.test(cb.id) || /race|ethnic/.test(ph) || /race|ethnic/.test(label)) { if (wantsDecline(eeo.race)) { want = declineRe; seeds = ["P", "D", "I"]; } }
+      else if (/relocat/.test(label)) { want = /^yes/i; seeds = ["Y"]; }
+      else if (/worked (at|for)|ever worked/.test(label)) { want = /^no/i; seeds = ["N"]; }
+      else if (/employed.*pwc|\bpwc\b/.test(label)) { want = /^no\b/i; seeds = ["N"]; }
+      else if (/citizen or lawful permanent resident|cuba, syria|export control/.test(label)) { want = /^no/i; seeds = ["N"]; }
+      else if (/riseup|nextgen/.test(label)) { want = /^no/i; seeds = ["N"]; }
+      else if (/authorized to work/.test(label)) { want = /^yes/i; seeds = ["Y"]; }
+      else if (/sponsor/.test(label)) { want = /^no/i; seeds = ["N"]; }
+      if (!want) continue;
+      if (await srPickSelect(cb, want, seeds)) { n++; log("selected: " + (label || ph || "question").slice(0, 40) + " → " + (cb.value || "").slice(0, 26), "good"); }
+    }
+
+    // 3) attestation text fields (electronic signature + today's date)
+    for (const w of deepAll("*").filter((e) => e.tagName === "SR-QUESTION-FIELD-TEXT")) {
+      const q = (w.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
+      const inp = deepAll("input, textarea", w).find((x) => x.getAttribute("role") !== "combobox");
+      if (!inp || (inp.value || "").trim()) continue;
+      if (/signature/.test(q)) {
+        const nm = ((role.profile || {}).preferred_name || (role.profile || {}).first_name || "") + " " + ((role.profile || {}).last_name || "");
+        if (srNativeSet(inp, nm.trim())) { n++; log("signed: " + nm.trim(), "good"); }
+      } else if (/today'?s date|^date\b|\bdate\b/.test(q)) {
+        const d = new Date();
+        const mm = String(d.getMonth() + 1).padStart(2, "0"), dd = String(d.getDate()).padStart(2, "0");
+        if (srNativeSet(inp, mm + "/" + dd + "/" + d.getFullYear())) { n++; log("date filled", "good"); }
+      }
+    }
+    if (!n) log("no preliminary questions matched — answer them yourself", "warn");
+    else log("Preliminary questions answered — review each, then submit yourself.", "good");
+  }
+
+  // Best-effort label for an spl-select combobox: climb its shadow-host chain to the nearest
+  // question-looking text (SmartRecruiters puts the label a couple of wrappers up).
+  function srComboLabel(inp) {
+    let n = inp.getRootNode().host || inp;
+    for (let i = 0; i < 7 && n; i++) {
+      const txt = (n.textContent || "").replace(/\s+/g, " ").trim();
+      if (txt.length > 12 && txt.length < 220 &&
+          /\?|worked|relocat|employ|citizen|gender|ethnic|race|pwc|sponsor|riseup|nextgen|authorized/i.test(txt)) return txt;
+      n = n.parentElement || (n.getRootNode && n.getRootNode().host);
+    }
+    return inp.placeholder || "";
   }
 
   function attachResume(bytes, name, preferred) {
@@ -825,8 +1381,26 @@
 
   // Date sub-fields (role=spinbutton). A plain value-set does NOT register with Workday, so we
   // type the digits through the field's own key handling. Returns true only if it stuck.
+  // Move focus fully OFF the date widget by clicking a neutral, non-interactive spot — the owner
+  // noticed Workday keeps showing "Invalid Date" while a month/year segment still holds focus, and
+  // that clicking elsewhere clears it. A bare el.blur() doesn't reproduce it; a real click on the
+  // step heading does. Fire the commit events too, so the field's own validation runs.
+  async function wdCommitDate(el) {
+    try {
+      if (el) {
+        el.dispatchEvent(new Event("change", { bubbles: true }));
+        el.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+        el.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+        if (el.blur) el.blur();
+      }
+    } catch (e) {}
+    const neutral = document.querySelector('[data-automation-id="pageHeaderTitleText"], h1, h2, h3') || document.body;
+    for (const t of ["pointerdown", "mousedown", "mouseup", "click"]) neutral.dispatchEvent(new MouseEvent(t, { bubbles: true }));
+    await sleep(250);
+  }
+
   async function wdDate(idPrefix, parts) {
-    let allOk = true;
+    let allOk = true, lastEl = null;
     for (const [seg, val] of Object.entries(parts)) {
       if (!val) continue;
       // Two traps in these spinbuttons, both learned the hard way:
@@ -850,10 +1424,15 @@
         await sleep(40);
         el = wdById(`${idPrefix}-dateSection${seg}-input`) || el;   // survive a re-render
       }
-      el.blur();
-      await sleep(150);
-      const got = wdById(`${idPrefix}-dateSection${seg}-input`) || el;
-      if (String(got.value).replace(/^0+(?=\d)/, "") !== v) allOk = false;  // verify on the LIVE element
+      lastEl = el;                                    // don't blur yet — focusing the next segment does that
+    }
+    // Only NOW, after every segment is typed, "click elsewhere" once to commit + clear the error.
+    await wdCommitDate(lastEl);
+    for (const [seg, val] of Object.entries(parts)) {          // verify on the LIVE elements
+      if (!val) continue;
+      const v = String(val).replace(/^0+(?=\d)/, "");
+      const got = wdById(`${idPrefix}-dateSection${seg}-input`);
+      if (!got || String(got.value).replace(/^0+(?=\d)/, "") !== v) allOk = false;
     }
     return allOk;
   }
@@ -902,35 +1481,39 @@
   async function wdHowDidYouHear(log) {
     const box = wdBox(/how did you (hear|learn)|where did you (hear|learn)/i);
     if (!box) return 0;
-    if (box.querySelector('[data-automation-id="selectedItem"]')) return 0;   // already answered
+    // ANY single answer is fine — the source doesn't matter (owner's rule). So the instant this
+    // field already has a chip, we're done. Detect it broadly (not just the standard
+    // selectedItem automation-id) so a re-fill pass never stacks a second, third, … pick on.
+    const hasPick = () => !!box.querySelector('[data-automation-id="selectedItem"],[data-automation-id^="DELETE"],button[aria-label*="Delete" i],[aria-label*="Remove" i]');
+    if (hasPick()) return 0;
     const input = box.querySelector('input[type=text],input:not([type])');
     if (!input) return 0;
+    const stopIf = () => { if (abortFill) throw new Error(ABORT); };
     for (const term of HEARD_CHAIN) {
+      stopIf();
+      if (hasPick()) return 0;                            // something already took — never add more
       input.scrollIntoView({ block: "center" });
       input.focus();
       input.click();
       setNativeValue(input, term);                       // filter the taxonomy
       let opts = [];
       for (let i = 0; i < 16 && !opts.length; i++) {
-        await sleep(90);
+        await sleep(90); stopIf();
         opts = [...document.querySelectorAll('[data-automation-id="promptOption"],[role=option]')]
           .filter((o) => o.offsetParent && o.textContent.trim());
       }
-      if (opts.length) {
-        for (const key of ["ArrowDown", "Enter"]) {      // the sequence that actually commits
-          for (const type of ["keydown", "keyup"]) {
-            input.dispatchEvent(new KeyboardEvent(type, { key, code: key, bubbles: true }));
-          }
-          await sleep(140);
-        }
-        for (let i = 0; i < 8 && !box.querySelector('[data-automation-id="selectedItem"]'); i++) await sleep(60);
-        if (box.querySelector('[data-automation-id="selectedItem"]')) {
-          log("How did you hear → " + term, "good");
-          return 1;
-        }
+      if (!opts.length) { setNativeValue(input, ""); await sleep(80); continue; }  // tenant lacks it → next
+      // This term IS offered → commit ONE and STOP. Never fall through to the rest of the chain
+      // (that was the "selected N times" bug). Try the two commit paths, then we're done regardless.
+      for (const key of ["ArrowDown", "Enter"]) {
+        for (const type of ["keydown", "keyup"]) input.dispatchEvent(new KeyboardEvent(type, { key, code: key, bubbles: true }));
+        await sleep(120); stopIf();
       }
-      setNativeValue(input, "");                         // this tenant doesn't offer it — next
-      await sleep(80);
+      if (!hasPick()) { coordSeq(opts[0]); for (let i = 0; i < 8 && !hasPick(); i++) { await sleep(50); stopIf(); } }
+      setNativeValue(input, "");
+      if (hasPick()) log("How did you hear → " + term, "good");
+      else log("How did you hear — options showed but wouldn't commit; pick one manually", "warn");
+      return hasPick() ? 1 : 0;                          // one attempt at one option — done either way
     }
     log("How did you hear — pick manually", "warn");
     return 0;
@@ -1044,14 +1627,28 @@
       const degBtn = document.getElementById(P + "degree");
       if (degBtn && /select one/i.test(degBtn.getAttribute("aria-label") || "")) {
         degBtn.click();
-        const want = /master/i.test(e.degree) ? /^masters?$/i : /bachelor/i.test(e.degree) ? /^bachelors?$/i : new RegExp(escapeRe(e.degree), "i");
+        const want = degreeRegex(e.degree);          // matches Masters/MS/M Tech, Bachelors/BS/B Tech…
         let dopts = [];
         for (let k = 0; k < 24 && !dopts.length; k++) {                 // poll, don't sleep blind
           await sleep(70);
           dopts = [...document.querySelectorAll('[role=option],[data-automation-id="promptOption"]')].filter((x) => x.offsetParent && x.textContent.trim());
         }
-        const o = dopts.find((x) => want.test(x.textContent.trim()));
-        if (o) { o.click(); await sleep(150); } else wdBlur();
+        // loose fallback so a tenant wording it "Master of Science" still matches "Master's"
+        const loose = /master/i.test(e.degree) ? /master/i : /bachelor/i.test(e.degree) ? /bachelor/i : null;
+        const o = dopts.find((x) => want.test(x.textContent.trim())) || (loose && dopts.find((x) => loose.test(x.textContent.trim())));
+        // a plain "Select One" button prompt commits on .click(); if that didn't take, coordSeq.
+        const committed = () => !/select one/i.test(degBtn.getAttribute("aria-label") || "");
+        if (o) {
+          o.click(); await sleep(150);
+          if (!committed()) { coordSeq(o); await sleep(150); }
+          log(committed() ? "degree → " + o.textContent.trim().slice(0, 24) : "degree — pick it manually",
+            committed() ? "good" : "warn");
+        } else { log("degree — no matching option, pick it manually", "warn"); }
+        // ALWAYS close the menu, whether or not we picked — a left-open degree prompt leaks its
+        // options into the very next field (Skills), which then clicks a degree option and the
+        // page jumps back to Degree. This was the "keeps bouncing to the degree dropdown" bug.
+        wdBlur();
+        await sleep(150);
       }
       log("added school: " + e.school, "good");
       await humanPause();
@@ -1065,48 +1662,60 @@
   // taxonomy — a term it doesn't recognise returns no options at all. So: try each skill,
   // retry a slash-variant ("Go/Golang" → "Go"), and quietly skip whatever it doesn't know.
   async function wdSkills(skills, log) {
-    const input = document.getElementById("skills--skills") || wdById("skills--skills");
-    if (!input || !(skills || []).length) return;
+    // The id isn't always "skills--skills" across tenants — fall back to any *skill* input, then
+    // to the "Type to Add Skills" / "Skills" prompt box, so NVIDIA-style tenants aren't missed.
+    const input = document.getElementById("skills--skills")
+      || wdById("skills--skills")
+      || [...document.querySelectorAll("input")].find((e) => e.offsetParent && /skill/i.test(e.id || ""))
+      || (() => { const b = wdBox(/type to add skills|add skills|^\s*skills\b/i); return b && b.querySelector('input[type=text],input:not([type])'); })();
+    if (!(skills || []).length) return;
+    if (!input) { log("skills box not found on this step — add them manually", "warn"); return; }
+    wdBlur();                                       // close any prompt still open from a prior field
+    await sleep(150);                               // so its stale options can't hijack our clicks
+    const pills = () => document.querySelectorAll('[data-automation-id="selectedItem"]').length;
+    // abort-aware wait: Stop must interrupt this multi-second loop, not wait it out. `sleep` alone
+    // can't throw, so every wait is followed by an abort check (and we check at each loop boundary).
+    const stopIf = () => { if (abortFill) throw new Error(ABORT); };
+    const nap = async (ms) => { await sleep(ms); stopIf(); };
     const already = new Set([...document.querySelectorAll('[data-automation-id="selectedItem"]')]
       .map((e) => e.textContent.replace(/\s+/g, " ").trim().toLowerCase()));
     let added = 0;
     for (const raw of skills) {
+      stopIf();
       if (added >= 10) break;                                  // enough signal; keep it human
       for (const term of [raw, ...(raw.includes("/") ? raw.split("/").map((s) => s.trim()) : [])]) {
+        stopIf();
         if (!term || already.has(term.toLowerCase())) continue;
         input.scrollIntoView({ block: "center" });
         input.focus();
         setNativeValue(input, term);
         let opts = [];
         for (let i = 0; i < 16 && !opts.length; i++) {          // taxonomy lookup is async
-          await sleep(90);
+          await nap(90);
           opts = [...document.querySelectorAll('[data-automation-id="promptOption"],[role=option]')]
             .filter((o) => o.offsetParent && o.textContent.trim());
         }
-        // Typing alone adds NOTHING — the entry has to be committed. And clicking a Workday
-        // promptOption silently fails (confirmed live), so commit with ArrowDown + Enter and
-        // only count it once a selected pill actually appears.
-        const pills = () => document.querySelectorAll('[data-automation-id="selectedItem"]').length;
+        if (!opts.length) { setNativeValue(input, ""); await nap(50); continue; }   // Workday doesn't know it
+        // Typing alone adds NOTHING — the entry must be COMMITTED, and tenants differ: some commit
+        // on Enter, some only when you click the option. So try each way and keep whichever makes a
+        // pill appear. The click uses coordSeq (a real pointer sequence) — a bare .click() on a
+        // Workday promptOption is silently ignored.
+        const best = opts.find((o) => o.textContent.trim().toLowerCase() === term.toLowerCase()) || opts[0];
+        const commits = [
+          async () => { for (const key of ["ArrowDown", "Enter"]) { for (const ty of ["keydown", "keyup"]) input.dispatchEvent(new KeyboardEvent(ty, { key, code: key, bubbles: true })); await nap(90); } },
+          async () => { coordSeq(best); },                      // click the first / matching option
+          async () => { for (const ty of ["keydown", "keyup"]) input.dispatchEvent(new KeyboardEvent(ty, { key: "Enter", code: "Enter", bubbles: true })); },
+        ];
         const n0 = pills();
-        for (const key of ["ArrowDown", "Enter"]) {
-          for (const type of ["keydown", "keyup"]) {
-            input.dispatchEvent(new KeyboardEvent(type, { key, code: key, bubbles: true }));
-          }
-          await sleep(120);
+        for (const commit of commits) {
+          stopIf();
+          await commit();
+          for (let i = 0; i < 8 && pills() === n0; i++) await nap(50);
+          if (pills() > n0) break;                              // committed for real
         }
-        for (let i = 0; i < 8 && pills() === n0; i++) await sleep(50);
-        if (pills() === n0) {                                  // keyboard didn't take — try the click
-          const hit = opts.find((o) => o.textContent.trim().toLowerCase() === term.toLowerCase()) || opts[0];
-          if (hit) hit.click();
-          for (let i = 0; i < 8 && pills() === n0; i++) await sleep(50);
-        }
-        if (pills() > n0) {                                    // committed for real
-          already.add(term.toLowerCase());
-          added++;
-          break;                                               // got this skill — next one
-        }
+        if (pills() > n0) { already.add(term.toLowerCase()); added++; break; }   // got it — next skill
         setNativeValue(input, "");                             // didn't take — clear and move on
-        await sleep(60);
+        await nap(60);
       }
     }
     setNativeValue(input, "");
@@ -1114,24 +1723,101 @@
       added ? "good" : "warn");
   }
 
+  // Open-ended TEXT questions on a Workday step ("Describe your interaction with the Workday
+  // system", "Why this role?") — a <textarea> or free text box that isn't a known profile field
+  // and isn't a Select-One prompt. Route them to the AI so REQUIRED ones never sit blank. The AI
+  // is told to reason about what the asked-about tool/process is and answer from her real SWE
+  // background, short and spoken, without inventing specifics.
+  async function wdOpenQuestions(role, log) {
+    if (!role.ai_enabled) return;
+    const open = [];
+    for (const box of wdBoxes()) {
+      const el = box.querySelector("textarea, input[type=text], input:not([type])");
+      if (!el || (el.value || "").trim() || isDropdownish(el)) continue;
+      const label = clean(box.innerText).replace(/\s*\*\s*$/, "").trim();
+      if (!label || label.length < 8) continue;
+      if (SENSITIVE.test(label)) continue;                       // demographics/comp → never AI here
+      // skip standard/known fields the deterministic layer already owns
+      if (/first name|last name|middle|preferred name|^name\b|full name|e-?mail|phone|address|city|state|province|zip|postal|country|linkedin|github|website|\burl\b|salary|compensation|pay|desired|date|school|univers|degree|field of study|company name|job title|employer|supervisor|reference/i.test(label)) continue;
+      // a genuine open question: a textarea, or a prompt with '?' / an open verb
+      if (el.tagName !== "TEXTAREA" && !/\?|describe|explain|tell us|why|how|what|share|elaborate|interaction|experience (with|using)|walk (us|me)/i.test(label)) continue;
+      open.push({ el, label });
+    }
+    if (!open.length) return;
+    log(`drafting ${open.length} open answer(s) with AI…`);
+    const res = await send({ type: "answer", jobId: role.job_id, questions: open.map((q) => q.label) });
+    if (isContextDead(res)) { log("JobScan was reloaded — refresh this page (⌘R), then click Fill again.", "warn"); return; }
+    if (!res || !res.ok) { log("AI answer failed: " + ((res && res.error) || "no response"), "warn"); return; }
+    const answers = res.answers || {};
+    let n = 0;
+    for (const { el, label } of open) {
+      const a = answers[label];
+      if (a && !(el.value || "").trim()) { await humanPause(); el.focus(); setNativeValue(el, a); el.blur(); n++; }
+    }
+    log(n ? `AI drafted ${n} answer(s) ✓ — read & edit each before submitting` : "AI left the open questions (declined/empty)", n ? "good" : "warn");
+  }
+
   async function wdQuestions(role, log) {
-    // Eligibility / conflict-of-interest questions: answer from the profile, default No.
+    // Owner's rule: EVERY required question must get an answer, aimed at getting the interview.
+    // Two passes: (1) specific eligibility/conflict phrasings, matched on the LEADING Yes/No (not
+    // an exact "Yes"/"No" — NVIDIA words options as full sentences like "Yes, I am authorized to
+    // work for any employer"); (2) a sweep over EVERY remaining "Select One" so nothing is blank.
+    const YES = /^\s*yes\b/i, NO = /^\s*no\b/i;
+    const profile = role.profile || {};
     const rules = [
-      [/legally authorized to work/i, /^yes$/i, "work authorized → Yes"],
-      [/require sponsorship|sponsorship for an employment visa/i, /^no$/i, "sponsorship → No"],
-      [/restrictive covenant|non-compete|non-disclosure/i, /^no$/i, "restrictive covenant → No"],
-      [/ever worked for|previously.*(employ|work)/i, /^no$/i, "worked here before → No"],
-      [/engage with .* employees to negotiate|related to anyone|government office or agency|close personal relationship|outside employment/i, /^no$/i, "conflict-of-interest → No"],
+      // authorization MUST come before sponsorship: a combined "authorized to work WITHOUT
+      // sponsorship?" then correctly resolves to Yes (she is authorized), and once answered that
+      // box is no longer "select one" so the sponsorship rule can't re-touch it.
+      [/authori[sz]ed to work|authori[sz]ation to work|legally (authorized|allowed|entitled|eligible)\b.{0,20}\bwork|(right|eligible|permitted|permission) to work|work authoriz/i, YES, "work authorized → Yes"],
+      [/\bsponsor/i, NO, "sponsorship → No"],
+      [/restrictive covenant|non-compete|non-disclosure/i, NO, "restrictive covenant → No"],
+      [/ever worked for|previously.*(employ|work)|worked (here|for us) before/i, NO, "worked here before → No"],
+      [/would you (consider |be willing to )?relocat|open to relocat|willing to relocat/i, YES, "relocate → Yes"],
+      [/do you.*(use|work (on|with)|experience (with|using)|familiar with).*(workday|servicenow|our (product|system|platform))/i, YES, "use our product → Yes"],
+      [/related to (a|an|any|current|anyone|someone)|family member.*(work|employ)|relative.*(work|employ)/i, NO, "related to employee → No"],
+      [/citizen or (lawful )?(permanent )?resident of (cuba|syria|iran|north korea|crimea)|export control|sanctioned (countr|region)/i, NO, "export-control country → No"],
+      [/(employ|work|affiliat).{0,40}(university|college|government|federal|public sector)/i, NO, "gov/university affiliation → No"],
+      [/engage with .* employees to negotiate|government office or agency|close personal relationship|outside employment|conflict of interest/i, NO, "conflict-of-interest → No"],
     ];
     for (const [q, want, name] of rules) {
-      let box;
+      let box, guard = 0;
       // some pages repeat the same shape several times — answer every match
-      while ((box = wdBoxes().find((b) => q.test(b.innerText) && /select one/i.test(b.innerText)))) {
+      while ((box = wdBoxes().find((b) => q.test(b.innerText) && /select one/i.test(b.innerText))) && guard++ < 12) {
         const r = await wdPrompt(new RegExp(escapeRe(box.innerText.slice(0, 40))), want);
         if (r !== "ok") { log(name + " — pick manually", "warn"); break; }
         log("answered: " + name, "good");
       }
     }
+
+    // Pass 2 — the catch-all so NO required Select-One is left blank. commonAnswer handles most;
+    // an unrecognized REQUIRED one still gets a favorable default (acknowledgement/eligibility →
+    // Yes, otherwise the safe No) and is flagged for you to double-check. Demographics are skipped
+    // (wdSelfIdentify owns those); an unrecognized OPTIONAL question is left alone.
+    for (const box of wdBoxes().filter((b) => /select one/i.test(b.innerText))) {
+      const q = clean(box.innerText).replace(/\bselect one\b\s*\*?/i, "").trim();
+      if (SENSITIVE.test(q)) continue;
+      const ca = commonAnswer(q, profile);
+      let want = null, note = "";
+      if (ca && ca.yesno) want = ca.yesno === "yes" ? YES : NO;
+      else if (ca && (ca.choice || ca.text)) want = new RegExp("^\\s*" + escapeRe(ca.choice || ca.text), "i");
+      if (!want) {
+        // belt-and-suspenders for the two that MUST be right: authorization → Yes, sponsorship →
+        // No, even if commonAnswer somehow missed (auth checked first for the combined phrasing).
+        const ql = q.toLowerCase();
+        if (/authori[sz]ed to work|(right|eligible|permitted) to work|legally\b.{0,15}\bwork|work authoriz/.test(ql)) want = YES;
+        else if (/\bsponsor/.test(ql)) want = NO;
+        else {
+          const required = /\*/.test(box.innerText) || /\brequired\b/i.test(box.innerText);
+          if (!required) continue;
+          want = /\b(willing|able|agree|acknowledg|consent|accept|confirm|certif|available|eligible|comply|comfortable|understand)\b/i.test(q) ? YES : NO;
+          note = " (defaulted — please verify)";
+        }
+      }
+      const r = await wdPrompt(new RegExp(escapeRe(box.innerText.slice(0, 40))), want);
+      if (r === "ok") log("answered: " + short(q) + note, note ? "warn" : "good");
+    }
+
+    await wdOpenQuestions(role, log);        // open-ended text questions → AI
     await wdSalary(role, log);
     await fillCoverLetterBox(role, log);
   }
@@ -1284,26 +1970,59 @@
     return out;
   }
 
-  // After filling a step, surface anything Workday would still reject on Save. Re-runs the
-  // step's own filler once (many "required" errors are just a control that didn't commit), then
-  // reports what's genuinely left for the owner — the field name AND why.
+  // PROACTIVE required-field scan — Workday doesn't flag a required field as an error until you
+  // try to Save, so after a fill everything can LOOK done while required fields are still empty.
+  // This walks every required formField (a "*" marker or data-automation-id="required") and
+  // reports the ones with no value: an unanswered "Select One", an empty text/textarea, or a
+  // radio/checkbox group with nothing ticked. Demographics are skipped (owner's own to decide).
+  function wdEmptyRequired() {
+    const out = [];
+    for (const box of wdBoxes()) {
+      const txt = (box.innerText || "").replace(/\s+/g, " ").trim();
+      const required = !!box.querySelector('[data-automation-id="required"], abbr[title*="required" i]') || /\*/.test(txt);
+      if (!required || SENSITIVE.test(txt)) continue;
+      if (/desired salary|salary expectation|expected salary|compensation expectation/i.test(txt)) continue;  // handled/optional-by-design
+      let empty = false;
+      if (/select one/i.test(txt)) empty = true;                          // dropdown not chosen
+      else {
+        const el = box.querySelector("input, textarea, select");
+        if (el && (el.type === "radio" || el.type === "checkbox")) {
+          const grp = [...box.querySelectorAll('input[type=radio],input[type=checkbox]')];
+          empty = grp.length > 0 && !grp.some((x) => x.checked);
+        } else if (el && !isDropdownish(el)) {
+          empty = !(el.value || "").trim();
+        }
+      }
+      if (empty) out.push({ box, field: txt.replace(/\s*\*.*/, "").slice(0, 44) });
+    }
+    return out;
+  }
+
+  // After filling a step, surface anything Workday would still reject on Save — both errors it
+  // already shows AND required fields still empty (which it hasn't flagged yet). Re-runs the
+  // step's own filler once (many are just a control that didn't commit), then reports what's
+  // genuinely left — the field name AND why. Confirms out loud when the step is fully filled.
   async function wdReportErrors(role, log, repaired) {
     let errs = wdErrorList();
-    if (!errs.length) return;
-    if (!repaired) {                                   // one repair pass — re-commit the fields
-      log(`${errs.length} field(s) flagged — retrying them…`, "warn");
-      await fillWorkday(role, log, true);              // silent re-fill
+    let empties = wdEmptyRequired();
+    if (!errs.length && !empties.length) { log("all required fields on this step are filled ✓", "good"); return; }
+    if (!repaired) {                                   // one repair pass — re-commit / re-fill
+      log(`${errs.length + empties.length} required field(s) still need a value — retrying…`, "warn");
+      await fillWorkday(role, log, true);              // silent re-fill (re-runs AI for open Qs too)
       wdBlur();
       await sleep(400);
       errs = wdErrorList();
-      if (!errs.length) { log("all flagged fields fixed ✓", "good"); return; }
+      empties = wdEmptyRequired();
+      if (!errs.length && !empties.length) { log("all required fields filled ✓", "good"); return; }
     }
-    log(`still needs you (${errs.length}):`, "warn");
-    for (const e of errs.slice(0, 8)) {
-      log("  • " + (e.field ? e.field + " — " : "") + e.msg, "warn");
-    }
+    const lines = [...new Set([
+      ...errs.map((e) => (e.field ? e.field + " — " : "") + e.msg),
+      ...empties.map((e) => e.field + " — still empty, fill it yourself"),
+    ])];
+    log(`still needs you (${lines.length}):`, "warn");
+    for (const line of lines.slice(0, 10)) log("  • " + line, "warn");
     // the date widgets are the usual culprit — remind about the trick that works by hand
-    if (errs.some((e) => /date|month|year/i.test(e.field + e.msg))) {
+    if (lines.some((l) => /date|month|year/i.test(l))) {
       log("  (date stuck? open its dropdown, pick a WRONG month, then the right one)", "warn");
     }
   }
@@ -1379,6 +2098,7 @@
         button:active{ transform:translateY(.5px); }
         button:disabled{ opacity:.55; cursor:default; }
         button.primary{ background:#12314f; color:#fff; border-color:#12314f; }
+        button.fill.stop{ background:#b42318; border-color:#b42318; }   /* filling → click to STOP */
         button.ai{ background:linear-gradient(135deg,#6d5efc,#8b5cf6); color:#fff; border:0; }
         button.code{ background:#0e7490; color:#fff; border:0; }
         button.ok{ background:#15803d; color:#fff; border-color:#15803d; }
@@ -1394,7 +2114,6 @@
           <div class="role"></div>
           <div class="status"></div>
           <button class="primary fill">Fill application</button>
-          <button class="ai cover" hidden>✍ Draft cover letter</button>
           <button class="code" hidden>📧 Get email code</button>
           <button class="ok submitted">✓ I submitted this</button>
           <div class="log"></div>
@@ -1423,7 +2142,7 @@
       : '<span class="chip none">no tailored résumé — text only</span>');
     const log = (m, cls) => { const d = document.createElement("div"); if (cls) d.className = cls; d.textContent = m; $(".log").appendChild(d); };
 
-    $(".x").onclick = () => host.remove();
+    $(".x").onclick = () => { abortFill = true; host.remove(); };   // closing the panel also stops a fill
 
     // minimize / restore — collapse to just the header pill so it never covers the submit button
     const wrap = $(".wrap"), minBtn = $(".min");
@@ -1452,22 +2171,36 @@
     });
 
     const fillBtn = $(".fill");
+    const FILL_LABEL = "Fill application";
     fillBtn.onclick = async () => {
+      // Second click while filling = STOP. Sets the abort flag; humanPause throws it and the
+      // whole fill unwinds to the finally below, leaving whatever's filled so far in place.
+      if (fillBtn.dataset.filling === "1") {
+        abortFill = true;
+        fillBtn.textContent = "stopping…";
+        return;
+      }
+      abortFill = false;
+      fillBtn.dataset.filling = "1";
+      fillBtn.classList.add("stop");
+      fillBtn.textContent = "■ Stop";
       $(".log").textContent = "";
-      fillBtn.disabled = true; const orig = fillBtn.textContent; fillBtn.textContent = "filling…";
       const profile = role.profile || {};
-
+      try {
       // Workday is a different animal (multi-step wizard, its own widgets) — own filler,
       // fills the CURRENT step only; you click Save and Continue / Submit yourself.
+      if (IS_GOOGLE) {
+        await fillGoogle(profile, log);
+        log("— profile fields filled; role-specific questions + résumé are yours here.");
+        return;
+      }
+      if (IS_SR) {
+        await fillSmartRecruiters(role, log);
+        log("— review everything, then submit yourself.");
+        return;
+      }
       if (IS_WORKDAY) {
-        try { await fillWorkday(role, log); }      // fills THIS step only — you click Save yourself
-        catch (e) {
-          const m = String((e && e.message) || e);
-          log(/context invalidated|Extension context/i.test(m)
-            ? "JobScan was reloaded — refresh this page (⌘R), then click Fill again."
-            : "Workday fill error: " + m, "warn");
-        }
-        fillBtn.disabled = false; fillBtn.textContent = orig;
+        await fillWorkday(role, log);              // fills THIS step only — you click Save yourself
         return;
       }
 
@@ -1480,10 +2213,14 @@
       if (!filled.length) line.textContent = "no standard text fields matched";
       if (skipped.length) log("left as-is: " + skipped.join(", "));
 
-      // 1.5) repeatable Employment + Education sections (Greenhouse custom forms, e.g. Lyft)
+      // 1.5) repeatable Employment + Education sections
       if (document.getElementById("company-name-0") || document.getElementById("school--0")) {
-        await fillGreenhouseHistory(role, log);
+        await fillGreenhouseHistory(role, log);           // Greenhouse custom forms (e.g. Lyft)
       }
+      if (IS_ASHBY && document.querySelector('[id$="education_history-degree"]')) {
+        await fillAshbyHistory(role, log);                // Ashby education block
+      }
+      if (IS_ASHBY) await fillAshbyButtons(profile, log); // Ashby Yes/No button-pair questions
 
       // 2) common eligibility / logistics (dropdowns, Yes/No radios, country, location…)
       const leftover = await fillCommon(profile, log, role);
@@ -1527,8 +2264,17 @@
       // 5) "Additional information" / cover-letter box
       await fillCoverLetterBox(role, log);
 
-      fillBtn.disabled = false; fillBtn.textContent = orig;
       log("— review everything, then submit yourself.");
+      } catch (e) {
+        const m = String((e && e.message) || e);
+        if (m.includes(ABORT)) log("⏹ stopped — the rest is yours.", "warn");
+        else if (/context invalidated|Extension context/i.test(m)) log("JobScan was reloaded — refresh this page (⌘R), then click Fill again.", "warn");
+        else log("fill error: " + m, "warn");
+      } finally {
+        fillBtn.dataset.filling = "";
+        fillBtn.classList.remove("stop");
+        fillBtn.textContent = FILL_LABEL;
+      }
     };
 
     // Email verification-code button — only when mailcode is configured (app password present).
@@ -1546,28 +2292,11 @@
       };
     }
 
-    // ✍ cover-letter button — opt-in so the token-heavy draft only runs when you ask.
-    if (role.ai_enabled) {
-      const cover = $(".cover");
-      cover.hidden = false;
-      cover.onclick = async () => {
-        const box = [...document.querySelectorAll("textarea")].find((el) =>
-          el.offsetParent && !((el.value || "").trim()) &&
-          /cover letter|additional information|anything else|tell us (more|anything)|what else should we know|why (do you want|are you interested)/.test((questionLabel(el) || fieldText(el) || "").toLowerCase()));
-        if (!box) { log("no empty cover-letter / 'anything else' box on this page", "warn"); return; }
-        cover.disabled = true; const o = cover.textContent; cover.textContent = "✍ drafting…";
-        const r = await send({ type: "coverLetter", jobId: role.job_id, words: 180 });
-        cover.disabled = false; cover.textContent = o;
-        if (isContextDead(r)) { log("JobScan was reloaded — refresh this page (⌘R).", "warn"); return; }
-        if (!r || !r.ok || !r.text) { log("cover letter failed: " + ((r && r.error) || "no text"), "warn"); return; }
-        box.focus(); setNativeValue(box, r.text); box.blur();
-        log("cover letter drafted ✓ — READ IT and make the wording yours before submitting", "good");
-      };
-    }
 
     $(".submitted").onclick = async () => {
       const res = await send({ type: "markApplied", jobId: role.job_id, variant: role.resume_variant });
       if (res && res.ok) { log("marked applied in JobScan ✓ (" + role.resume_variant + ")", "good"); $(".submitted").disabled = true; }
+      else if (isContextDead(res)) log("JobScan was reloaded — refresh this page (⌘R), then click ✓ again.", "warn");
       else log("mark-applied failed: " + (res && res.error), "warn");
     };
     return host;
@@ -1584,20 +2313,110 @@
     // Workday renders its own widgets (no file input on most steps) — detect its form fields.
     const hasForm = IS_WORKDAY
       ? document.querySelector('[data-automation-id^="formField"], [data-automation-id="add-button"]')
-      : document.querySelector('input[type=file], #first_name, [name*="resume" i]');
+      : (IS_GOOGLE
+        ? document.querySelector('input[jsname], [role=radiogroup], [jsname="oYxtQd"]')
+        : (IS_SR
+          ? (deepAll("input#first-name-input, input#email-input, sr-question-field-radio, sr-question-field-select")[0]
+             || (/\/screening/i.test(location.pathname) ? deepAll("input[role=combobox]")[0] : null))  // shadow DOM; page 2 = /screening
+          : document.querySelector('input[type=file], #first_name, [name*="resume" i]')));
     if (!hasForm) return;                                    // not on the application form yet
     if (shownFor === location.href && document.getElementById("jobscan-panel")) return;
     busy = true;
     try {
       const res = await send({ type: "lookup", url: location.href });
       if (!res) { console.warn("[JobScan] no response — is JobScan running on http://127.0.0.1:8787 ?"); return; }
-      if (!res.found) { console.info("[JobScan] no matching role for", location.href); return; }
+      let role = res.found ? res.role : null;
+      // Google/Microsoft careers URLs carry no job id. Owner's rule: default to the company's
+      // TOP-scored role (she applies high-score-first, so the first is the best guess) and use
+      // ITS tailored résumé. Only if the company has no tailored role, fall back to profile-only.
+      if (!role && (IS_GOOGLE || IS_MICROSOFT || IS_SR)) {
+        const company = IS_GOOGLE ? "Google" : IS_MICROSOFT ? "Microsoft"
+          : ((location.pathname.match(/\/company\/([^/]+)/) || [])[1] || "").replace(/[-_]/g, " ");
+        const top = await send({ type: "topRole", company });
+        if (top && top.found) role = top.role;
+        else {
+          const p = await send({ type: "profile" });
+          if (p && p.ok) role = { ...p, company, title: "profile fill (no role match)", has_tailored_pdf: false };
+        }
+      }
+      if (!role) { console.info("[JobScan] no matching role for", location.href); return; }
       const old = document.getElementById("jobscan-panel");
       if (old) old.remove();
       shownFor = location.href;
-      panel(res.role);
+      panel(role);
     } finally { busy = false; }
   }
+
+  // ---- Capture: for job pages that AREN'T in JobScan (Apple/MS/Google/Tesla and any other
+  //      careers site the daily scanner can't reach). Reads the posting off the DOM and sends
+  //      it to the local server, which scores it + queues it for tailoring. Always available as
+  //      a small pill so she can browse any careers page and pull in whatever looks good. ----
+  function extractJob() {
+    const clean = (s) => (s || "").replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+    let title = (document.querySelector("h1") || {}).textContent
+      || (document.title || "").split(/[|\-–—·•]/)[0];
+    title = (title || "").trim().slice(0, 160);
+    // biggest sensible text block wins — description containers first, then main/article, then body
+    const cands = [...document.querySelectorAll(
+      '[class*="description" i],[id*="description" i],[class*="job" i][class*="detail" i],'
+      + 'main,article,[role="main"]')];
+    let best = "", bestLen = 0;
+    for (const el of cands) {
+      const t = (el.innerText || "").trim();
+      if (t.length > bestLen) { best = t; bestLen = t.length; }
+    }
+    if (bestLen < 300) best = (document.body.innerText || "").trim();
+    return { title, jd: clean(best).slice(0, 14000) };
+  }
+
+  function capturePill() {
+    if (document.getElementById("jobscan-capture")) return;
+    const host = document.createElement("div");
+    host.id = "jobscan-capture";
+    const shadow = host.attachShadow({ mode: "open" });
+    shadow.innerHTML = `
+      <style>
+        :host{ all:initial; }
+        .cap{ font:600 13px/1.3 -apple-system,system-ui,sans-serif; display:flex; align-items:center; gap:7px;
+          background:#12314f; color:#fff; border-radius:999px; padding:9px 14px; cursor:pointer;
+          box-shadow:0 4px 14px rgba(0,0,0,.22); user-select:none; white-space:nowrap; }
+        .cap:hover{ filter:brightness(1.08); }
+        .cap.busy{ opacity:.7; cursor:default; }
+        .out{ margin-top:7px; font:600 12px/1.4 -apple-system,system-ui,sans-serif; color:#fff;
+          background:#0f172a; border-radius:9px; padding:8px 11px; max-width:250px; box-shadow:0 4px 14px rgba(0,0,0,.22); }
+        .out.good{ background:#15803d; } .out.warn{ background:#b42318; }
+      </style>
+      <div class="cap">📥 Capture to JobScan</div>
+      <div class="out" hidden></div>`;
+    host.style.cssText = "position:fixed !important; bottom:20px !important; right:20px !important;"
+      + "left:auto !important; top:auto !important; z-index:2147483646 !important; margin:0 !important;";
+    document.documentElement.appendChild(host);
+    const cap = shadow.querySelector(".cap"), out = shadow.querySelector(".out");
+    cap.onclick = async () => {
+      if (cap.classList.contains("busy")) return;
+      const { title, jd } = extractJob();
+      if (jd.length < 80) {
+        out.hidden = false; out.className = "out warn";
+        out.textContent = "couldn't read a job description on this page";
+        return;
+      }
+      cap.classList.add("busy"); cap.textContent = "📥 capturing…";
+      out.hidden = false; out.className = "out"; out.textContent = "scoring…";
+      const res = await send({ type: "capture", payload: { url: location.href, title, jd, location: "" } });
+      cap.classList.remove("busy"); cap.textContent = "📥 Capture to JobScan";
+      if (res && res.ok) {
+        out.className = "out good";
+        out.textContent = `✓ ${res.company} — ${res.title}\nscore ${Math.round(res.score)} · ${res.verdict}`;
+      } else {
+        out.className = "out warn";
+        out.textContent = "capture failed: " + ((res && res.error) || "no response");
+      }
+    };
+  }
+  // show the pill everywhere EXCEPT the ATS application forms the main panel already owns
+  const ON_ATS_FORM = IS_GOOGLE || IS_SR || IS_WORKDAY || IS_MICROSOFT || IS_ASHBY
+    || /greenhouse|lever|ashby|myworkday|smartrecruiters|rippling|avature/i.test(location.hostname);
+  if (!ON_ATS_FORM) capturePill();
 
   // 1) poll for ~20s after load (covers the form rendering after a click to "Apply")
   let ticks = 0;
