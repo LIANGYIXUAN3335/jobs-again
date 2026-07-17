@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { width: 260px; margin: 0; font: 13px/1.45 -apple-system, Segoe UI, Helvetica, Arial, sans-serif; color: #1a1d21; }
+  .hd { background: #12314f; color: #fff; padding: 10px 12px; font-weight: 600; }
+  .bd { padding: 12px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+  .ok { background: #14632c; } .bad { background: #b3261e; }
+  ol { padding-left: 18px; margin: 8px 0 0; color: #374151; }
+  li { margin: 4px 0; }
+  code { background: #eef0f3; padding: 0 4px; border-radius: 3px; }
+  a { color: #12314f; }
+</style>
+</head>
+<body>
+  <div class="hd">JobScan Apply Helper</div>
+  <div class="bd">
+    <div id="status"><span class="dot bad"></span>checking local server…</div>
+    <ol>
+      <li>Open a <b>Greenhouse / Lever / Ashby</b> application page.</li>
+      <li>The <b>JobScan</b> panel appears if the role is in your DB.</li>
+      <li>Click <b>Fill</b> → review → submit yourself.</li>
+      <li>Click <b>✓ I submitted</b> to mark it applied.</li>
+    </ol>
+    <p class="muted" id="hint" style="color:#6b7280;margin:8px 0 0;"></p>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
