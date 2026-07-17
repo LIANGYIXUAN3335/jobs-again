@@ -1,0 +1,94 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 0 12px 60px;
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  color: #1a1d21; background: #fafafa;
+}
+code { background: #eee; padding: 0 4px; border-radius: 3px; }
+.dim { color: #8a8f98; }
+
+.topbar { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; padding: 10px 0 6px; }
+.topbar h1 { font-size: 16px; margin: 0; }
+.counts a { margin-right: 10px; color: #444; text-decoration: none; padding: 2px 6px; border-radius: 4px; }
+.counts a.on { background: #1a1d21; color: #fff; }
+.counts b { font-weight: 600; }
+.runinfo { margin-left: auto; color: #8a8f98; }
+.runinfo .err { color: #c0392b; cursor: help; }
+
+.settings { margin: 4px 0 8px; color: #555; }
+.settings summary { cursor: pointer; user-select: none; }
+.co-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 0; align-items: center; }
+.co-chips form { display: inline-flex; gap: 4px; }
+
+#filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px; }
+#filters input[name=q] { width: 200px; }
+#filters input[name=min_score] { width: 90px; }
+input, select, button, textarea {
+  font: inherit; padding: 3px 6px; border: 1px solid #cfd3d8; border-radius: 4px; background: #fff;
+}
+button { cursor: pointer; }
+button:hover { background: #f0f1f3; }
+:focus-visible { outline: 2px solid #2563eb; outline-offset: 1px; }
+
+table { border-collapse: collapse; width: 100%; background: #fff; }
+thead th {
+  position: sticky; top: 0; background: #f2f3f5; text-align: left;
+  padding: 6px 8px; border-bottom: 2px solid #d8dbe0; font-weight: 600; z-index: 2;
+}
+tbody td { padding: 5px 8px; border-bottom: 1px solid #ecedef; vertical-align: top; }
+tbody tr:hover { background: #f6f8fb; }
+tr.focused { outline: 2px solid #2563eb; outline-offset: -2px; }
+tr.gone { opacity: 0; transition: opacity .25s; }
+td.num, th.num { text-align: right; }
+td.score b { font-size: 14px; }
+td.co { font-weight: 600; white-space: nowrap; }
+td.title { max-width: 420px; }
+.title-link { cursor: pointer; }
+.title-link:hover { text-decoration: underline; }
+a.apply { text-decoration: none; margin-left: 4px; }
+td.loc { color: #555; white-space: nowrap; }
+td.chips { white-space: nowrap; color: #555; font-variant-numeric: tabular-nums; }
+td.seen { white-space: nowrap; color: #555; }
+
+.chip {
+  display: inline-block; font-size: 11px; padding: 0 5px; border-radius: 8px;
+  background: #eceff3; color: #444; margin-left: 4px; white-space: nowrap;
+}
+.chip.remote { background: #e6f4ea; color: #1e7a3a; margin: 0 4px 0 0; }
+.chip.new { background: #fff3cd; color: #8a6d00; }
+.chip.warn { background: #fdecea; color: #b3261e; cursor: help; }
+.chip.hide { background: #e8e8e8; color: #777; }
+.chip.sr { background: #ede9fe; color: #5b21b6; }
+.chip.tailor { background: #e0f2fe; color: #0369a1; }
+.chip button.co-remove { border: none; background: none; padding: 0 0 0 2px; }
+
+.verdict { font-size: 11px; padding: 1px 7px; border-radius: 8px; }
+.v-strong { background: #d1f2d9; color: #14632c; }
+.v-consider { background: #fff3cd; color: #7a6000; }
+.v-weak { background: #ececec; color: #777; }
+
+.signals .why { color: #14632c; }
+.signals .caution { color: #b3261e; }
+.signals div { max-width: 320px; }
+
+td.actions { white-space: nowrap; }
+td.actions button { padding: 2px 7px; margin-left: 2px; }
+td.actions .variant { max-width: 90px; }
+td.actions .more { max-width: 24px; }
+.status-chip { font-size: 11px; padding: 1px 6px; border-radius: 8px; background: #ececec; margin-right: 4px; }
+.status-chip[data-status="new"] { background: #e7effd; color: #1d4ed8; }
+.status-chip[data-status="applied"] { background: #d1f2d9; color: #14632c; }
+.status-chip[data-status="interviewing"] { background: #ede9fe; color: #5b21b6; }
+.status-chip[data-status="skip"] { background: #ececec; color: #777; }
+.status-chip[data-status="rejected"] { background: #fdecea; color: #b3261e; }
+
+td.notes-cell { min-width: 90px; max-width: 220px; color: #555; cursor: text; }
+td.notes-cell textarea { width: 100%; min-height: 54px; }
+
+tr.jd-row td { background: #fbfbfd; }
+tr.jd-row pre {
+  white-space: pre-wrap; max-height: 420px; overflow-y: auto; margin: 6px 0 2px;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: #333;
+}
+.jd-meta { color: #8a8f98; font-size: 12px; }
+td.empty { text-align: center; color: #8a8f98; padding: 30px; }
