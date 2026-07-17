@@ -36,6 +36,21 @@ async function setStatus(tr, status) {
   }
 }
 
+/* ---------- queue for tailoring ---------- */
+async function queueTailoring(tr) {
+  if (!tr) return;
+  const res = await api(`/api/roles/${encodeURIComponent(tr.dataset.jobId)}/queue-tailoring`,
+    "POST", { angle: null });
+  const chip = tr.querySelector(".chip.tailor");
+  if (!chip) {
+    const span = document.createElement("span");
+    span.className = "chip tailor";
+    span.textContent = "queued";
+    tr.querySelector(".title .apply").before(span, document.createTextNode(" "));
+  }
+  alert(`Prompt written:\n${res.prompt_path}\n\nOpen it in VS Code, generate with Claude Code, save the YAML, then click "ingest résumés".`);
+}
+
 /* ---------- JD expand ---------- */
 async function toggleJD(tr) {
   const next = tr.nextElementSibling;
@@ -101,13 +116,28 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "j") { e.preventDefault(); focusStep(focusIdx < 0 ? 0 : 1); }
   else if (e.key === "k") { e.preventDefault(); focusStep(-1); }
   else if (e.key === "Enter" && tr) { e.preventDefault(); toggleJD(tr); }
+  else if (e.key === "t" && tr) { e.preventDefault(); queueTailoring(tr); }
   else if (acts[e.key] && tr) { e.preventDefault(); setStatus(tr, acts[e.key]); }
 });
 
 /* ---------- delegated clicks / changes ---------- */
 document.addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-act]");
-  if (btn) { setStatus(rowOf(btn), btn.dataset.act); return; }
+  if (btn) {
+    if (btn.dataset.act === "queue") queueTailoring(rowOf(btn));
+    else setStatus(rowOf(btn), btn.dataset.act);
+    return;
+  }
+  if (e.target.closest("#ingest-btn")) {
+    const b = e.target.closest("#ingest-btn");
+    b.disabled = true; b.textContent = "ingesting…";
+    api("/api/ingest", "POST").then((r) => {
+      b.disabled = false; b.textContent = "ingest résumés";
+      alert(r.ingested ? `Rendered ${r.ingested} résumé PDF(s). Reloading.` : "Nothing new in output/resumes/.");
+      if (r.ingested) location.reload();
+    }).catch(() => { b.disabled = false; b.textContent = "ingest résumés"; });
+    return;
+  }
   if (e.target.closest(".title-link")) { toggleJD(rowOf(e.target)); return; }
   const notes = e.target.closest(".notes-cell");
   if (notes) { editNotes(notes); return; }

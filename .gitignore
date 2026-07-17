@@ -6,3 +6,8 @@ __pycache__/
 data/*.db-wal
 data/*.db-shm
 data/logs/
+
+# tailoring artifacts are personal/generated, not source
+output/prompts/*.md
+output/resumes/*.yaml
+output/resumes/*.pdf

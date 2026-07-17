@@ -194,6 +194,14 @@ def set_notes(conn, job_id: str, notes: str) -> dict:
     return upsert_state(conn, job_id, notes=notes)
 
 
+def set_tailor(conn, job_id: str, **fields) -> dict:
+    allowed = {"tailor_status", "prompt_path", "tailored_resume_path"}
+    bad = set(fields) - allowed
+    if bad:
+        raise ValueError(f"set_tailor got unexpected fields: {bad}")
+    return upsert_state(conn, job_id, **fields)
+
+
 def list_applied_companies(conn) -> list[dict]:
     return [dict(r) for r in conn.execute(
         "SELECT * FROM applied_companies ORDER BY display_name"
@@ -244,7 +252,8 @@ def fetch_view(
 ) -> dict:
     rows = [dict(r) for r in conn.execute(
         "SELECT r.*, s.status AS own_status, s.notes, s.applied_date,"
-        "       s.applied_with_resume, s.tailor_status, s.status_updated_at"
+        "       s.applied_with_resume, s.tailor_status, s.tailored_resume_path,"
+        "       s.status_updated_at"
         " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
     )]
     applied_cos = {r["name_norm"]: r["display_name"] for r in
@@ -341,7 +350,8 @@ def fetch_view(
 def get_role(conn: sqlite3.Connection, job_id: str) -> dict | None:
     r = conn.execute(
         "SELECT r.*, s.status AS own_status, s.notes, s.applied_date,"
-        "       s.applied_with_resume, s.tailor_status"
+        "       s.applied_with_resume, s.tailor_status, s.prompt_path,"
+        "       s.tailored_resume_path"
         " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
         " WHERE r.job_id = ?",
         (job_id,),

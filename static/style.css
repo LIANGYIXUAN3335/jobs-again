@@ -60,6 +60,9 @@ td.seen { white-space: nowrap; color: #555; }
 .chip.hide { background: #e8e8e8; color: #777; }
 .chip.sr { background: #ede9fe; color: #5b21b6; }
 .chip.tailor { background: #e0f2fe; color: #0369a1; }
+a.chip.tailor.ready { text-decoration: none; background: #d1f2d9; color: #14632c; }
+td.actions button.queue { margin-left: 6px; }
+#ingest-btn { padding: 1px 8px; font-size: 12px; }
 .chip button.co-remove { border: none; background: none; padding: 0 0 0 2px; }
 
 .verdict { font-size: 11px; padding: 1px 7px; border-radius: 8px; }
