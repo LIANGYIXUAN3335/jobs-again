@@ -165,16 +165,38 @@
     return box;
   }
 
-  // ---- boot: only act if this frame actually holds an application form ----
-  async function boot() {
+  // ---- boot: the form on Ashby/Greenhouse loads LATE (SPA), so we can't just check
+  //      once at load. Poll briefly + watch the DOM + watch for SPA URL changes, and
+  //      show the panel as soon as an application form appears for a matching role. ----
+  let shownFor = null;   // URL the panel is currently shown for
+  let busy = false;      // avoid overlapping lookups while the DOM churns
+
+  async function tryShow() {
+    if (busy) return;
     const hasForm = document.querySelector('input[type=file], #first_name, [name*="resume" i]');
-    if (!hasForm) return;
-    const res = await send({ type: "lookup", url: location.href });
-    if (!res) { console.warn("[JobScan] no response from extension"); return; }
-    if (!res.found) { console.info("[JobScan] no matching role for this page"); return; }
-    panel(res.role);
+    if (!hasForm) return;                                    // not on the application form yet
+    if (shownFor === location.href && document.getElementById("jobscan-panel")) return;
+    busy = true;
+    try {
+      const res = await send({ type: "lookup", url: location.href });
+      if (!res) { console.warn("[JobScan] no response — is JobScan running on http://127.0.0.1:8787 ?"); return; }
+      if (!res.found) { console.info("[JobScan] no matching role for", location.href); return; }
+      const old = document.getElementById("jobscan-panel");
+      if (old) old.remove();
+      shownFor = location.href;
+      panel(res.role);
+    } finally { busy = false; }
   }
 
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
-  else boot();
+  // 1) poll for ~20s after load (covers the form rendering after a click to "Apply")
+  let ticks = 0;
+  const poll = setInterval(() => { tryShow(); if (++ticks > 40) clearInterval(poll); }, 500);
+  // 2) react to DOM changes (form injected without a reload)
+  new MutationObserver(() => tryShow()).observe(document.documentElement, { childList: true, subtree: true });
+  // 3) react to SPA navigation (URL changed without a full page load)
+  let lastUrl = location.href;
+  setInterval(() => {
+    if (location.href !== lastUrl) { lastUrl = location.href; shownFor = null; ticks = 0; tryShow(); }
+  }, 800);
+  tryShow();
 })();
