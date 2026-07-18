@@ -143,7 +143,10 @@ class ResumeScore:
 
 
 def score_resume(jd_text: str, merged: dict, cfg: dict, base_text: str | None = None) -> ResumeScore:
-    gate = float(((cfg or {}).get("resume_scoring") or {}).get("gate", 80))
+    rs = (cfg or {}).get("resume_scoring") or {}
+    floor = float(rs.get("floor", 65))
+    target = float(rs.get("target", rs.get("gate", 80)))   # `gate` kept as a fallback for old configs
+    strong = float(rs.get("strong", 85))
     jd = jd_text or ""
     rtext = _resume_text(merged)
 
@@ -187,8 +190,10 @@ def score_resume(jd_text: str, merged: dict, cfg: dict, base_text: str | None = 
     coverable = sorted(m for m in all_missing if m in base_present)
     true_gaps = sorted(m for m in all_missing if m not in base_present)
 
+    verdict = ("strong" if overall >= strong else "apply" if overall >= target
+               else "improve" if overall >= floor else "drop")
     return ResumeScore(
-        overall=overall, verdict="apply" if overall >= gate else "hold",
+        overall=overall, verdict=verdict,
         skills_coverage=skills_coverage, title_alignment=title_alignment,
         achievements=achievements, parseability=parseability,
         matched_hard=matched_hard, missing_hard=missing_hard,

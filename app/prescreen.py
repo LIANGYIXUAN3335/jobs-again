@@ -53,7 +53,10 @@ def prescreen(cfg: dict, min_score: float = 0.0) -> list[dict]:
 
 def main(argv: list[str]) -> None:
     cfg = cfgmod.load_config()
-    gate = float((cfg.get("resume_scoring") or {}).get("gate", 80))
+    rs = cfg.get("resume_scoring") or {}
+    target = float(rs.get("target", rs.get("gate", 80)))
+    strong = float(rs.get("strong", 85))
+    tailor_min = float(rs.get("tailor_min", 50))
     min_score = 0.0
     top = None
     for i, a in enumerate(argv):
@@ -62,17 +65,18 @@ def main(argv: list[str]) -> None:
         if a == "--top" and i + 1 < len(argv):
             top = int(argv[i + 1])
     ranked = prescreen(cfg, min_score)
-    # a genuine fit = technically rich JD (asks for ≥5 hard skills) she covers well
-    worth = [r for r in ranked if r["req"] >= 5 and r["ceiling"] >= 70]
+    # a genuine fit = technically rich JD (asks for ≥5 hard skills) she covers to the intake floor
+    worth = [r for r in ranked if r["req"] >= 5 and r["ceiling"] >= tailor_min]
     shown = (worth[:top] if top else worth)
     print(f"\nPre-screen — base résumé vs {len(ranked)} roles.  "
           f"'hit/req' = hard eng skills she meets / the JD asks for.\n"
-          f"Ranked by absolute overlap (thin & non-eng JDs sink).  gate {gate:.0f}\n")
+          f"Ranked by absolute overlap (thin & non-eng JDs sink).  "
+          f"strong ≥{strong:.0f} · apply ≥{target:.0f} · intake ≥{tailor_min:.0f}\n")
     for r in shown:
-        mark = "✅" if r["ceiling"] >= gate else "🟡"
+        mark = "🟢" if r["ceiling"] >= strong else "✅" if r["ceiling"] >= target else "🟡"
         print(f"  {mark} {r['ceiling']:>3}  {r['hit']:>2}/{r['req']:<2}  "
               f"{r['company'][:20]:<20} {r['title'][:42]}")
-    print(f"\n  {len(worth)} roles worth tailoring (JD asks ≥5 hard skills & ceiling ≥70).")
+    print(f"\n  {len(worth)} roles worth tailoring (JD asks ≥5 hard skills & ceiling ≥{tailor_min:.0f}).")
     print(f"  Showing top {len(shown)}. Run with --top N to see more.")
 
 
