@@ -11,3 +11,6 @@ data/logs/
 output/prompts/*.md
 output/resumes/*.yaml
 output/resumes/*.pdf
+
+# LOCAL SECRETS — never commit (Anthropic API key for AI autofill)
+secrets.yaml
