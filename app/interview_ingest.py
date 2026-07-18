@@ -1,0 +1,230 @@
+"""Index the 面试复盘 markdown into the pipeline — the merge point between the interview-review
+skill and JobScan.
+
+The review files are already structured: the interview-review skill appends one
+`## Company · Date · Round` section per interview to three card-source files, each tagged with
+an `<!-- atoms-source id="..." -->` marker for the atoms card cron. This module reuses that
+EXACT convention — zero new markers, zero risk to the cron — and mirrors the sections into
+`interviews` / `interview_items` so the pipeline can show, per role: which rounds happened,
+what was asked, and which action items are still open.
+
+Boundaries, deliberately:
+  - The markdown stays the system of record. This is read-only on every file; re-ingest is
+    idempotent (items replaced per marker), and a job link set by hand always survives.
+  - Matching is company-name based against applied/interviewing/rejected roles: exactly one
+    candidate → auto-link (and the role advances to stage=interview — a 复盘 existing IS the
+    evidence an interview happened); several → left unlinked for the UI to resolve. Most
+    reviews are startups outside the scanned 99 — those stay standalone, which is fine: the
+    questions and action items still surface in one place.
+
+    python -m app.interview_ingest            # scan, ingest, print the table
+    python -m app.interview_ingest --dry-run  # parse + match, write nothing
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+from . import config as cfgmod
+from . import store
+
+# "## Amazon · 2026-07-06 · Round 3" / "## WOP.com · 2026-06 · Recruiter Screen". The second
+# field must look like a date — that alone filters non-interview sections ("## 答案库 / …").
+_HEADING = re.compile(r"^##\s+(?P<company>[^·\n]+?)\s*·\s*(?P<date>20\d{2}(?:-\d{2}){0,2})"
+                      r"(?:\s*·\s*(?P<round>.+?))?\s*$")
+_MARKER = re.compile(r'<!--\s*atoms-source\s+id="(?P<id>[^"]+)"')
+_CHECKBOX = re.compile(r"^\s*-\s*\[(?P<done>[ xX])\]\s*(?P<text>.+?)\s*$")
+_QUESTION = re.compile(r"^###\s*Q:\s*(?P<text>.+?)\s*$")
+
+
+def _derived_id(company: str, date: str) -> str:
+    kebab = re.sub(r"[^a-z0-9]+", "-", company.lower()).strip("-")
+    return f"{date}-{kebab}"
+
+
+def _sections(text: str, src_file: str, kind: str) -> list[dict]:
+    """Split one card-source file into per-interview sections with their items."""
+    out: list[dict] = []
+    cur: dict | None = None
+    for line in text.splitlines():
+        h = _HEADING.match(line)
+        if line.startswith("## "):
+            cur = None                                   # any ## ends the previous section
+        if h:
+            cur = {"company": h["company"].strip(), "date": h["date"],
+                   "round": (h["round"] or "").strip(), "heading": line.strip()[3:],
+                   "marker": None, "items": [], "src_file": src_file, "kind": kind}
+            out.append(cur)
+            continue
+        if cur is None:
+            continue
+        m = _MARKER.search(line)
+        if m:
+            cur["marker"] = m["id"].strip()
+            continue
+        if kind == "action":
+            c = _CHECKBOX.match(line)
+            if c:
+                cur["items"].append({"kind": "action", "text": c["text"],
+                                     "done": c["done"].lower() == "x", "src_file": src_file})
+        else:
+            q = _QUESTION.match(line)
+            if q:
+                cur["items"].append({"kind": kind, "text": q["text"],
+                                     "done": 0, "src_file": src_file})
+    for s in out:
+        s["marker"] = s["marker"] or _derived_id(s["company"], s["date"])
+    return out
+
+
+def _files(cfg: dict) -> list[tuple[Path, str]]:
+    """(path, item-kind) for each card-source file that exists."""
+    iv = cfg.get("interviews") or {}
+    base = Path(iv.get("dir") or (cfgmod.ROOT.parent / "面试复盘"))
+    names = iv.get("files") or {
+        "action": "Interview Action Items.md",
+        "tech_q": "Technical_Interview_Questions.md",
+        "ai_q": "AI_Agent_Interview_Questions.md",
+    }
+    return [(base / fname, kind) for kind, fname in names.items() if (base / fname).exists()]
+
+
+# README.md is her hand-maintained master index: one line per interview with the local
+# review/transcript md (the Otter transcript's processed form) and, when one exists, the
+# Otter share link. "- [31. Amazon - Technical Phone Screen](Amazon/02_....md) (140 transcript
+# rows) - [Otter](https://otter.ai/u/...)" under a "### Company" heading.
+_README_CO = re.compile(r"^###\s+(.+?)\s*$")
+_README_ENTRY = re.compile(r"^\s*-\s*\[(?P<label>[^\]]+)\]\(<?(?P<path>[^)>]+\.md)>?\)(?P<rest>.*)$")
+_README_OTTER = re.compile(r"\[Otter\]\((?P<url>https?://[^)]+)\)")
+_TOKEN = re.compile(r"[a-z0-9]{1,}")
+
+
+def _readme_entries(base: Path) -> dict[str, list[dict]]:
+    """{company_norm: [{label, path, otter}]} from 面试复盘/README.md (missing file → {})."""
+    p = base / "README.md"
+    if not p.exists():
+        return {}
+    out: dict[str, list[dict]] = {}
+    company = None
+    for line in p.read_text(encoding="utf-8").splitlines():
+        h = _README_CO.match(line)
+        if h:
+            company = cfgmod.norm_key(h.group(1))
+            continue
+        e = _README_ENTRY.match(line)
+        if e and company:
+            m = _README_OTTER.search(e["rest"] or "")
+            out.setdefault(company, []).append({
+                "label": e["label"], "path": e["path"].strip(),
+                "otter": m["url"] if m else None})
+    return out
+
+
+def _best_entry(entries: list[dict], round_type: str) -> dict | None:
+    """The README line for THIS round: highest token overlap between the interview's round
+    label and the entry label; needs ≥2 shared tokens (so "Round 1" matches "Round 1 — BQ +
+    OOD Checkout Price Engine" but a lone shared word like "interview" links nothing)."""
+    want = set(_TOKEN.findall((round_type or "").lower()))
+    best, score = None, 1
+    for e in entries:
+        have = set(_TOKEN.findall(e["label"].lower()))
+        s = len(want & have)
+        if s > score:
+            best, score = e, s
+    return best
+
+
+def _match_role(conn, company: str) -> tuple[str | None, int]:
+    """(job_id, n_candidates). Auto-link only when the company resolves to EXACTLY one
+    applied/interviewing/rejected role — the same propose-don't-guess rule as outcomes."""
+    cn = cfgmod.norm_key(company)
+    if not cn:
+        return None, 0
+    rows = conn.execute(
+        "SELECT r.job_id FROM jobs.roles r JOIN role_state s ON s.job_id=r.job_id"
+        " WHERE s.status IN ('applied','interviewing','rejected')"
+        "   AND (r.company_norm = ? OR r.company_norm LIKE ? || '%')",
+        (cn, cn)).fetchall()
+    ids = [r["job_id"] for r in rows]
+    return (ids[0], 1) if len(ids) == 1 else (None, len(ids))
+
+
+def ingest(cfg: dict, conn, *, dry_run: bool = False) -> dict:
+    merged: dict[str, dict] = {}
+    for path, kind in _files(cfg):
+        text = path.read_text(encoding="utf-8")
+        for s in _sections(text, path.name, kind):
+            g = merged.setdefault(s["marker"], {
+                "company": s["company"], "date": s["date"], "round": s["round"],
+                "sources": {}, "items": []})
+            g["sources"][path.name] = s["heading"]
+            g["round"] = g["round"] or s["round"]
+            g["items"].extend(s["items"])
+
+    iv = cfg.get("interviews") or {}
+    base = Path(iv.get("dir") or (cfgmod.ROOT.parent / "面试复盘"))
+    readme = _readme_entries(base)
+
+    linked = ambiguous = standalone = with_transcript = 0
+    for marker, g in sorted(merged.items()):
+        job_id, n_cand = _match_role(conn, g["company"])
+        if job_id:
+            linked += 1
+        elif n_cand > 1:
+            ambiguous += 1
+        else:
+            standalone += 1
+        entry = _best_entry(readme.get(cfgmod.norm_key(g["company"]), []), g["round"])
+        if entry:
+            with_transcript += 1
+        if dry_run:
+            continue
+        store.interview_upsert(
+            conn, marker_id=marker, company=g["company"], happened_on=g["date"],
+            round_type=g["round"], sources=json.dumps(g["sources"], ensure_ascii=False),
+            job_id=job_id,
+            transcript_url=(entry or {}).get("otter"),
+            review_path=(entry or {}).get("path"))
+        store.interview_replace_items(conn, marker, g["items"])
+        # A review existing IS evidence the interview happened — advance the pipeline.
+        row = conn.execute("SELECT job_id FROM interviews WHERE marker_id=?", (marker,)).fetchone()
+        eff_job = row["job_id"] if row else job_id
+        if eff_job:
+            st = conn.execute("SELECT status FROM role_state WHERE job_id=?", (eff_job,)).fetchone()
+            if st and st["status"] in ("applied", "interviewing"):
+                store.record_signal(conn, eff_job, stage="interview", when=_day(g["date"]))
+    return {"interviews": len(merged), "linked": linked, "ambiguous": ambiguous,
+            "standalone": standalone, "with_transcript": with_transcript}
+
+
+def _day(d: str) -> str:
+    return d if len(d) == 10 else f"{d}-01" if len(d) == 7 else f"{d}-01-01"
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--dry-run", action="store_true")
+    args = ap.parse_args(argv)
+    cfg = cfgmod.load_config()
+    conn = store.connect_view(cfg)
+    try:
+        res = ingest(cfg, conn, dry_run=args.dry_run)
+        print(f"{res['interviews']} interviews indexed · {res['linked']} linked to roles ·"
+              f" {res['ambiguous']} ambiguous · {res['standalone']} standalone ·"
+              f" {res['with_transcript']} with transcript"
+              + (" (dry run — nothing written)" if args.dry_run else ""))
+        if not args.dry_run:
+            for r in store.interviews_overview(conn)[:12]:
+                tag = r["role_title"] or ""
+                print(f"  {r['happened_on']:10}  {r['company'][:18]:18} {r['round_type'][:26]:26}"
+                      f" q{r['n_questions']:>2} · act {r['n_done']}/{r['n_actions']}  {tag[:36]}")
+    finally:
+        conn.close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

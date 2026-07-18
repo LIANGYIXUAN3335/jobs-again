@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import httpx
 
-from .base import Posting, polite_get, strip_html
+from .base import Posting, polite_get, posted_day, strip_html
 
 API = "https://api.ashbyhq.com/posting-api/job-board/{slug}"
 
@@ -26,6 +26,7 @@ def parse_job(company: str, slug: str, j: dict) -> Posting:
         apply_url=j.get("jobUrl") or j.get("applyUrl") or "",
         department=department,
         is_remote=bool(j.get("isRemote")) or workplace == "remote" or "remote" in location.lower(),
+        posted_at=posted_day(j.get("publishedAt")),
     )
 
 

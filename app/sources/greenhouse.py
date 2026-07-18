@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import httpx
 
-from .base import Posting, polite_get, strip_html
+from .base import Posting, polite_get, posted_day, strip_html
 
 API = "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
 
@@ -30,6 +30,10 @@ def parse_job(company: str, slug: str, j: dict) -> Posting:
         apply_url=f"https://job-boards.greenhouse.io/embed/job_app?for={slug}&token={raw_id}",
         department=departments,
         is_remote="remote" in location.lower(),
+        # first_published only (present on 100% of a 1354-posting sample across three
+        # boards). Deliberately NOT falling back to updated_at: that moves on any edit, so
+        # a months-old req would keep re-freshening itself to the top of the list.
+        posted_at=posted_day(j.get("first_published")),
     )
 
 

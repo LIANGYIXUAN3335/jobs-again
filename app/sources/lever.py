@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import httpx
 
-from .base import Posting, polite_get, strip_html
+from .base import Posting, polite_get, posted_day, strip_html
 
 API = "https://api.lever.co/v0/postings/{slug}?mode=json"
 
@@ -33,6 +33,7 @@ def parse_job(company: str, slug: str, j: dict) -> Posting:
         apply_url=j.get("hostedUrl") or j.get("applyUrl") or "",
         department=department,
         is_remote=workplace == "remote" or "remote" in location.lower(),
+        posted_at=posted_day(j.get("createdAt")),      # epoch milliseconds
     )
 
 

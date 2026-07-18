@@ -62,3 +62,48 @@ def test_config_hash_tracks_scoring_changes():
     tweaked = {**CFG, "scoring": {**CFG["scoring"], "depth": {**CFG["scoring"]["depth"], "zookeeper": 0.4}}}
     assert scoring.config_hash(tweaked) != h1
     assert scoring.config_hash({**CFG, "companies": []}) == h1  # non-scoring keys ignored
+
+
+# --- freshness: a ranking boost, deliberately outside weighted_score ---
+
+def test_freshness_full_bonus_inside_the_window_then_decays_to_zero():
+    at = lambda d: scoring.freshness(d, None, CFG, today="2026-07-24")   # noqa: E731
+    assert at("2026-07-24")["bonus"] == 10.0    # posted today
+    assert at("2026-07-22")["bonus"] == 10.0    # 2 days = still the full bonus
+    assert at("2026-07-21")["bonus"] < 10.0     # 3 days = decaying
+    assert at("2026-07-17")["bonus"] < at("2026-07-21")["bonus"]
+    assert at("2026-07-10")["bonus"] == 0.0     # 14 days = expired
+    assert at("2025-01-01")["bonus"] == 0.0     # never negative
+
+
+def test_freshness_falls_back_to_first_seen_but_flags_it():
+    known = scoring.freshness("2026-07-23", "2026-01-01", CFG, today="2026-07-24")
+    assert known["bonus"] == 10.0 and known["posted_known"] is True
+    inferred = scoring.freshness(None, "2026-07-23T10:00:00-07:00", CFG, today="2026-07-24")
+    assert inferred["bonus"] == 10.0 and inferred["posted_known"] is False
+
+
+def test_freshness_ignores_undatable_rows():
+    assert scoring.freshness(None, None, CFG, today="2026-07-24")["bonus"] == 0.0
+    assert scoring.freshness("Immediately", "soon", CFG, today="2026-07-24")["bonus"] == 0.0
+
+
+def test_freshness_capture_date_is_not_a_posting_date():
+    """allow_inferred=False (hand-captured/manual roles): first_seen is when the OWNER
+    clicked capture, so it must never earn the boost — only a real posted_at may."""
+    captured_today = scoring.freshness(None, "2026-07-24T17:31:25-07:00", CFG,
+                                       today="2026-07-24", allow_inferred=False)
+    assert captured_today["bonus"] == 0.0 and captured_today["date"] is None
+    # a real posted_at on a captured role still counts
+    real_date = scoring.freshness("2026-07-23", "2026-07-24T17:31:25-07:00", CFG,
+                                  today="2026-07-24", allow_inferred=False)
+    assert real_date["bonus"] == 10.0 and real_date["posted_known"] is True
+
+
+def test_freshness_is_not_baked_into_the_score_or_the_rescore_trigger():
+    # The 4-dim score answers "is this a good job", which does not change as a req ages.
+    s = scoring.score(mk(DEEP_JD), {}, CFG)
+    assert s.weighted == scoring.score(mk(DEEP_JD), {}, CFG).weighted
+    # ...so retuning freshness must not trigger a full rescore of every stored role.
+    tuned = dict(CFG, scoring=dict(CFG["scoring"], freshness={"enabled": True, "bonus": 25}))
+    assert scoring.config_hash(tuned) == scoring.config_hash(CFG)

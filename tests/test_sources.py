@@ -68,3 +68,21 @@ def test_ashby_parse_prefers_plain_text():
     assert p.jd_text == "Distributed ledger systems."
     assert "San Francisco" in p.location and "New York" in p.location
     assert p.apply_url  # jobUrl preferred, non-empty
+
+
+def test_greenhouse_posted_at_uses_first_published_not_updated_at():
+    # updated_at moves on any edit; using it would keep re-freshening an old req.
+    job = dict(GH_JOB, first_published="2026-06-02T08:58:57-04:00",
+               updated_at="2026-07-22T13:25:41-04:00")
+    assert greenhouse.parse_job("Stripe", "stripe", job).posted_at == "2026-06-02"
+    assert greenhouse.parse_job("Stripe", "stripe", GH_JOB).posted_at is None
+
+
+def test_lever_posted_at_from_epoch_millis():
+    assert lever.parse_job("Acme", "acme", dict(LV_JOB, createdAt=1711403416463)).posted_at \
+        == "2024-03-25"
+
+
+def test_ashby_posted_at_from_published_at():
+    job = dict(AB_JOB, publishedAt="2026-06-03T18:24:47.526+00:00")
+    assert ashby.parse_job("Acme", "acme", job).posted_at == "2026-06-03"

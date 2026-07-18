@@ -9,7 +9,7 @@ import time
 
 import httpx
 
-from .base import Posting, polite_get, strip_html
+from .base import Posting, polite_get, posted_day, strip_html
 
 API = "https://api.smartrecruiters.com/v1/companies/{slug}/postings"
 PAGE = 100
@@ -59,6 +59,7 @@ def fetch(client: httpx.Client, company: str, slug: str, retries: int = 2) -> li
             apply_url=f"https://jobs.smartrecruiters.com/{slug}/{raw_id}",
             department=((j.get("department") or {}).get("label") or ""),
             is_remote=bool(loc.get("remote")),
+            posted_at=posted_day(j.get("releasedDate")),
             fetch_jd=_jd,
         ))
     return out
