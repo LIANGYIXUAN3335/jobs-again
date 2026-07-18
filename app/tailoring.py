@@ -11,6 +11,7 @@ resume can alter a fact. Tailoring only supplies summary + reworded bullets + sk
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -19,9 +20,21 @@ from pathlib import Path
 import yaml
 
 from . import config as cfgmod
+from . import resume_score
 from . import store
 
 BASE_PATH = "resumes/resume_base.yaml"
+
+
+def _base_text(base: dict) -> str:
+    """Flatten the locked base into one blob — the ground truth of what's真 for her."""
+    parts: list[str] = []
+    for items in (base.get("skills_master") or {}).values():
+        parts.extend(items)
+    for job in base.get("experience", []):
+        parts.append(job.get("title", ""))
+        parts.extend(job.get("bullets_master", []))
+    return " \n ".join(parts)
 
 
 # ---------- paths ----------
@@ -46,6 +59,43 @@ def resume_pdf_path(cfg: dict, company: str, job_id: str) -> Path:
     return resume_yaml_path(cfg, company, job_id).with_suffix(".pdf")
 
 
+_GENERIC_ROLE = re.compile(r"\b(senior|sr\.?|staff|principal|lead|software|engineer|"
+                           r"developer|swe|sde|member of technical staff)\b", re.IGNORECASE)
+
+
+def _role_short(title: str, maxlen: int = 40) -> str:
+    """Distinctive part of a role title for the filename: the team, not the generic level.
+    'Senior Software Engineer - Streaming Platform' -> 'Streaming Platform'."""
+    t = (title or "").strip()
+    m = re.search(r"\(([^)]+)\)", t)                       # team in parens wins
+    if m:
+        t = m.group(1)
+    else:
+        parts = [p.strip() for p in re.split(r"[—\-,:|]", t) if p.strip()]
+        t = parts[-1] if len(parts) > 1 else t             # text after a separator = the team
+    t = _GENERIC_ROLE.sub("", t)
+    t = re.sub(r"\s+", " ", t).strip(" -,·")
+    return t[:maxlen]
+
+
+def _sanitize(name: str) -> str:
+    return re.sub(r'[/\\:*?"<>|]', "-", name).strip()
+
+
+def friendly_pdf_prefix(company: str, title: str) -> str:
+    """Stable per-role filename prefix (no score) so old scored copies can be swept.
+    Ends with ' - ' so the score reads as 'Company - Role - 87.pdf'."""
+    role = _role_short(title)
+    seg = f" - {role}" if role else ""
+    return _sanitize(f"Casey Example - {company}{seg}") + " - "
+
+
+def friendly_pdf_path(cfg: dict, company: str, title: str, score: int) -> Path:
+    d = cfgmod.resolve_path(cfg["output_dirs"]["resumes"])
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{friendly_pdf_prefix(company, title)}{score}.pdf"
+
+
 def load_base(cfg: dict) -> dict:
     return yaml.safe_load(cfgmod.resolve_path(BASE_PATH).read_text(encoding="utf-8"))
 
@@ -54,21 +104,47 @@ def load_base(cfg: dict) -> dict:
 
 _INSTRUCTIONS = """\
 You are tailoring Casey Example's resume for ONE specific role. Produce a truthful,
-JD-aligned resume as a STRUCTURED YAML file (schema at the bottom) — not prose.
+JD-aligned, CONFIDENT resume as a STRUCTURED YAML file (schema at the bottom) — not prose.
+The goal is a resume that reads as STRONG as her original, just re-aimed at this JD — not
+a watered-down, hedged version. If a bullet comes out weaker than the base bullet it was
+built from, you did it wrong.
 
-Rules (important):
+Truth rules (hard constraints):
 - Work ONLY from the real experience in the base resume below. Do NOT invent employers,
   titles, dates, metrics, or skills. Reword and re-emphasize; never fabricate.
-- Use the job description's own terminology where it truthfully matches Casey's work.
-- Casey is moving from frontend/product/ads work toward backend/distributed systems.
-  Reframe her real work in terms of the services, data models, APIs, reliability, and
-  scale behind it (e.g. state-transition logic, validation/guardrail systems, Go/internal
-  API integration, Prometheus monitoring, data consistency across pipelines) — without
-  claiming backend ownership she didn't have.
-- Keep every real job present. You may reorder/trim bullets per job and rewrite them, but
-  keep them accurate. Aim for a tight 1-2 pages.
-- List any JD requirements she does NOT clearly meet in `gaps` (honest, for her eyes only
-  — this does NOT go into the PDF). Do not paper over them in the bullets.
+- Use the job description's own terminology ONLY where it truthfully matches her work.
+
+Keep the punch (this is where the old version failed):
+- PRESERVE every concrete detail and number from the base bullet: real product/system names
+  (GMV Max, Meta Business Suite AI agents, Click-to-Call), scale (500+ products, 8+ scenarios,
+  5+ inputs), and metrics (30% fewer invalid submissions, 90%+ coverage, 50% fewer exceptions,
+  2 hrs/day). A bullet with a specific artifact + a number beats any amount of backend jargon.
+- Do NOT abstract concrete work into floating buzzwords. "Designed deterministic state-transition
+  logic and validation guardrails to keep interdependent workflows consistent" is a FAILURE —
+  it deleted GMV Max, the 8+ scenarios, and reads as filler. Name the real thing, then frame it.
+- Keyword-density cap: phrases like "state-transition logic", "validation guardrails",
+  "data consistency across pipelines" may appear in AT MOST ONE bullet total across the whole
+  resume. Repeating them across jobs is the #1 thing that made the last version read as generic.
+- Lead each bullet with the accomplishment/impact, not the reframe. Strong verb + real system +
+  number. The backend angle is the lens, not the subject.
+
+Reframe, don't downgrade:
+- She is moving from frontend/product/ads work toward backend/distributed systems. Reframe the
+  real work in terms of the services, data models, APIs, reliability, and scale behind it —
+  WITHOUT claiming backend ownership she didn't have, and without erasing what she actually shipped.
+
+Confidence rules (summary + bullets):
+- The summary SELLS. State what she is and what she brings, in the present tense. BANNED:
+  "excited to grow into", "hoping to learn", "can be learned on the job", "eager to", any
+  phrasing that apologizes for a gap or frames her as a beginner. Gaps live in `gaps`, never here.
+- Keep every real job present AND keep it substantive. TikTok and Meta keep 3-4 strong bullets each;
+  older jobs keep 2-3 — do NOT shrink a real job to a single bullet just because it's less relevant.
+  Preserve the real accomplishments; reorder and reword, but only drop a bullet if it is pure
+  duplication or truly irrelevant. Aim for a full, tight 1-2 pages (fill the page — don't leave it sparse).
+
+- List any JD requirements she does NOT clearly meet in `gaps` (honest, for her eyes only — this
+  does NOT go into the PDF). State them plainly and neutrally; do NOT editorialize about how big a
+  stretch the role is. Do not paper over them in the bullets.
 
 Angle for this role: {angle} — {angle_hint}
 """
@@ -81,7 +157,8 @@ _SCHEMA = """\
 job_id: "{job_id}"          # keep verbatim — links the resume back to the role
 angle: "{angle}"
 summary: >
-  2-3 sentence professional summary tailored to THIS role, truthful, backend-leaning.
+  2-3 sentence professional summary tailored to THIS role. Present tense, confident, backend-
+  leaning. State what she IS and what she brings — never what she hopes to become. No hedging.
 skills:                     # pick & order from the base skill pool; JD-relevant first
   - label: "Programming Languages"
     items: ["Go/Golang", "Java", "Python", "SQL", "TypeScript"]
@@ -89,25 +166,30 @@ skills:                     # pick & order from the base skill pool; JD-relevant
     items: ["PostgreSQL/Postgres", "MySQL", "Cassandra", "Redis", "Kafka"]
   # ...more groups as useful
 experience:                 # one block per real job; keep the company names verbatim
-  - company: "TikTok"
+  - company: "TikTok"        # keep the concrete name + number from the base bullet, then re-aim it
     bullets:
-      - "Reworded bullet emphasizing services/APIs/data/scale, truthful."
-      - "..."
+      - "Strong verb + REAL system (e.g. GMV Max) + what you built + the metric (e.g. 30% fewer invalid submissions)."
+      - "..."               # 3-4 bullets; do NOT strip out product names, scale, or numbers
   - company: "Meta"
-    bullets: ["...", "..."]
+    bullets: ["...", "..."]  # 3-4 bullets; keep Meta Business Suite AI agents, 90%+ coverage, 50% fewer exceptions
   - company: "Gemini Express Corp"
-    bullets: ["..."]
+    bullets: ["..."]         # 1-2 bullets
   - company: "Shanghai Haoxiong Education Technology Co., Ltd"
-    bullets: ["..."]
-gaps:                       # JD asks for X, she has Y — NOT rendered into the PDF
+    bullets: ["..."]         # 1-2 bullets; keep MySQL/Cassandra, 500+ products, 85% coverage
+gaps:                       # JD asks for X, she has Y — NOT rendered into the PDF. Plain & neutral.
   - "JD wants deep Kubernetes/operator experience; she has container/Docker basics."
 """
 
 _ANGLE_HINTS = {
-    "backend-distributed": "lead with distributed systems, services, data consistency, "
-                           "reliability, Go/Java backend, Kafka/queues, observability.",
-    "payments": "lead with correctness/validation/guardrails, idempotency, ledgers, "
-                "money-movement reliability, Go/internal APIs, monitoring.",
+    "backend-distributed": "frame her real shipped systems through a backend lens — the Go/Internal "
+                           "API flows, the MySQL/Cassandra product backend, Prometheus reliability "
+                           "monitoring, multi-step data pipelines — keeping the concrete names and "
+                           "numbers. Surface Go/Java, distributed services, databases, observability.",
+    "payments": "frame her real work through a correctness/reliability lens — the validation & "
+                "guardrail rules (8+ scenarios, 30% fewer invalid submissions), the Go/Internal API "
+                "request-response flows, monitoring — keeping the concrete names and numbers. "
+                "Surface money-movement-adjacent themes: validation, idempotency-style safeguards, "
+                "reliability, Go/internal APIs, monitoring.",
 }
 
 
@@ -128,6 +210,19 @@ def write_prompt(cfg: dict, conn, job_id: str, angle: str | None = None) -> Path
     notes = cfgmod.load_company_notes(cfg).get(cfgmod.norm_key(role["company"]), {})
     out_path = resume_yaml_path(cfg, role["company"], job_id)
 
+    # Truth-safe keyword feedback: what the JD wants that is ALREADY真 for her (surface it)
+    # vs what she genuinely lacks (goes to gaps, never invented).
+    coverable, true_gaps = resume_score.jd_keyword_plan(role.get("jd_text", ""), _base_text(base))
+    kw_block = [
+        "## Keywords this JD asks for — coverage guide (raises the match score)",
+        "TRUE for Casey (in her real experience) and JD-relevant — MAKE SURE these surface in the",
+        "summary/skills/bullets, worded naturally (do NOT keyword-stuff a list):",
+        "  " + (", ".join(coverable) if coverable else "(none detected)"),
+        "JD-relevant but NOT supported by her background — put in `gaps`, do NOT claim them:",
+        "  " + (", ".join(true_gaps) if true_gaps else "(none detected)"),
+        "",
+    ]
+
     parts = [
         f"# Tailor résumé — {role['company']}: {role['title']}",
         "",
@@ -142,6 +237,7 @@ def write_prompt(cfg: dict, conn, job_id: str, angle: str | None = None) -> Path
         (role.get("jd_text") or "(no JD text captured)").strip(),
         "```",
         "",
+        *kw_block,
         "## Base résumé — the ONLY source of truth for facts (reword, don't invent)",
         "```yaml",
         yaml.safe_dump(base, sort_keys=False, allow_unicode=True).strip(),
@@ -230,8 +326,19 @@ def ingest_file(cfg: dict, conn, yaml_file: Path) -> dict:
     role = store.get_role(conn, job_id)
     if not role:
         raise TailorError(f"{yaml_file.name}: job_id {job_id!r} not in DB")
-    merged = merge(load_base(cfg), tailored)
-    pdf = render_pdf(merged, resume_pdf_path(cfg, role["company"], job_id))
+    base = load_base(cfg)
+    merged = merge(base, tailored)
+    sc = resume_score.score_resume(role.get("jd_text", ""), merged, cfg, _base_text(base))
+    # filename carries name + company + role + score; sweep this role's older scored copies
+    # and the legacy job-id-named PDF so only the current one remains.
+    rdir = cfgmod.resolve_path(cfg["output_dirs"]["resumes"])
+    for stale in rdir.glob(f"{friendly_pdf_prefix(role['company'], role['title'])}*.pdf"):
+        stale.unlink()
+    legacy = resume_pdf_path(cfg, role["company"], job_id)
+    if legacy.exists():
+        legacy.unlink()
+    pdf = friendly_pdf_path(cfg, role["company"], role["title"], sc.overall)
+    render_pdf(merged, pdf)
     store.set_tailor(conn, job_id, tailor_status="ready", tailored_resume_path=str(pdf))
     return {"job_id": job_id, "company": role["company"], "pdf": str(pdf),
-            "gaps": tailored.get("gaps") or []}
+            "gaps": tailored.get("gaps") or [], "score": sc}
