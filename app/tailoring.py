@@ -82,18 +82,24 @@ def _sanitize(name: str) -> str:
     return re.sub(r'[/\\:*?"<>|]', "-", name).strip()
 
 
-def friendly_pdf_prefix(company: str, title: str) -> str:
+def _ats_id(job_id: str) -> str:
+    """The raw ATS id as it appears in the posting URL (gh:datadog:7993551 -> 7993551)."""
+    return (job_id or "").split(":")[-1]
+
+
+def friendly_pdf_prefix(company: str, title: str, job_id: str) -> str:
     """Stable per-role filename prefix (no score) so old scored copies can be swept.
-    Ends with ' - ' so the score reads as 'Company - Role - 87.pdf'."""
+    Includes [ats-id] so same-company roles never collide and you can match the posting URL.
+    Ends with ' - ' so the score reads as 'Company - Role [id] - 87.pdf'."""
     role = _role_short(title)
     seg = f" - {role}" if role else ""
-    return _sanitize(f"Casey Example - {company}{seg}") + " - "
+    return _sanitize(f"Casey Example - {company}{seg} [{_ats_id(job_id)}]") + " - "
 
 
-def friendly_pdf_path(cfg: dict, company: str, title: str, score: int) -> Path:
+def friendly_pdf_path(cfg: dict, company: str, title: str, job_id: str, score: int) -> Path:
     d = cfgmod.resolve_path(cfg["output_dirs"]["resumes"])
     d.mkdir(parents=True, exist_ok=True)
-    return d / f"{friendly_pdf_prefix(company, title)}{score}.pdf"
+    return d / f"{friendly_pdf_prefix(company, title, job_id)}{score}.pdf"
 
 
 def load_base(cfg: dict) -> dict:
@@ -332,12 +338,12 @@ def ingest_file(cfg: dict, conn, yaml_file: Path) -> dict:
     # filename carries name + company + role + score; sweep this role's older scored copies
     # and the legacy job-id-named PDF so only the current one remains.
     rdir = cfgmod.resolve_path(cfg["output_dirs"]["resumes"])
-    for stale in rdir.glob(f"{friendly_pdf_prefix(role['company'], role['title'])}*.pdf"):
+    for stale in rdir.glob(f"{friendly_pdf_prefix(role['company'], role['title'], job_id)}*.pdf"):
         stale.unlink()
     legacy = resume_pdf_path(cfg, role["company"], job_id)
     if legacy.exists():
         legacy.unlink()
-    pdf = friendly_pdf_path(cfg, role["company"], role["title"], sc.overall)
+    pdf = friendly_pdf_path(cfg, role["company"], role["title"], job_id, sc.overall)
     render_pdf(merged, pdf)
     store.set_tailor(conn, job_id, tailor_status="ready", tailored_resume_path=str(pdf))
     return {"job_id": job_id, "company": role["company"], "pdf": str(pdf),
