@@ -51,7 +51,59 @@ CREATE TABLE IF NOT EXISTS role_state (
 CREATE TABLE IF NOT EXISTS applied_companies (
   name_norm TEXT PRIMARY KEY, display_name TEXT, added_at TEXT
 );
+CREATE TABLE IF NOT EXISTS reply_queue (
+  msg_id TEXT PRIMARY KEY,              -- email Message-ID, for dedup
+  uid TEXT, from_addr TEXT, from_name TEXT, reply_to TEXT,
+  subject TEXT, snippet TEXT,
+  category TEXT,                        -- scheduling | assessment | recruiter | other
+  asks_availability INTEGER DEFAULT 0,
+  repliable INTEGER DEFAULT 1,          -- 0 when the sender is a no-reply relay
+  draft TEXT, references_hdr TEXT, in_reply_to TEXT,
+  status TEXT DEFAULT 'pending',        -- pending | sent | dismissed
+  found_at TEXT, sent_at TEXT
+);
 """
+
+
+_QUEUE_COLS = [
+    "msg_id", "uid", "from_addr", "from_name", "reply_to", "subject", "snippet",
+    "category", "asks_availability", "repliable", "draft", "references_hdr",
+    "in_reply_to", "status", "found_at", "sent_at",
+]
+
+
+def queue_has(conn, msg_id: str) -> bool:
+    return conn.execute("SELECT 1 FROM reply_queue WHERE msg_id=?", (msg_id,)).fetchone() is not None
+
+
+def queue_add(conn, item: dict) -> None:
+    row = {k: item.get(k) for k in _QUEUE_COLS}
+    conn.execute(
+        f"INSERT OR IGNORE INTO reply_queue ({', '.join(_QUEUE_COLS)}) "
+        f"VALUES ({', '.join('?' for _ in _QUEUE_COLS)})",
+        [row[k] for k in _QUEUE_COLS])
+    conn.commit()
+
+
+def queue_list(conn, status: str = "pending") -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM reply_queue WHERE status=? ORDER BY found_at DESC", (status,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def queue_get(conn, msg_id: str) -> dict | None:
+    r = conn.execute("SELECT * FROM reply_queue WHERE msg_id=?", (msg_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def queue_mark(conn, msg_id: str, status: str, sent_at: str | None = None) -> None:
+    conn.execute("UPDATE reply_queue SET status=?, sent_at=? WHERE msg_id=?",
+                 (status, sent_at, msg_id))
+    conn.commit()
+
+
+def queue_count_pending(conn) -> int:
+    return conn.execute("SELECT COUNT(*) n FROM reply_queue WHERE status='pending'").fetchone()["n"]
 
 
 def la_now_iso() -> str:

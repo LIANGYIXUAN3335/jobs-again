@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JobScan · Replies</title>
+  <style>
+    :root { --line:#e2e8f0; --ink:#0f172a; --muted:#64748b; }
+    * { box-sizing:border-box; }
+    body { font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+      color:var(--ink); background:#f8fafc; margin:0; padding:24px; }
+    .wrap { max-width:820px; margin:0 auto; }
+    h1 { font-size:20px; margin:0 0 4px; }
+    .sub { color:var(--muted); margin:0 0 18px; }
+    a.back { color:#12314f; text-decoration:none; font-weight:600; }
+    .banner { background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; padding:9px 12px;
+      border-radius:9px; font-size:13px; margin-bottom:16px; }
+    h2 { font-size:14px; text-transform:uppercase; letter-spacing:.4px; color:var(--muted);
+      margin:22px 0 10px; }
+    .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:14px 16px;
+      margin-bottom:12px; box-shadow:0 1px 2px rgba(15,23,42,.04); }
+    .card.armed { border-color:#fdba74; }
+    .row { display:flex; justify-content:space-between; align-items:baseline; gap:10px; }
+    .from { font-weight:600; }
+    .subj { color:var(--muted); font-size:13px; }
+    .chip { display:inline-block; font-size:11px; font-weight:600; padding:2px 8px; border-radius:999px; }
+    .chip.sched { background:#e0f2fe; color:#075985; }
+    .chip.assess { background:#fef3c7; color:#92400e; }
+    .chip.recruiter { background:#ede9fe; color:#5b21b6; }
+    .chip.other { background:#f1f5f9; color:#475569; }
+    .chip.armed { background:#ffedd5; color:#9a3412; }
+    .chip.noreply { background:#fee2e2; color:#991b1b; }
+    .snippet { color:var(--muted); font-size:12.5px; margin:8px 0; white-space:pre-wrap;
+      max-height:64px; overflow:hidden; }
+    textarea { width:100%; min-height:120px; font:13px/1.5 inherit; color:var(--ink);
+      border:1px solid var(--line); border-radius:8px; padding:10px; resize:vertical; }
+    .acts { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+    button { font:inherit; font-weight:600; cursor:pointer; border:1px solid var(--line);
+      border-radius:8px; background:#f8fafc; color:var(--ink); padding:7px 13px; }
+    button.send { background:#15803d; color:#fff; border-color:#15803d; }
+    button.hold { background:#b45309; color:#fff; border-color:#b45309; }
+    button:disabled { opacity:.5; cursor:default; }
+    .msg { font-size:12px; margin-left:6px; }
+    .msg.ok { color:#15803d; } .msg.err { color:#b42318; }
+    .empty { color:var(--muted); font-style:italic; }
+    .warn { color:#b45309; font-size:12px; margin-top:6px; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <a class="back" href="/">← back to jobs</a>
+  <h1>📥 Replies</h1>
+  <p class="sub">Emails that need a reply. Mode: <b>{{ mode }}</b> ·
+    {% if calendar_on %}calendar connected ✓{% else %}calendar not connected — availability replies wait for you{% endif %}</p>
+
+  {% if not calendar_on %}
+  <div class="banner">Google Calendar isn't connected yet, so scheduling replies can't auto-fill your
+    availability — they'll show up below with an <b>[[AVAILABILITY]]</b> placeholder to fill.
+    Run <code>python tools/gcal_auth.py</code> once to enable auto-availability.</div>
+  {% endif %}
+
+  <h2>⏳ Auto-sending soon ({{ armed|length }}) — {{ undo_minutes }} min undo window</h2>
+  {% if not armed %}<p class="empty">nothing armed.</p>{% endif %}
+  {% for it in armed %}
+  <div class="card armed" data-id="{{ it.msg_id }}">
+    <div class="row"><span class="from">{{ it.from_name }}</span>
+      <span><span class="chip armed">auto-send</span> <span class="chip {{ it.category }}">{{ it.category }}</span></span></div>
+    <div class="subj">{{ it.subject }}</div>
+    <div class="snippet">{{ it.snippet }}</div>
+    <textarea>{{ it.draft }}</textarea>
+    <div class="acts">
+      <button class="send" onclick="act(this,'send')">Send now</button>
+      <button class="hold" onclick="act(this,'hold')">Cancel auto-send (keep draft)</button>
+      <button onclick="act(this,'dismiss')">Dismiss</button>
+      <span class="msg"></span>
+    </div>
+  </div>
+  {% endfor %}
+
+  <h2>✍️ Waiting for your OK ({{ pending|length }})</h2>
+  {% if not pending %}<p class="empty">nothing pending.</p>{% endif %}
+  {% for it in pending %}
+  <div class="card" data-id="{{ it.msg_id }}">
+    <div class="row"><span class="from">{{ it.from_name }}</span>
+      <span><span class="chip {{ it.category }}">{{ it.category }}</span>
+        {% if not it.repliable %}<span class="chip noreply">no-reply</span>{% endif %}</span></div>
+    <div class="subj">{{ it.subject }}</div>
+    <div class="snippet">{{ it.snippet }}</div>
+    <textarea>{{ it.draft }}</textarea>
+    {% if not it.repliable %}<div class="warn">Sender is a no-reply relay — reply on the platform instead of here.</div>{% endif %}
+    <div class="acts">
+      <button class="send" onclick="act(this,'send')" {% if not it.repliable %}disabled{% endif %}>Send</button>
+      <button onclick="act(this,'dismiss')">Dismiss</button>
+      <span class="msg"></span>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<script>
+async function act(btn, kind) {
+  const card = btn.closest('.card');
+  const id = card.dataset.id;
+  const msg = card.querySelector('.msg');
+  const draft = card.querySelector('textarea').value;
+  btn.disabled = true; msg.textContent = '…'; msg.className = 'msg';
+  try {
+    const r = await fetch(`/api/replies/${encodeURIComponent(id)}/${kind}`, {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ draft }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || r.status);
+    msg.textContent = kind === 'send' ? 'sent ✓' : kind === 'hold' ? 'auto-send cancelled' : 'dismissed';
+    msg.className = 'msg ok';
+    setTimeout(() => card.remove(), 900);
+  } catch (e) {
+    msg.textContent = String(e.message || e); msg.className = 'msg err';
+    btn.disabled = false;
+  }
+}
+</script>
+</body>
+</html>

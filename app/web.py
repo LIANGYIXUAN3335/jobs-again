@@ -14,7 +14,9 @@ from pydantic import BaseModel
 
 from . import ai as aimod
 from . import config as cfgmod
+from . import gcal as gcalmod
 from . import ingest as ingestmod
+from . import mail as sendmail
 from . import mailcode as mailmod
 from . import store, tailoring
 
@@ -32,7 +34,10 @@ _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 def url_candidates(url: str) -> list[str]:
     """Raw ATS ids that might appear in an application-page URL."""
     c: list[str] = []
-    for pat in (r"gh_jid=(\d+)", r"[?&]token=(\d+)", r"/jobs/(\d+)"):
+    for pat in (r"gh_jid=(\d+)", r"[?&]token=(\d+)", r"/jobs/(\d+)",
+                # Workday req ids: .../Software-Engineer-II_R-279240, .../job/R-273932/...,
+                # .../Staff-Software-Engineer_REF078668W  → job_id ends ':R-279240'
+                r"[_/]([A-Z]{1,4}-?\d{3,}[A-Za-z0-9]*)"):
         c += re.findall(pat, url)
     c += _UUID.findall(url)
     seen, out = set(), []
@@ -41,6 +46,46 @@ def url_candidates(url: str) -> list[str]:
             seen.add(x)
             out.append(x)
     return out
+
+
+_MONTHS = {m.lower(): i for i, m in enumerate(
+    ["January", "February", "March", "April", "May", "June",
+     "July", "August", "September", "October", "November", "December"], 1)}
+
+
+def _parse_dates(s: str) -> dict:
+    """'April 2025 - Present' → start 04/2025 + current; 'Jan 2024 - Apr 2025' → both ends."""
+    out = {"start_month": "", "start_year": "", "end_month": "", "end_year": "", "current": False}
+    parts = re.split(r"\s*[-–—]\s*", s or "")
+
+    def one(t: str) -> tuple[str, str]:
+        m = re.search(r"([A-Za-z]+)\s+(\d{4})", t or "")
+        if not m:
+            return ("", "")
+        num = _MONTHS.get(m.group(1).lower()[:3] and
+                          next((k for k in _MONTHS if k.startswith(m.group(1).lower()[:3])), ""), 0)
+        return (f"{num:02d}" if num else "", m.group(2))
+
+    if parts:
+        out["start_month"], out["start_year"] = one(parts[0])
+    if len(parts) > 1:
+        if re.search(r"present|current", parts[1], re.I):
+            out["current"] = True
+        else:
+            out["end_month"], out["end_year"] = one(parts[1])
+    return out
+
+
+def profile_experience() -> list[dict]:
+    """Work history for the extension's Workday filler, from the LOCKED base résumé."""
+    try:
+        base = tailoring.load_base(cfg)
+    except Exception:
+        return []
+    return [{
+        "company": j.get("company", ""), "title": j.get("title", ""),
+        "location": j.get("location", ""), **_parse_dates(j.get("dates", "")),
+    } for j in (base.get("experience") or [])]
 app.mount("/static", StaticFiles(directory=str(cfgmod.ROOT / "static")), name="static")
 templates = Jinja2Templates(directory=str(cfgmod.ROOT / "templates"))
 
@@ -167,7 +212,10 @@ def api_lookup(url: str, conn=Depends(view_conn)):
         "resume_variant": "tailored" if has_pdf else "base",
         "ai_enabled": aimod.available(cfg),
         "mailcode_enabled": mailmod.available(cfg),
+        "eeo_decline": bool(cfg.get("eeo_decline", True)),
+        "eeo": cfg.get("eeo") or {},          # per-field self-ID preference; unset → decline
         "profile": cfg.get("profile") or {},
+        "experience": profile_experience(),   # work history for Workday's My Experience step
     }
 
 
@@ -229,6 +277,61 @@ def api_add_applied(body: CompanyIn, conn=Depends(view_conn)):
 @app.delete("/api/applied-companies/{name}")
 def api_remove_applied(name: str, conn=Depends(view_conn)):
     store.remove_applied_company(conn, name)
+    return {"ok": True}
+
+
+@app.get("/replies", response_class=HTMLResponse)
+def replies_page(request: Request, conn=Depends(view_conn)):
+    armed = store.queue_list(conn, "armed")
+    pending = store.queue_list(conn, "pending")
+    undo = int((cfg.get("inbox") or {}).get("undo_minutes", 30))
+    return templates.TemplateResponse(request, "replies.html", {
+        "armed": armed, "pending": pending,
+        "undo_minutes": undo, "calendar_on": gcalmod.available(cfg),
+        "mode": (cfg.get("inbox") or {}).get("autosend_mode", "gated"),
+    })
+
+
+@app.get("/api/replies")
+def api_replies(conn=Depends(view_conn)):
+    return {"armed": store.queue_list(conn, "armed"),
+            "pending": store.queue_list(conn, "pending"),
+            "calendar_on": gcalmod.available(cfg)}
+
+
+class ReplyIn(BaseModel):
+    draft: str | None = None
+
+
+@app.post("/api/replies/{msg_id}/send")
+def api_reply_send(msg_id: str, body: ReplyIn, conn=Depends(view_conn)):
+    it = store.queue_get(conn, msg_id)
+    if not it:
+        raise HTTPException(404, "not in queue")
+    if not it.get("reply_to") or not it.get("repliable"):
+        raise HTTPException(400, "no direct reply address — reply on the platform")
+    draft = (body.draft if body.draft is not None else it["draft"]) or ""
+    if "[[AVAILABILITY]]" in draft:
+        raise HTTPException(400, "draft still has an [[AVAILABILITY]] placeholder — fill it first")
+    try:
+        sendmail.send_reply(cfg, it["reply_to"], it["subject"], draft,
+                            in_reply_to=it["in_reply_to"], references=it["references_hdr"])
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"send failed: {e}")
+    store.queue_mark(conn, msg_id, "sent", store.la_now_iso())
+    return {"ok": True}
+
+
+@app.post("/api/replies/{msg_id}/hold")
+def api_reply_hold(msg_id: str, conn=Depends(view_conn)):
+    """Cancel a queued auto-send: move ARMED → pending so it won't fire, keeps the draft."""
+    store.queue_mark(conn, msg_id, "pending")
+    return {"ok": True}
+
+
+@app.post("/api/replies/{msg_id}/dismiss")
+def api_reply_dismiss(msg_id: str, conn=Depends(view_conn)):
+    store.queue_mark(conn, msg_id, "dismissed")
     return {"ok": True}
 
 
