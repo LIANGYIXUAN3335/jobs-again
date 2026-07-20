@@ -48,6 +48,16 @@ async function answer(jobId, questions) {
   return r.json(); // { answers: {question: text} }
 }
 
+async function emailCode() {
+  const r = await apiFetch(`/api/email-code`);
+  if (!r.ok) {
+    let detail = `email-code ${r.status}`;
+    try { detail = (await r.json()).detail || detail; } catch (e) { /* keep default */ }
+    throw new Error(detail);
+  }
+  return r.json(); // { code, subject, from, date }
+}
+
 async function markApplied(jobId, variant) {
   const r = await apiFetch(`/api/roles/${encodeURIComponent(jobId)}/status`, {
     method: "POST",
@@ -64,6 +74,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (msg.type === "lookup") sendResponse(await lookup(msg.url));
       else if (msg.type === "resume") sendResponse({ ok: true, ...(await resumeBase64(msg.jobId)) });
       else if (msg.type === "answer") sendResponse({ ok: true, ...(await answer(msg.jobId, msg.questions)) });
+      else if (msg.type === "emailCode") sendResponse({ ok: true, ...(await emailCode()) });
       else if (msg.type === "markApplied") sendResponse({ ok: true, ...(await markApplied(msg.jobId, msg.variant)) });
       else sendResponse({ ok: false, error: "unknown message" });
     } catch (e) {

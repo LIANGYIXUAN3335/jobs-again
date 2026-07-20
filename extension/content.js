@@ -163,6 +163,36 @@
     return out;
   }
 
+  // ---- email verification-code field ----
+  function codeField() {
+    const inputs = document.querySelectorAll(
+      'input[type=text], input[type=number], input[type=tel], input[autocomplete="one-time-code"], input:not([type])');
+    for (const el of inputs) {
+      if (el.disabled || el.readOnly || (el.value || "").trim()) continue;
+      const t = fieldText(el);
+      if (/\b(zip|postal|area|country|dial|employee|promo|referral|discount|coupon)\b/i.test(t)) continue;
+      if (/verification|security code|one[\s-]?time|passcode|confirmation code|\botp\b|verify|access code|\bcode\b/i.test(t))
+        return el;
+    }
+    return null;
+  }
+  function otpBoxes() {
+    const b = [...document.querySelectorAll(
+      'input[maxlength="1"], input[autocomplete="one-time-code"]')].filter((el) => !el.disabled && !el.readOnly);
+    return b.length >= 4 && b.length <= 8 ? b : null;
+  }
+  function fillCode(code) {
+    const boxes = otpBoxes();
+    if (boxes && code.length === boxes.length) {         // split OTP boxes → one digit each
+      boxes.forEach((el, i) => { el.focus(); setNativeValue(el, code[i]); });
+      boxes[boxes.length - 1].blur();
+      return true;
+    }
+    const el = codeField();
+    if (el) { el.focus(); setNativeValue(el, code); el.blur(); return true; }
+    return false;
+  }
+
   // ---- floating panel ----
   function panel(role) {
     // Shadow DOM so the host page's CSS can't bleed in and overlap our text.
@@ -200,6 +230,7 @@
         button:disabled{ opacity:.55; cursor:default; }
         button.primary{ background:#12314f; color:#fff; border-color:#12314f; }
         button.ai{ background:linear-gradient(135deg,#6d5efc,#8b5cf6); color:#fff; border:0; }
+        button.code{ background:#0e7490; color:#fff; border:0; }
         button.ok{ background:#15803d; color:#fff; border-color:#15803d; }
         .log{ margin-top:11px; font-size:12px; line-height:1.5; max-height:150px; overflow:auto;
           white-space:pre-wrap; color:#334155; border-top:1px solid #eef2f6; padding-top:9px; }
@@ -214,6 +245,7 @@
           <div class="status"></div>
           <button class="primary fill">Fill standard fields + résumé</button>
           <button class="ai" hidden>✨ AI-answer open questions</button>
+          <button class="code" hidden>📧 Get email code</button>
           <button class="ok submitted">✓ I submitted this</button>
           <div class="log"></div>
         </div>
@@ -302,6 +334,21 @@
           if (a && !(el.value || "").trim()) { setNativeValue(el, a); n++; }
         }
         log(n ? `filled ${n} answer(s) ✓ — read & edit each before submitting` : "nothing filled (legal/EEO skipped, or no draft)", n ? "good" : "warn");
+      };
+    }
+
+    // Email verification-code button — only when mailcode is configured (app password present).
+    if (role.mailcode_enabled) {
+      const codeBtn = $(".code");
+      codeBtn.hidden = false;
+      codeBtn.onclick = async () => {
+        codeBtn.disabled = true; const orig = codeBtn.textContent; codeBtn.textContent = "📧 checking…";
+        const res = await send({ type: "emailCode" });
+        codeBtn.disabled = false; codeBtn.textContent = orig;
+        if (!res || !res.ok) { log("email-code failed: " + (res && res.error), "warn"); return; }
+        if (!res.code) { log("no recent verification code found — trigger 'send code', then retry", "warn"); return; }
+        const ok = fillCode(res.code);
+        log(ok ? `filled code ${res.code} ✓ (${res.subject || "email"})` : `code is ${res.code} — no code field found, paste it`, ok ? "good" : "warn");
       };
     }
 
