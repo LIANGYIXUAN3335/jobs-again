@@ -33,6 +33,9 @@ dates, metrics, skills, or claims not present in the facts.
 - Write naturally and specifically — reference real companies/projects (GMV Max, the AI-agent \
 onboarding platform, the MySQL/Cassandra product backend) where relevant. No buzzword filler.
 - Be concise and confident; no apologies, no "I hope to", no hedging.
+- For a SHORT factual field (current job title, current/previous employer, most recent school, \
+degree, years of experience, current location/company), answer with JUST the value — e.g. \
+"Software Engineer", "TikTok", "Illinois Institute of Technology" — not a full sentence.
 - If a question asks for anything you cannot truthfully answer from the facts, or is a \
 legal/eligibility/demographic question (work authorization, sponsorship, veteran/disability/\
 race/gender, salary, criminal history, U.S.-person status), return an empty string for it — \
