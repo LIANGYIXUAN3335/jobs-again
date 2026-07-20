@@ -36,9 +36,10 @@
     // preferred/nickname MUST come before first_name (a "preferred first name" field
     // contains "first name" and would otherwise match legal first_name).
     ["preferred_name", /\bpreferred (first )?name\b|\bnickname\b|\bgoes by\b|\bpreferred\b/],
+    ["legal_name", /\blegal (full )?name\b/],        // explicit "Legal name" → legal (Alex Example)
     ["first_name", /\bfirst name\b|\bgiven name\b|\blegal first\b/],
     ["last_name", /\blast name\b|\bfamily name\b|\bsurname\b/],
-    ["full_name", /\bfull name\b|\byour name\b|\blegal name\b|^\s*name\b/],
+    ["full_name", /\bfull name\b|\byour name\b|^\s*name\b/],
     ["email", /\be-?mail\b/],
     ["phone", /\bphone\b|\bmobile\b|\btelephone\b/],
     ["linkedin", /\blinkedin\b/],
@@ -63,17 +64,28 @@
     // Casey is the preferred name, used only for an explicit preferred/nickname field.
     const legalFirst = profile.legal_first_name || profile.first_name;
     const preferred = profile.preferred_name || profile.first_name;
-    const legalFull = [legalFirst, profile.last_name].filter(Boolean).join(" ");
-    // Phone: drop the leading country code (+1 / 1) — many forms have a separate country/dial-code
-    // selector, so a leading "+1" duplicates it. Keep just the national number.
-    const phone = (profile.phone || "").replace(/^\s*\+?\s*1[\s.\-]+/, "").trim();
+    const legalFull = [legalFirst, profile.last_name].filter(Boolean).join(" ");    // Alex Example
+    const preferredFull = [preferred, profile.last_name].filter(Boolean).join(" "); // Casey Example
     return {
-      first_name: legalFirst, last_name: profile.last_name,
-      preferred_name: preferred, full_name: legalFull,
-      email: profile.email, phone: phone, linkedin: profile.linkedin,
+      first_name: legalFirst, last_name: profile.last_name,     // First name → legal (Alex)
+      preferred_name: preferred,                                // Preferred/nickname → Casey
+      full_name: preferredFull,                                 // single "Full Name" → Casey Example (résumé)
+      legal_name: legalFull,                                    // explicit "Legal name" → Alex Example
+      email: profile.email, phone: profile.phone, linkedin: profile.linkedin,
       github: profile.github, website: profile.website,
       location: profile.location, country: profile.country,
     }[key] || "";
+  }
+
+  // True when a separate country / dial-code selector sits next to this phone input — then we
+  // fill just the national number so we don't duplicate the "+1". A lone phone field keeps "+1".
+  function hasDialCodeSelector(el) {
+    let n = el.parentElement;
+    for (let i = 0; i < 3 && n; i++, n = n.parentElement) {
+      if (n.querySelector('select, [class*="iti"], [class*="flag"], [class*="dial"], [class*="country" i]')) return true;
+      if (/\+\d{1,3}\b/.test((n.textContent || "").slice(0, 200))) return true;   // a visible "+1" chip
+    }
+    return false;
   }
 
   // Fills one standard field at a time with a human-like pause between each, so the form's
@@ -87,8 +99,10 @@
       if (el.disabled || el.readOnly) continue;
       const key = classify(el);
       if (!key) continue;
-      const val = valueFor(key, profile);
+      let val = valueFor(key, profile);
       if (!val) continue;
+      // phone: drop the +1 country code only when a separate dial-code selector is present
+      if (key === "phone" && hasDialCodeSelector(el)) val = val.replace(/^\s*\+?\s*1[\s.\-]+/, "").trim();
       if ((el.value || "").trim()) { skipped.push(key + " (already filled)"); continue; }
       if (filled.length) await humanPause();          // pace between fields (skip before the first)
       el.focus();
