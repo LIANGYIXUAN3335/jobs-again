@@ -86,7 +86,7 @@
   <td class="title">
     <span class="title-link" title="show JD">{{ r.title }}</span>
     {% if r.seniority == 'senior' %}<span class="chip sr" title="senior-titled role">sr</span>{% endif %}
-    {% if r.badge_ref %}<span class="chip warn" title="you marked {{ r.badge_ref.status }} on the same title ({{ r.badge_ref.job_id }}{% if r.badge_ref.date %}, {{ r.badge_ref.date }}{% endif %})">⚠ applied before</span>{% endif %}
+    {% if r.badge_ref %}<span class="chip warn" title="A DIFFERENT posting (job {{ r.badge_ref.job_id }}{% if r.badge_ref.date %}, {{ r.badge_ref.date }}{% endif %}) with the same company + same title — you marked that one “{{ r.badge_ref.status }}”. THIS is a separate/re-listed job ID, so it stays in review.">⚠ same title · {{ r.badge_ref.status }} before</span>{% endif %}
     {% if r.hidden_company %}<span class="chip hide" title="company is in the hidden list">co-hidden</span>{% endif %}
     {% if r.tailor_status == 'ready' %}<a class="chip tailor ready" href="/api/roles/{{ r.job_id }}/resume.pdf" target="_blank" title="download tailored PDF">📄 resume</a>
     {% elif r.tailor_status and r.tailor_status != 'none' %}<span class="chip tailor" title="prompt written to output/prompts — generate with Claude Code, then Ingest">{{ r.tailor_status }}</span>{% endif %}
