@@ -147,12 +147,16 @@
           color:#0f172a; background:#fff; border:1px solid #e2e8f0; border-radius:14px;
           box-shadow:0 12px 32px rgba(15,23,42,.22); overflow:hidden; }
         .hd{ background:linear-gradient(135deg,#1d4470,#0f2942); color:#fff; padding:11px 14px;
-          display:flex; justify-content:space-between; align-items:center; }
+          display:flex; justify-content:space-between; align-items:center; cursor:grab; user-select:none; }
+        .hd:active{ cursor:grabbing; }
         .brand{ display:flex; align-items:center; gap:8px; font-weight:700; letter-spacing:.2px; font-size:14px; }
         .dot{ width:9px; height:9px; border-radius:50%; background:#4ade80; box-shadow:0 0 0 3px rgba(74,222,128,.25); }
-        .x{ cursor:pointer; background:transparent; border:0; color:#cbd5e1; font-size:18px; line-height:1;
-          padding:2px 4px; border-radius:6px; }
-        .x:hover{ background:rgba(255,255,255,.14); color:#fff; }
+        .ctl{ display:flex; align-items:center; gap:1px; }
+        .ctl button{ cursor:pointer; background:transparent; border:0; color:#cbd5e1; font-size:18px; line-height:1;
+          padding:2px 7px; margin:0; width:auto; border-radius:6px; font-weight:600; }
+        .ctl button:hover{ background:rgba(255,255,255,.14); color:#fff; }
+        .wrap.collapsed{ width:auto; }
+        .wrap.collapsed .bd{ display:none; }
         .bd{ padding:14px; }
         .role{ font-weight:650; font-size:14px; line-height:1.35; margin-bottom:8px; }
         .chip{ display:inline-block; font-size:11.5px; font-weight:600; padding:3px 9px; border-radius:999px; }
@@ -174,7 +178,7 @@
         .log .good{ color:#15803d; }
       </style>
       <div class="wrap">
-        <div class="hd"><span class="brand"><span class="dot"></span>JobScan</span><button class="x" title="close">×</button></div>
+        <div class="hd"><span class="brand"><span class="dot"></span>JobScan</span><span class="ctl"><button class="min" title="minimize">–</button><button class="x" title="close">×</button></span></div>
         <div class="bd">
           <div class="role"></div>
           <div class="status"></div>
@@ -193,6 +197,32 @@
     const log = (m, cls) => { const d = document.createElement("div"); if (cls) d.className = cls; d.textContent = m; $(".log").appendChild(d); };
 
     $(".x").onclick = () => host.remove();
+
+    // minimize / restore — collapse to just the header pill so it never covers the submit button
+    const wrap = $(".wrap"), minBtn = $(".min");
+    minBtn.onclick = (e) => {
+      e.stopPropagation();
+      const collapsed = wrap.classList.toggle("collapsed");
+      minBtn.textContent = collapsed ? "▢" : "–";
+      minBtn.title = collapsed ? "restore" : "minimize";
+    };
+
+    // drag the panel by its header (switch from bottom/right anchoring to top/left on first drag)
+    $(".hd").addEventListener("mousedown", (e) => {
+      if (e.target.closest("button")) return;           // don't start a drag from the ×/– buttons
+      const r = host.getBoundingClientRect();
+      const dx = e.clientX - r.left, dy = e.clientY - r.top;
+      host.style.right = "auto"; host.style.bottom = "auto";
+      host.style.left = r.left + "px"; host.style.top = r.top + "px";
+      const move = (ev) => {
+        host.style.left = Math.max(0, Math.min(innerWidth - 40, ev.clientX - dx)) + "px";
+        host.style.top = Math.max(0, Math.min(innerHeight - 30, ev.clientY - dy)) + "px";
+      };
+      const up = () => { document.removeEventListener("mousemove", move); document.removeEventListener("mouseup", up); };
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", up);
+      e.preventDefault();
+    });
 
     const fillBtn = $(".fill");
     fillBtn.onclick = async () => {
