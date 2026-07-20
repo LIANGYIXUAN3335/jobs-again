@@ -86,7 +86,8 @@ def score(posting: Posting, notes: dict, cfg: dict) -> Score:
     s_wlb = prior_plus_keywords("wlb")
     s_culture = prior_plus_keywords("culture")
 
-    # --- stability: entirely from company notes ---
+    # --- stability: company financial health (notes) + role's business-criticality (JD).
+    # Revenue-proximate / core work is harder to cut; cost-center work is first to go. ---
     st = _num(notes.get("stability_prior"))
     layoffs = notes.get("recent_layoffs")
     if st is None:
@@ -98,7 +99,12 @@ def score(posting: Posting, notes: dict, cfg: dict) -> Score:
             st -= 1.5
     if _truthy_layoffs(layoffs):
         neg.append((f"recent layoffs ({layoffs})", -1.5))
-    s_stability = _clamp(st)
+    st_adj = 0.0
+    for kw, w in (sc.get("stability") or {}).items():
+        if _hit(kw.strip(), text):
+            st_adj += float(w)
+            (pos if w > 0 else neg).append((kw.strip(), float(w)))
+    s_stability = _clamp(st + _clamp(st_adj, -cap, cap))
 
     # --- weighted total, normalized to 0-100 ---
     w = cfg.get("weights") or {}
