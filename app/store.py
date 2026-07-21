@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS role_state (
 CREATE TABLE IF NOT EXISTS applied_companies (
   name_norm TEXT PRIMARY KEY, display_name TEXT, added_at TEXT
 );
+CREATE TABLE IF NOT EXISTS company_batch (
+  company_norm TEXT PRIMARY KEY, batch_date TEXT, job_ids TEXT
+);
 CREATE TABLE IF NOT EXISTS reply_queue (
   msg_id TEXT PRIMARY KEY,              -- email Message-ID, for dedup
   uid TEXT, from_addr TEXT, from_name TEXT, reply_to TEXT,
@@ -71,6 +74,20 @@ _QUEUE_COLS = [
     "category", "asks_availability", "repliable", "draft", "references_hdr",
     "in_reply_to", "status", "found_at", "sent_at",
 ]
+
+
+def batch_get(conn, company_norm: str) -> dict | None:
+    r = conn.execute("SELECT batch_date, job_ids FROM company_batch WHERE company_norm=?",
+                     (company_norm,)).fetchone()
+    if not r:
+        return None
+    return {"batch_date": r["batch_date"], "job_ids": set(json.loads(r["job_ids"] or "[]"))}
+
+
+def batch_set(conn, company_norm: str, batch_date: str, job_ids) -> None:
+    conn.execute("INSERT OR REPLACE INTO company_batch (company_norm, batch_date, job_ids) VALUES (?,?,?)",
+                 (company_norm, batch_date, json.dumps(sorted(job_ids))))
+    conn.commit()
 
 
 def queue_has(conn, msg_id: str) -> bool:
@@ -347,6 +364,7 @@ def fetch_view(
         r["hidden_sig"] = hidden_sig
 
         in_review = eff == "new" and not r["hidden_company"] and not hidden_sig and not cd
+        r["in_review"] = in_review
         if in_review:
             counts["new"] += 1
         elif eff in counts and eff != "new":
@@ -391,6 +409,43 @@ def fetch_view(
     else:
         out.sort(key=lambda r: (r["weighted_score"] or 0, r["first_seen"] or ""), reverse=True)
 
+    # --- per-company cap: in the review tab, show at most `max` roles per company (top by
+    # score), frozen for `window_days` so you work through one batch before the next surfaces.
+    # A company over the cap records a batch date; overflow is held (still visible under 'all'). ---
+    cap_cfg = cfg.get("per_company_cap") or {}
+    cap_max = int(cap_cfg.get("max", 0) or 0)
+    cap_info: dict[str, dict] = {}
+    if status == "new" and cap_max > 0:
+        window = int(cap_cfg.get("window_days", 7))
+        stale = (datetime.date.fromisoformat(today) - datetime.timedelta(days=window)).isoformat()
+        review_by_co: dict[str, list] = {}
+        for r in rows:
+            if r.get("in_review"):
+                review_by_co.setdefault(r["company_norm"], []).append(r)
+        active: dict[str, set] = {}
+        for cn, rs in review_by_co.items():
+            if len(rs) <= cap_max:
+                active[cn] = {x["job_id"] for x in rs}
+                continue
+            rec = batch_get(conn, cn)
+            still_new = {x["job_id"] for x in rs}
+            if rec and (rec["batch_date"] or "") >= stale:
+                # frozen for the whole window — even if you clear all 15, the next batch waits
+                # until `window_days` pass (your "re-search next week"). Cleared ones just drop out.
+                active[cn] = rec["job_ids"] & still_new
+            else:
+                top = sorted(rs, key=lambda x: -(x["weighted_score"] or 0))[:cap_max]
+                ids = {x["job_id"] for x in top}
+                batch_set(conn, cn, today, ids)
+                active[cn] = ids
+                rec = {"batch_date": today}
+            held = len(rs) - len(active[cn])
+            if held > 0:
+                cap_info[rs[0]["company"]] = {"shown": len(active[cn]), "held": held,
+                                              "since": rec["batch_date"], "window_days": window}
+        out = [r for r in out if r["company_norm"] not in active or r["job_id"] in active[r["company_norm"]]]
+        counts["new"] = sum(len(v) for v in active.values())
+
     companies = sorted({r["company"] for r in rows})
     return {
         "rows": out,
@@ -398,6 +453,7 @@ def fetch_view(
         "total_roles": len(rows),
         "companies": companies,
         "applied_companies": sorted(applied_cos.values(), key=str.lower),
+        "cap_info": cap_info,
         "run": last_run(conn),
         "today": today,
     }
