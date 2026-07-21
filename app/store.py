@@ -9,6 +9,7 @@ import json
 import sqlite3
 from zoneinfo import ZoneInfo
 
+from . import config as cfgmod
 from .config import db_path, norm_key, user_db_path
 
 LA = ZoneInfo("America/Los_Angeles")
@@ -310,6 +311,7 @@ def fetch_view(
     )]
     applied_cos = {r["name_norm"]: r["display_name"] for r in
                    conn.execute("SELECT * FROM applied_companies")}
+    cooldown_cos = cfgmod.active_cooldowns(cfg)     # {norm_key: {until, reason}}
     sig_mode = cfg.get("signature_match", "badge")
 
     closed_by_sig: dict[tuple, dict] = {}
@@ -327,6 +329,8 @@ def fetch_view(
         r["status"] = eff
         r["notes"] = r["notes"] or ""
         r["hidden_company"] = r["company_norm"] in applied_cos
+        cd = cooldown_cos.get(r["company_norm"])
+        r["cooldown"] = cd                          # {until, reason} or None
         r["badge_ref"] = None
         hidden_sig = False
         if eff == "new" and sig_mode != "off":
@@ -342,7 +346,7 @@ def fetch_view(
                     }
         r["hidden_sig"] = hidden_sig
 
-        in_review = eff == "new" and not r["hidden_company"] and not hidden_sig
+        in_review = eff == "new" and not r["hidden_company"] and not hidden_sig and not cd
         if in_review:
             counts["new"] += 1
         elif eff in counts and eff != "new":

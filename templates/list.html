@@ -89,6 +89,7 @@
     {% if r.seniority == 'senior' %}<span class="chip sr" title="senior-titled role">sr</span>{% endif %}
     {% if r.badge_ref %}<span class="chip warn" title="A DIFFERENT posting (job {{ r.badge_ref.job_id }}{% if r.badge_ref.date %}, {{ r.badge_ref.date }}{% endif %}) with the same company + same title — you marked that one “{{ r.badge_ref.status }}”. THIS is a separate/re-listed job ID, so it stays in review.">⚠ same title · {{ r.badge_ref.status }} before</span>{% endif %}
     {% if r.hidden_company %}<span class="chip hide" title="company is in the hidden list">co-hidden</span>{% endif %}
+    {% if r.cooldown %}<span class="chip warn" title="application cooldown — {{ r.cooldown.reason }}. Scanner skips this company and it's hidden from review until then.">⏳ cooldown to {{ r.cooldown.until }}</span>{% endif %}
     {% if r.tailor_status == 'ready' %}<a class="chip tailor ready" href="/api/roles/{{ r.job_id }}/resume.pdf" target="_blank" title="download tailored PDF">📄 resume</a>
     {% elif r.tailor_status and r.tailor_status != 'none' %}<span class="chip tailor" title="prompt written to output/prompts — generate with Claude Code, then Ingest">{{ r.tailor_status }}</span>{% endif %}
     <a class="apply" href="{{ r.apply_url }}" target="_blank" rel="noopener" title="open application page">↗</a>
@@ -109,7 +110,7 @@
     <select class="variant" title="resume variant recorded when marking applied">
       {% for v in resume_variants %}<option>{{ v }}</option>{% endfor %}
     </select>
-    <button data-act="applied" title="mark applied (a)">✓</button>
+    <button data-act="applied" class="mark-applied" title="mark applied — records the résumé variant on the left (key: a)">✓ applied</button>
     <button data-act="skip" title="skip (s)">–</button>
     <button data-act="rejected" title="rejected (x)">✕</button>
     <select class="more" title="other status">
