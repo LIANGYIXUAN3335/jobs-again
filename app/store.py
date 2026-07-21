@@ -91,10 +91,21 @@ def batch_set(conn, company_norm: str, batch_date: str, job_ids) -> None:
 
 
 def queue_has(conn, msg_id: str) -> bool:
-    return conn.execute("SELECT 1 FROM reply_queue WHERE msg_id=?", (msg_id,)).fetchone() is not None
+    # stored msg_ids are stripped on insert (queue_add), so an exact match on the stripped
+    # lookup key is reliable — SQLite's TRIM() doesn't remove newlines, so don't rely on it.
+    return conn.execute("SELECT 1 FROM reply_queue WHERE msg_id=?",
+                        ((msg_id or "").strip(),)).fetchone() is not None
+
+
+def queue_closed_rows(conn) -> list[dict]:
+    """Conversations the user has finished with (sent or dismissed) — used to suppress
+    re-drafting a NEW message that belongs to the same conversation (same sender+subject)."""
+    return [dict(r) for r in conn.execute(
+        "SELECT from_addr, subject FROM reply_queue WHERE status IN ('sent','dismissed')")]
 
 
 def queue_add(conn, item: dict) -> None:
+    item = {**item, "msg_id": (item.get("msg_id") or "").strip()}
     row = {k: item.get(k) for k in _QUEUE_COLS}
     conn.execute(
         f"INSERT OR IGNORE INTO reply_queue ({', '.join(_QUEUE_COLS)}) "
