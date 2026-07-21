@@ -23,7 +23,8 @@ def main():
     conn = store.connect_view(cfg)
     d = store.fetch_view(conn, cfg, status="new")     # already per-company-capped
     todo = [r for r in d["rows"]
-            if r.get("tailor_status") != "ready" and (r["weighted_score"] or 0) >= min_score]
+            if r.get("tailor_status") != "ready" and r.get("verdict") != "drop"
+            and (r["weighted_score"] or 0) >= min_score]
     todo.sort(key=lambda r: -(r["weighted_score"] or 0))
     todo = todo[:cap]
 

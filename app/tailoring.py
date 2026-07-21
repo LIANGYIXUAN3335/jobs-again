@@ -121,18 +121,22 @@ Truth rules (hard constraints):
 - Use the job description's own terminology ONLY where it truthfully matches her work.
 
 Keep the punch (this is where the old version failed):
-- PRESERVE every concrete detail and number from the base bullet: real product/system names
-  (GMV Max, Meta Business Suite AI agents, Click-to-Call), scale (500+ products, 8+ scenarios,
-  5+ inputs), and metrics (30% fewer invalid submissions, 90%+ coverage, 50% fewer exceptions,
-  2 hrs/day). A bullet with a specific artifact + a number beats any amount of backend jargon.
+- PRESERVE the concrete details in the base bullet: real product/system names (GMV Max, Meta
+  Business Suite AI agents, Click-to-Call), scale (500+ products, 8+ scenarios, 5+ inputs), and
+  any metrics THAT ARE ALREADY THERE (30% fewer invalid submissions, 90%+ coverage, 500+ products).
+  A bullet with a specific real artifact beats any amount of backend jargon.
+- NOT every bullet needs a metric. Use ONLY numbers that already exist in the base bullet —
+  never add, pad, or invent a number to hit a quota. A metric-free bullet that names a real
+  system and what she built with it is perfectly strong; percentages don't help ATS matching
+  anyway, so don't chase them. If the base bullet has no number, don't manufacture one.
 - Do NOT abstract concrete work into floating buzzwords. "Designed deterministic state-transition
   logic and validation guardrails to keep interdependent workflows consistent" is a FAILURE —
   it deleted GMV Max, the 8+ scenarios, and reads as filler. Name the real thing, then frame it.
 - Keyword-density cap: phrases like "state-transition logic", "validation guardrails",
   "data consistency across pipelines" may appear in AT MOST ONE bullet total across the whole
   resume. Repeating them across jobs is the #1 thing that made the last version read as generic.
-- Lead each bullet with the accomplishment/impact, not the reframe. Strong verb + real system +
-  number. The backend angle is the lens, not the subject.
+- Lead each bullet with the accomplishment/impact, not the reframe: strong verb + real system
+  (+ its real number when the base bullet has one). The backend angle is the lens, not the subject.
 
 Reframe, don't downgrade:
 - She is moving from frontend/product/ads work toward backend/distributed systems. Reframe the
@@ -196,6 +200,12 @@ _ANGLE_HINTS = {
                 "request-response flows, monitoring — keeping the concrete names and numbers. "
                 "Surface money-movement-adjacent themes: validation, idempotency-style safeguards, "
                 "reliability, Go/internal APIs, monitoring.",
+    "full-stack": "frame her as someone who owns a feature end to end — the React/TypeScript "
+                  "advertiser surfaces at TikTok sitting on her own Go internal APIs, the Meta "
+                  "AI-agent onboarding platform (React + Docker microservices, GraphQL, Kafka), and "
+                  "the Java/Node/REST services at Haoxiong — keeping the concrete names and numbers. "
+                  "Surface both halves in every job: UI framework AND the service/database behind it, "
+                  "plus the Cypress/Jest testing discipline that ties them together.",
 }
 
 
@@ -204,6 +214,15 @@ def suggest_angle(cfg: dict, role: dict) -> str:
     pay_terms = ("payment", "fintech", "ledger", "billing", "money", "transaction", "card")
     if any(t in text for t in pay_terms):
         return "payments"
+    # Full-stack only when the TITLE says so, or the JD asks for front-end work on top of
+    # services. A backend JD that merely name-drops React must stay backend-distributed.
+    title = (role.get("title") or "").lower()
+    if "full-stack" in title or "full stack" in title or "fullstack" in title:
+        return "full-stack"
+    fe = ("react", "typescript", "front end", "front-end", "frontend", "javascript", "ui/ux")
+    if sum(t in text for t in fe) >= 2 and any(
+            t in text for t in ("web application", "user interface", "front end", "front-end", "frontend")):
+        return "full-stack"
     return "backend-distributed"
 
 
@@ -338,8 +357,13 @@ def ingest_file(cfg: dict, conn, yaml_file: Path) -> dict:
     # filename carries name + company + role + score; sweep this role's older scored copies
     # and the legacy job-id-named PDF so only the current one remains.
     rdir = cfgmod.resolve_path(cfg["output_dirs"]["resumes"])
-    for stale in rdir.glob(f"{friendly_pdf_prefix(role['company'], role['title'], job_id)}*.pdf"):
-        stale.unlink()
+    # NB: match by prefix via startswith, NOT Path.glob — the "[job-id]" in the prefix
+    # contains glob metacharacters ([...] is a char class), so glob would never match the
+    # real file and stale scored copies would pile up on every re-score.
+    prefix = friendly_pdf_prefix(role["company"], role["title"], job_id)
+    for stale in rdir.iterdir():
+        if stale.suffix == ".pdf" and stale.name.startswith(prefix):
+            stale.unlink()
     legacy = resume_pdf_path(cfg, role["company"], job_id)
     if legacy.exists():
         legacy.unlink()
