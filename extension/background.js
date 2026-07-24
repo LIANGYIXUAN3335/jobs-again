@@ -58,6 +58,45 @@ async function emailCode() {
   return r.json(); // { code, subject, from, date }
 }
 
+async function salary(jobId) {
+  const r = await apiFetch(`/api/salary?job_id=${encodeURIComponent(jobId)}`);
+  if (!r.ok) throw new Error(`salary ${r.status}`);
+  return r.json();   // { amount, source }
+}
+
+async function coverLetter(jobId, words) {
+  const r = await apiFetch(`/api/cover-letter?job_id=${encodeURIComponent(jobId)}&words=${words || 180}`);
+  if (!r.ok) {
+    let detail = `cover letter ${r.status}`;
+    try { detail = (await r.json()).detail || detail; } catch (e) { /* keep default */ }
+    throw new Error(detail);
+  }
+  return r.json();   // { text }
+}
+
+async function pickOption(jobId, question, options) {
+  const r = await apiFetch(`/api/pick-option`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ job_id: jobId, question, options }),
+  });
+  if (!r.ok) return { index: -1 };
+  return r.json();   // { index }
+}
+
+async function topRole(company) {
+  const r = await apiFetch(`/api/top-role?company=${encodeURIComponent(company)}`);
+  if (r.status === 404) return { found: false };
+  if (!r.ok) throw new Error(`top-role ${r.status}`);
+  return { found: true, role: await r.json() };
+}
+
+async function profileOnly() {
+  const r = await apiFetch(`/api/profile`);
+  if (!r.ok) throw new Error(`profile ${r.status}`);
+  return r.json();
+}
+
 async function markApplied(jobId, variant) {
   const r = await apiFetch(`/api/roles/${encodeURIComponent(jobId)}/status`, {
     method: "POST",
@@ -68,14 +107,34 @@ async function markApplied(jobId, variant) {
   return r.json();
 }
 
+async function capture(payload) {
+  const r = await apiFetch(`/api/capture`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    let detail = `capture ${r.status}`;
+    try { detail = (await r.json()).detail || detail; } catch (e) { /* keep default */ }
+    throw new Error(detail);
+  }
+  return r.json(); // { ok, job_id, company, title, score, verdict }
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
       if (msg.type === "lookup") sendResponse(await lookup(msg.url));
+      else if (msg.type === "profile") sendResponse({ ok: true, ...(await profileOnly()) });
+      else if (msg.type === "topRole") sendResponse(await topRole(msg.company));
       else if (msg.type === "resume") sendResponse({ ok: true, ...(await resumeBase64(msg.jobId)) });
       else if (msg.type === "answer") sendResponse({ ok: true, ...(await answer(msg.jobId, msg.questions)) });
       else if (msg.type === "emailCode") sendResponse({ ok: true, ...(await emailCode()) });
+      else if (msg.type === "salary") sendResponse({ ok: true, ...(await salary(msg.jobId)) });
+      else if (msg.type === "coverLetter") sendResponse({ ok: true, ...(await coverLetter(msg.jobId, msg.words)) });
+      else if (msg.type === "pickOption") sendResponse({ ok: true, ...(await pickOption(msg.jobId, msg.question, msg.options)) });
       else if (msg.type === "markApplied") sendResponse({ ok: true, ...(await markApplied(msg.jobId, msg.variant)) });
+      else if (msg.type === "capture") sendResponse({ ok: true, ...(await capture(msg.payload)) });
       else sendResponse({ ok: false, error: "unknown message" });
     } catch (e) {
       sendResponse({ ok: false, error: String(e.message || e) });
