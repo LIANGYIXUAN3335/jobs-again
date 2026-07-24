@@ -21,7 +21,10 @@
   #v(3pt, weak: true)
   #let c = data.contact
   #text(size: 9pt)[
-    #c.phone #h(5pt) · #h(5pt) #link("mailto:" + c.email)[#c.email] #h(5pt) · #h(5pt) #c.location #h(5pt) · #h(5pt) #link("https://" + c.linkedin)[#c.linkedin]
+    // Display the clean short form, but point the hyperlink at the canonical www + trailing-slash
+    // URL — the bare/no-slash form gets rejected as "invalid" by some validators. Assumes
+    // contact.linkedin is stored as "linkedin.com/in/<handle>" (no scheme/www/slash).
+    #c.phone #h(5pt) · #h(5pt) #link("mailto:" + c.email)[#c.email] #h(5pt) · #h(5pt) #c.location #h(5pt) · #h(5pt) #link("https://www." + c.linkedin + "/")[#c.linkedin]
   ]
 ]
 #v(3pt)
