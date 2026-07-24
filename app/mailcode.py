@@ -29,6 +29,15 @@ _STRONG_REV = re.compile(
     r"(\d{4,8})[^0-9]{0,20}(?:is your (?:verification|one[\s-]?time|security|login) |"
     r"verification code|one[\s-]?time (?:code|passcode))", re.IGNORECASE)
 _VERIFYISH = re.compile(r"verif|one[\s-]?time|passcode|confirm your|\botp\b|log ?in code", re.IGNORECASE)
+# Some senders (Greenhouse: "paste this code ... : dW9hkRYX") issue MIXED alphanumeric codes,
+# which the digit-only patterns above structurally cannot see. Match the code phrase, then take
+# the first mixed letters+digits token after it — the mixed requirement is what keeps ordinary
+# English words out, so the trailing window can be generous.
+_CODE_PHRASE = re.compile(
+    r"verification code|one[\s-]?time (?:code|passcode|password|pin)|passcode|security code|"
+    r"access code|confirmation code|your code is|use code|paste (?:in )?this code|"
+    r"enter (?:the )?code|code[:\s]+is|\botp\b", re.IGNORECASE)
+_ALNUM_TOKEN = re.compile(r"\b(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)([A-Za-z0-9]{5,10})\b")
 
 
 def _is_year(s: str) -> bool:
@@ -46,6 +55,12 @@ def _extract_code(text: str):
         for c in cand:
             if len(c) == length:
                 return c
+    # mixed alphanumeric code right after a code phrase (Greenhouse et al.)
+    for pm in _CODE_PHRASE.finditer(text):
+        window = text[pm.end():pm.end() + 120]
+        tm = _ALNUM_TOKEN.search(window)
+        if tm:
+            return tm.group(1)
     # weak fallback: clearly a verification email AND exactly one non-year 6-digit number
     if _VERIFYISH.search(text):
         sixes = {n for n in re.findall(r"\b\d{6}\b", text) if not _is_junk(n)}
