@@ -14,6 +14,8 @@ from pydantic import BaseModel
 
 from . import ai as aimod
 from . import config as cfgmod
+from . import followup as followupmod
+from . import funnel as funnelmod
 from . import gcal as gcalmod
 from . import ingest as ingestmod
 from . import mail as sendmail
@@ -35,6 +37,7 @@ def url_candidates(url: str) -> list[str]:
     """Raw ATS ids that might appear in an application-page URL."""
     c: list[str] = []
     for pat in (r"gh_jid=(\d+)", r"[?&]token=(\d+)", r"/jobs/(\d+)",
+                r"[?&]pid=(\d+)",                       # Microsoft careers: apply?pid=1970393556941507
                 # Workday req ids: .../Software-Engineer-II_R-279240, .../job/R-273932/...,
                 # .../Staff-Software-Engineer_REF078668W  → job_id ends ':R-279240'
                 r"[_/]([A-Z]{1,4}-?\d{3,}[A-Za-z0-9]*)"):
@@ -76,16 +79,56 @@ def _parse_dates(s: str) -> dict:
     return out
 
 
-def profile_experience() -> list[dict]:
-    """Work history for the extension's Workday filler, from the LOCKED base résumé."""
+def profile_skills(role: dict | None = None) -> list[str]:
+    """Flat skill list for Workday's "Type to Add Skills". Prefer this role's TAILORED résumé
+    skills (already JD-aligned by the tailoring pass); fall back to the base skill pool."""
+    import yaml  # local: only needed here
     try:
         base = tailoring.load_base(cfg)
     except Exception:
         return []
-    return [{
-        "company": j.get("company", ""), "title": j.get("title", ""),
-        "location": j.get("location", ""), **_parse_dates(j.get("dates", "")),
-    } for j in (base.get("experience") or [])]
+    if role:
+        try:
+            p = tailoring.resume_yaml_path(cfg, role["company"], role["job_id"])
+            if p.exists():
+                t = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+                out = [s for g in (t.get("skills") or []) for s in (g.get("items") or [])]
+                if out:
+                    return out
+        except Exception:
+            pass
+    return [s for items in (base.get("skills_master") or {}).values() for s in items]
+
+
+def profile_experience(role: dict | None = None) -> list[dict]:
+    """Work history for the extension's Workday filler, from the LOCKED base résumé.
+    `bullets` feed Workday's "Role Description" box. When this role already has a tailored
+    résumé, use ITS bullets so the typed-in history matches the PDF being attached;
+    otherwise fall back to the base (ground-truth) bullets."""
+    import yaml  # local: only needed here
+    try:
+        base = tailoring.load_base(cfg)
+    except Exception:
+        return []
+    tailored: dict[str, list[str]] = {}
+    if role:
+        try:
+            p = tailoring.resume_yaml_path(cfg, role["company"], role["job_id"])
+            if p.exists():
+                t = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+                tailored = {j.get("company"): (j.get("bullets") or [])
+                            for j in (t.get("experience") or [])}
+        except Exception:
+            tailored = {}
+    out = []
+    for j in (base.get("experience") or []):
+        co = j.get("company", "")
+        out.append({
+            "company": co, "title": j.get("title", ""), "location": j.get("location", ""),
+            "bullets": tailored.get(co) or j.get("bullets_master") or [],
+            **_parse_dates(j.get("dates", "")),
+        })
+    return out
 app.mount("/static", StaticFiles(directory=str(cfgmod.ROOT / "static")), name="static")
 templates = Jinja2Templates(directory=str(cfgmod.ROOT / "templates"))
 
@@ -197,26 +240,175 @@ def api_ingest(conn=Depends(view_conn)):
     return {"ok": True, "ingested": n}
 
 
-@app.get("/api/lookup")
-def api_lookup(url: str, conn=Depends(view_conn)):
-    """The extension asks 'what role is this application page?' Returns role + profile."""
-    role = store.lookup_role_by_ids(conn, url_candidates(url))
-    if not role:
-        raise HTTPException(404, "no matching role for this URL")
+def _lookup_payload(conn, role: dict, top_role_default: bool = False) -> dict:
+    """Build the role+profile response the extension consumes (shared by /api/lookup and
+    /api/top-role). `top_role_default` flags that this role was chosen as the company's best
+    guess, not matched from the URL, so the panel can say so."""
     has_pdf = bool(role.get("tailored_resume_path")
                    and Path(role["tailored_resume_path"]).exists())
+    # Have I applied to THIS company before? (the "I forget I already applied" guard, shown as a
+    # warning on the panel.) Count other roles at the same company already applied/interviewing.
+    prior = conn.execute(
+        "SELECT r.title, s.status, s.applied_date FROM jobs.roles r JOIN role_state s"
+        " ON s.job_id=r.job_id WHERE r.company_norm=(SELECT company_norm FROM jobs.roles"
+        " WHERE job_id=?) AND s.status IN ('applied','interviewing') AND r.job_id!=?"
+        " ORDER BY s.applied_date DESC",
+        (role["job_id"], role["job_id"]),
+    ).fetchall()
+    ai_cfg = cfg.get("ai") or {}
     return {
         "job_id": role["job_id"], "company": role["company"], "title": role["title"],
         "status": role["status"], "tailor_status": role.get("tailor_status") or "none",
         "has_tailored_pdf": has_pdf,
         "resume_variant": "tailored" if has_pdf else "base",
         "ai_enabled": aimod.available(cfg),
+        "auto_dropdowns": bool(ai_cfg.get("auto_dropdowns", True)),
+        "auto_cover_letter": bool(ai_cfg.get("auto_cover_letter", False)),
+        "this_status": role.get("status") or "new",     # THIS role's own status
+        "company_applied": [                             # OTHER roles at this company already done
+            {"title": r["title"], "status": r["status"], "date": r["applied_date"]}
+            for r in prior[:6]
+        ],
         "mailcode_enabled": mailmod.available(cfg),
         "eeo_decline": bool(cfg.get("eeo_decline", True)),
         "eeo": cfg.get("eeo") or {},          # per-field self-ID preference; unset → decline
         "profile": cfg.get("profile") or {},
-        "experience": profile_experience(),   # work history for Workday's My Experience step
+        "experience": profile_experience(role),   # work history + bullets for Workday's My Experience
+        "skills": profile_skills(role),           # for Workday's "Type to Add Skills" typeahead
+        "top_role_default": top_role_default,      # true → chosen as the company's best guess
     }
+
+
+@app.get("/api/lookup")
+def api_lookup(url: str, conn=Depends(view_conn)):
+    """The extension asks 'what role is this application page?' Returns role + profile."""
+    role = store.lookup_role_by_ids(conn, url_candidates(url))
+    if not role:
+        raise HTTPException(404, "no matching role for this URL")
+    return _lookup_payload(conn, role)
+
+
+_PAY = re.compile(r"\$\s*([0-9]{2,3}(?:,[0-9]{3})+|[0-9]{5,6})(?!\s*%)", re.I)
+
+
+@app.get("/api/salary")
+def api_salary(job_id: str, conn=Depends(view_conn)):
+    """A desired-salary figure for ONE role. Truth order: the JD's own published range →
+    an AI market estimate → the configured fallback. The response always says which one it
+    used, so a guessed number never masquerades as a published one."""
+    role = store.get_role(conn, job_id)
+    if not role:
+        raise HTTPException(404, "unknown job_id")
+    rule = cfg.get("salary") or {}
+
+    # 1) the JD's published range (filter to plausible annual salaries — skips "10%" bonuses,
+    #    "401k", years, and stray ids that also look like numbers)
+    nums = sorted({int(m.group(1).replace(",", "")) for m in _PAY.finditer(role.get("jd_text") or "")})
+    nums = [n for n in nums if 40_000 <= n <= 900_000]
+    if nums:
+        which = str(rule.get("use_jd_range", "low")).lower()
+        amount = nums[-1] if which == "high" else nums[len(nums) // 2] if which == "mid" else nums[0]
+        return {"amount": amount, "source": f"JD range ${nums[0]:,}–${nums[-1]:,} ({which} end)"}
+
+    # 2) AI market estimate. Uses ai.estimate_salary(), NOT answer_questions() — the latter
+    #    refuses compensation questions by design (the model must never answer a salary
+    #    question TO an employer); this is research FOR the candidate, who still reviews it.
+    if aimod.available(cfg):
+        try:
+            est = aimod.estimate_salary(cfg, role)
+            if est:
+                return {"amount": est, "source": "AI market estimate"}
+        except Exception:
+            pass
+
+    # 3) fallback
+    return {"amount": int(rule.get("fallback", 180_000)), "source": "configured fallback"}
+
+
+class PickIn(BaseModel):
+    job_id: str
+    question: str
+    options: list[str]
+
+
+@app.post("/api/pick-option")
+def api_pick_option(body: PickIn, conn=Depends(view_conn)):
+    """Choose the best dropdown option index for a sentence-option question (work auth,
+    relocation…), grounded in the candidate facts. -1 means 'leave it for the user'."""
+    if not aimod.available(cfg):
+        return {"index": -1}
+    role = store.get_role(conn, body.job_id)
+    if not role:
+        raise HTTPException(404, "unknown job_id")
+    try:
+        return {"index": aimod.pick_option(cfg, role, body.question, body.options)}
+    except Exception:
+        return {"index": -1}
+
+
+@app.get("/api/top-role")
+def api_top_role(company: str, conn=Depends(view_conn)):
+    """For a form whose URL carries no job id (Google/Microsoft), pick the company's HIGHEST-
+    scored role that has a tailored résumé — the owner applies top-score-first, so the top role
+    is the best default. Returns the same shape as /api/lookup so the extension treats it
+    identically. Falls back to profile-only (404) if the company has no tailored role."""
+    cn = cfgmod.norm_key(company)
+    row = conn.execute(
+        "SELECT r.job_id FROM jobs.roles r LEFT JOIN role_state s ON s.job_id=r.job_id"
+        " WHERE r.company_norm=? AND s.tailor_status='ready' AND s.tailored_resume_path IS NOT NULL"
+        " ORDER BY r.weighted_score DESC LIMIT 1", (cn,)).fetchone()
+    if not row:
+        raise HTTPException(404, f"no tailored role for {company!r}")
+    role = store.get_role(conn, row["job_id"])
+    return _lookup_payload(conn, role, top_role_default=True)
+
+
+@app.get("/api/profile")
+def api_profile():
+    """Role-independent profile for forms whose URL carries no job id (Google/Microsoft careers).
+    The extension fills name/email/phone/eligibility/consent from this — no résumé, no
+    role-specific questions, since we can't tell which posting it is."""
+    ai_cfg = cfg.get("ai") or {}
+    return {
+        "profile_only": True,
+        "profile": cfg.get("profile") or {},
+        "eeo": cfg.get("eeo") or {},
+        "eeo_decline": bool(cfg.get("eeo_decline", True)),
+        "experience": profile_experience(),
+        "ai_enabled": aimod.available(cfg),
+        "auto_dropdowns": bool(ai_cfg.get("auto_dropdowns", True)),
+    }
+
+
+@app.get("/api/applied-scan")
+def api_applied_scan(days: int = 90, conn=Depends(view_conn)):
+    """Review queue of roles the inbox suggests you already applied to. Read-only — never
+    changes status; the UI confirms each match one at a time via the status endpoint."""
+    from . import applied_scan
+    if not applied_scan.available(cfg):
+        raise HTTPException(503, "email scan disabled (set mailcode.email + gmail_app_password)")
+    try:
+        return applied_scan.scan(cfg, days=days)
+    except Exception as e:
+        raise HTTPException(502, f"applied-scan failed: {type(e).__name__}: {e}")
+
+
+@app.get("/api/cover-letter")
+def api_cover_letter(job_id: str, words: int = 180, conn=Depends(view_conn)):
+    """A short cover-letter paragraph for the 'Additional information / anything else you'd
+    like us to know' boxes. Same voice method as the cover-letter skill."""
+    if not aimod.available(cfg):
+        raise HTTPException(503, "AI disabled (set ai.enabled + a key in secrets.yaml)")
+    role = store.get_role(conn, job_id)
+    if not role:
+        raise HTTPException(404, "unknown job_id")
+    try:
+        text = aimod.cover_letter(cfg, role, max_words=words)
+    except Exception as e:
+        raise HTTPException(502, f"cover letter failed: {type(e).__name__}: {e}")
+    if not text:
+        raise HTTPException(502, "model returned nothing")
+    return {"text": text}
 
 
 @app.get("/api/roles/{job_id}/resume.pdf")
@@ -333,6 +525,387 @@ def api_reply_hold(msg_id: str, conn=Depends(view_conn)):
 def api_reply_dismiss(msg_id: str, conn=Depends(view_conn)):
     store.queue_mark(conn, msg_id, "dismissed")
     return {"ok": True}
+
+
+class CaptureIn(BaseModel):
+    url: str
+    title: str
+    jd: str
+    company: str | None = None
+    location: str | None = None
+
+
+_DOMAIN_CO = {
+    "apple": "Apple", "microsoft": "Microsoft", "google": "Google", "atlassian": "Atlassian",
+    "wise": "Wise", "linkedin": "LinkedIn", "tesla": "Tesla", "circle": "Circle",
+    "hashicorp": "HashiCorp", "retool": "Retool", "deel": "Deel", "netflix": "Netflix",
+    "uber": "Uber", "amazon": "Amazon", "meta": "Meta", "nvidia": "Nvidia",
+}
+
+
+def _company_from_url(url: str) -> str:
+    host = re.sub(r"^https?://", "", url or "").split("/")[0].lower()
+    for key, name in _DOMAIN_CO.items():
+        if key in host:
+            return name
+    parts = [p for p in host.split(".") if p not in ("www", "jobs", "careers", "boards", "com", "io", "co", "ai", "net", "org")]
+    return (parts[0].capitalize() if parts else "Captured")
+
+
+@app.post("/api/capture")
+def api_capture(body: CaptureIn):
+    """Ingest a job the browser extension read off ANY careers page (Apple/MS/Google/anywhere).
+    Adds it to jobscan.db via the same pipeline, scores it, and reports back."""
+    from . import manual as manualmod
+    from . import scoring as scoringmod
+    from types import SimpleNamespace
+    import hashlib
+    jd = (body.jd or "").strip()
+    if len(jd) < 80:
+        raise HTTPException(400, "couldn't read a real job description on this page")
+    company = (body.company or _company_from_url(body.url)).strip() or "Captured"
+    title = (body.title or "").strip() or "Software Engineer"
+    loc = (body.location or "").strip()
+    jid = "cap:" + hashlib.sha1(body.url.encode()).hexdigest()[:16]
+    jobs = store.connect_jobs(cfg)
+    manualmod.add_role(cfg, jobs, company, title, jd, apply_url=body.url, location=loc, job_id=jid)
+    notes = cfgmod.load_company_notes(cfg).get(cfgmod.norm_key(company), {})
+    p = SimpleNamespace(title=title, jd_text=jd, is_remote="remote" in loc.lower(),
+                        company=company, location=loc, apply_url=body.url)
+    s = scoringmod.score(p, notes, cfg)
+    jobs.execute("UPDATE roles SET s_stability=?, s_culture=?, s_depth=?, s_wlb=?, weighted_score=?,"
+                 " verdict=?, why=?, caution=? WHERE job_id=?",
+                 (s.s_stability, s.s_culture, s.s_depth, s.s_wlb, s.weighted, s.verdict, s.why, s.caution, jid))
+    jobs.commit()
+    return {"ok": True, "job_id": jid, "company": company, "title": title,
+            "score": s.weighted, "verdict": s.verdict}
+
+
+# Careers pages for the companies the daily scanner can't reach — bookmark /browse and skim daily.
+_UNSUPPORTED_LINKS = {
+    "Apple": "https://jobs.apple.com/en-us/search?search=software%20engineer&location=united-states-USA&sort=newest",
+    "Microsoft": "https://jobs.careers.microsoft.com/global/en/search?q=software%20engineer&lc=United%20States&exp=Experienced%20professionals",
+    "Google": "https://www.google.com/about/careers/applications/jobs/results?q=software%20engineer&location=United%20States",
+    "Atlassian": "https://www.atlassian.com/company/careers/all-jobs?team=Engineering&location=Americas",
+    "Tesla": "https://www.tesla.com/careers/search/?query=software%20engineer&region=5",
+    "Wise": "https://wise.jobs/jobs/?search=software+engineer",
+    "LinkedIn": "https://careers.linkedin.com/jobs?keywords=software%20engineer",
+    "Circle": "https://www.circle.com/careers",
+    "HashiCorp": "https://www.hashicorp.com/careers/open-positions",
+    "Retool": "https://retool.com/careers#jobs",
+    "Deel": "https://www.deel.com/careers/",
+}
+
+
+@app.get("/browse", response_class=HTMLResponse)
+def browse_unsupported():
+    rows = "".join(
+        f'<li><a href="{u}" target="_blank" rel="noopener">{co}</a> '
+        f'<span class="d">— open careers page</span></li>' for co, u in _UNSUPPORTED_LINKS.items())
+    return HTMLResponse(
+        '<meta charset="utf-8"><title>JobScan · Browse</title>'
+        '<style>body{font:15px/1.6 -apple-system,system-ui,sans-serif;max-width:640px;margin:32px auto;padding:0 20px;color:#0f172a}'
+        'h1{font-size:20px}a.b{color:#12314f;font-weight:600;text-decoration:none}'
+        'ul{list-style:none;padding:0}li{padding:8px 0;border-bottom:1px solid #eef2f6}'
+        'li a{font-weight:600;color:#12314f}.d{color:#64748b;font-size:13px}'
+        '.tip{background:#eff6ff;border:1px solid #bfdbfe;padding:10px 12px;border-radius:9px;font-size:13px;color:#1e40af}</style>'
+        '<a class="b" href="/">← back to JobScan</a><h1>🌐 Browse unsupported companies</h1>'
+        '<p class="tip">These companies can\'t be auto-scanned. Skim them here daily — when you find a role you like, '
+        'open it and hit <b>📥 Capture</b> in the JobScan extension to pull it into JobScan (scored + tailorable).</p>'
+        f'<ul>{rows}</ul>')
+
+
+@app.get("/apply", response_class=HTMLResponse)
+def apply_queue(conn=Depends(view_conn)):
+    """One-click apply queue: review roles that have a tailored résumé ready, newest-highest first.
+    'Open all' opens each application page in its own tab so you apply straight through."""
+    data = store.fetch_view(conn, cfg, status="new", sort="score")
+    ready = [r for r in data["rows"] if r.get("tailor_status") == "ready" and r.get("apply_url")][:25]
+    items = "".join(
+        f'<li><a class="j" href="{r["apply_url"]}" target="_blank" rel="noopener">{r["company"]} — {r["title"]}</a>'
+        f' <span class="s">{r["weighted_score"]:.0f}</span>'
+        f' <a class="r" href="/api/roles/{r["job_id"]}/resume.pdf" target="_blank">📄</a></li>'
+        for r in ready)
+    urls = ",".join(f'"{r["apply_url"]}"' for r in ready)
+    return HTMLResponse(
+        '<meta charset="utf-8"><title>JobScan · Apply queue</title>'
+        '<style>body{font:15px/1.6 -apple-system,system-ui,sans-serif;max-width:720px;margin:32px auto;padding:0 20px;color:#0f172a}'
+        'h1{font-size:20px}a.b{color:#12314f;font-weight:600;text-decoration:none}ul{list-style:none;padding:0}'
+        'li{padding:8px 0;border-bottom:1px solid #eef2f6;display:flex;align-items:center;gap:8px}'
+        'a.j{font-weight:600;color:#12314f;text-decoration:none;flex:1}a.j:hover{text-decoration:underline}'
+        '.s{background:#e7f6ec;color:#15803d;font-weight:700;border-radius:6px;padding:1px 7px;font-size:13px}'
+        'a.r{text-decoration:none}button{font:inherit;font-weight:700;background:#12314f;color:#fff;border:0;'
+        'border-radius:9px;padding:10px 16px;cursor:pointer;margin:8px 0}'
+        '.tip{background:#fff7ed;border:1px solid #fed7aa;padding:10px 12px;border-radius:9px;font-size:13px;color:#9a3412}</style>'
+        '<a class="b" href="/">← back to JobScan</a><h1>🚀 Apply queue '
+        f'<span style="color:#64748b;font-weight:400">({len(ready)} ready)</span></h1>'
+        '<p class="tip">Roles with a tailored résumé ready. <b>Open all</b> pops each application page in its own tab — '
+        'then apply straight through. (First time, allow pop-ups for this site.)</p>'
+        f'<button onclick=\'[{urls}].forEach(u=>window.open(u,"_blank"))\'>Open all {len(ready)} tabs</button>'
+        f'<ul>{items}</ul>')
+
+
+# ---------------------------------------------------------------- outcome / funnel / follow-up
+#
+# The half of the loop that used to end at status='applied'. All three pages share the same
+# rule as the rest of the app: the scanner and the mailbox propose, the owner disposes. Nothing
+# below writes a status without an explicit click, and nothing below sends mail.
+
+_PAGE_CSS = (
+    'body{font:14px/1.55 -apple-system,system-ui,sans-serif;max-width:1000px;margin:28px auto;'
+    'padding:0 20px;color:#0f172a}h1{font-size:20px;margin:.4em 0}h2{font-size:15px;margin:1.6em 0 .5em}'
+    'a.b{color:#12314f;font-weight:600;text-decoration:none}table{border-collapse:collapse;width:100%;'
+    'margin:6px 0 18px}th,td{text-align:left;padding:5px 9px;border-bottom:1px solid #eef2f6}'
+    'th{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#64748b;font-weight:600}'
+    'td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}'
+    '.tip{background:#eff6ff;border:1px solid #bfdbfe;padding:9px 12px;border-radius:9px;'
+    'font-size:13px;color:#1e40af;margin:10px 0}'
+    '.warn{background:#fff7ed;border-color:#fed7aa;color:#9a3412}'
+    '.muted{color:#94a3b8}.small{font-size:12px}'
+    'button{font:inherit;font-size:13px;font-weight:600;background:#12314f;color:#fff;border:0;'
+    'border-radius:7px;padding:5px 11px;cursor:pointer}button.g{background:#e2e8f0;color:#0f172a}'
+    'button:disabled{opacity:.5;cursor:default}pre{white-space:pre-wrap;background:#f8fafc;'
+    'border:1px solid #e2e8f0;border-radius:8px;padding:10px;font:13px/1.5 ui-monospace,monospace}'
+    '.pill{border-radius:5px;padding:1px 6px;font-size:11px;font-weight:700}'
+    '.hi{background:#dcfce7;color:#15803d}.md{background:#fef9c3;color:#854d0e}'
+    '.lo{background:#f1f5f9;color:#475569}'
+)
+
+
+def _page(title: str, body: str) -> HTMLResponse:
+    return HTMLResponse(f'<meta charset="utf-8"><title>JobScan · {title}</title>'
+                        f'<style>{_PAGE_CSS}</style>'
+                        f'<a class="b" href="/">← back to JobScan</a>{body}')
+
+
+class SignalIn(BaseModel):
+    stage: str | None = None
+    outcome: str | None = None
+    note: str = ""
+    when: str | None = None
+
+
+@app.post("/api/roles/{job_id}/signal")
+def api_record_signal(job_id: str, body: SignalIn, conn=Depends(view_conn)):
+    """Record what happened to an application (stage reached / final outcome). Monotonic —
+    see store.record_signal; a later signal can advance a row but never walk it backwards."""
+    if not store.get_role(conn, job_id):
+        raise HTTPException(404, "unknown job_id")
+    try:
+        state = store.record_signal(conn, job_id, stage=body.stage, outcome=body.outcome,
+                                    note=body.note, when=body.when)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "state": state}
+
+
+@app.get("/api/funnel")
+def api_funnel(by: str = "score,match,company,ats", conn=Depends(view_conn)):
+    dims = [d.strip() for d in by.split(",") if d.strip() in funnelmod._DIMENSIONS]
+    rep = funnelmod.report(cfg, conn, dims or ["score"])
+    rep.pop("apps", None)                       # the per-application rows are big and unused here
+    return rep
+
+
+@app.get("/funnel", response_class=HTMLResponse)
+def funnel_page(conn=Depends(view_conn)):
+    dims = ["score", "match", "company", "ats"]
+    rep = funnelmod.report(cfg, conn, dims)
+    o, s, tune = rep["overall"], rep["signal"], rep["tuning"]
+    if not o["applied"]:
+        return _page("Funnel", '<h1>📊 Funnel</h1><p class="tip">No applications recorded yet.</p>')
+
+    def rate(r):
+        if r["response_rate"] is None:
+            return '<span class="muted">—</span>'
+        txt = f'{r["response_rate"]:.0f}%'
+        return txt if r["enough"] else f'{txt} <span class="muted small">?</span>'
+
+    tables = ""
+    for d in dims:
+        rows = "".join(
+            f'<tr><td>{r["bucket"]}</td><td class="n">{r["applied"]}</td>'
+            f'<td class="n">{r["mature"]}</td><td class="n">{r["responded"]}</td>'
+            f'<td class="n">{r["interviewed"]}</td><td class="n">{r["offered"]}</td>'
+            f'<td class="n">{r["quiet"]}</td><td class="n">{rate(r)}</td></tr>'
+            for r in rep["by"][d][:20])
+        tables += (f'<h2>by {d}</h2><table><tr><th>{d}</th><th class="n">applied</th>'
+                   f'<th class="n">judgeable</th><th class="n">replied</th><th class="n">intv</th>'
+                   f'<th class="n">offer</th><th class="n">quiet</th><th class="n">reply rate</th>'
+                   f'</tr>{rows}</table>')
+
+    if s["verdict"] == "not enough data":
+        signal = (f'<p class="tip warn"><b>Does the role score predict a reply?</b> '
+                  f'Not answerable yet — {s["n"]} judgeable applications, need about {s["need"]}. '
+                  f'Record outcomes on <a href="/outcomes">/outcomes</a> and this fills itself in.</p>')
+    else:
+        signal = (f'<p class="tip"><b>Does the role score predict a reply?</b> {s["verdict"]} — '
+                  f'bottom half {s["low_half_rate"]:.0f}% vs top half {s["high_half_rate"]:.0f}% '
+                  f'(split at {s["cutoff"]:.0f}, n={s["n"]}).</p>')
+
+    return _page("Funnel", f"""<h1>📊 Funnel</h1>
+      <p>{o['applied']} applications · {o['companies']} companies ·
+         <b>{o['mature']}</b> old enough to judge (≥{o['window']}d),
+         {o['pending']} still too fresh</p>
+      <p>replied <b>{o['responded']}</b> · interview+ <b>{o['interviewed']}</b> ·
+         offer <b>{o['offered']}</b> · rejected {o['rejected']} · quiet {o['quiet']}</p>
+      {signal}{tables}
+      <p class="small muted">Applications younger than {o['window']} days are excluded from every
+      rate — counting yesterday's silence as a rejection would drag every number to zero.
+      "?" marks a bucket with fewer than {tune['min_n']} judgeable applications.</p>""")
+
+
+@app.get("/api/outcomes")
+def api_outcomes(days: int = 120, conn=Depends(view_conn)):
+    """Proposals only — what the mailbox suggests happened. Writes nothing (see app/outcomes.py)."""
+    from . import outcomes as outcomesmod
+    if not outcomesmod.available(cfg):
+        raise HTTPException(503, "mailbox not configured")
+    try:
+        return outcomesmod.scan(cfg, days=days)
+    except Exception as e:
+        raise HTTPException(502, f"outcome scan failed: {type(e).__name__}: {e}")
+
+
+@app.get("/outcomes", response_class=HTMLResponse)
+def outcomes_page():
+    """Client-rendered: the scan is an IMAP round-trip, so it runs on demand, not on page load."""
+    return _page("Outcomes", """<h1>📥 Outcomes from the inbox</h1>
+      <p class="tip">Reads the mailbox for rejections, interview invites, assessments and offers,
+      and matches each against your open applications. <b>Nothing is written until you click.</b>
+      A rejection email names a company but rarely says which of its roles, so anything
+      ambiguous asks you to pick.</p>
+      <p><button onclick="scan()">Scan inbox</button>
+         <select id="days"><option>60</option><option selected>120</option><option>180</option></select>
+         <span class="small muted">days back</span></p>
+      <div id="out"></div>
+      <script>
+      async function scan(){
+        const o=document.getElementById('out'); o.innerHTML='<p class="muted">scanning…</p>';
+        const r=await fetch('/api/outcomes?days='+document.getElementById('days').value);
+        if(!r.ok){o.innerHTML='<p class="tip warn">'+await r.text()+'</p>';return}
+        const d=await r.json();
+        if(!d.proposals.length){o.innerHTML='<p class="muted">scanned '+d.scanned+' emails, no outcome signals.</p>';return}
+        const cls={high:'hi',medium:'md',low:'lo'};
+        const rank={high:0,medium:1,low:2};
+        d.proposals.sort((a,b)=>rank[a.confidence]-rank[b.confidence]||a.date.localeCompare(b.date));
+        o.innerHTML='<p class="small muted">scanned '+d.scanned+' emails · '+d.proposals.length+' signals</p>'+
+          d.proposals.map((p,i)=>'<div style="border-bottom:1px solid #eef2f6;padding:9px 0">'+
+            '<span class="pill '+cls[p.confidence]+'">'+p.confidence+'</span> '+
+            '<b>'+p.company+'</b> · '+p.signal+' · '+p.date+
+            '<div class="small muted">'+esc(p.subject)+'</div>'+
+            p.roles.map(r=>'<div style="margin-top:4px">'+
+              '<button onclick=\\'commit('+i+',"'+r.job_id+'",this)\\'>record</button> '+
+              '<span class="small">'+esc(r.title)+'</span> '+
+              '<span class="small muted">'+r.job_id+'</span></div>').join('')+
+          '</div>').join('');
+        window._props=d.proposals;
+      }
+      function esc(s){const e=document.createElement('div');e.textContent=s;return e.innerHTML}
+      async function commit(i,job_id,btn){
+        const p=window._props[i];
+        const body={stage:p.stage||(p.signal==='rejection'?null:'responded'),
+                    outcome:p.outcome||null,note:p.signal+': '+p.subject,when:p.date};
+        const r=await fetch('/api/roles/'+encodeURIComponent(job_id)+'/signal',
+          {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+        btn.textContent=r.ok?'recorded ✓':'failed'; btn.disabled=true;
+      }
+      </script>""")
+
+
+@app.get("/api/followups")
+def api_followups(conn=Depends(view_conn)):
+    return {"quiet": followupmod.quiet(cfg, conn), "tuning": followupmod.tuning(cfg)}
+
+
+@app.post("/api/followups/{job_id}/draft")
+def api_followup_draft(job_id: str, channel: str = "email", conn=Depends(view_conn)):
+    """Draft a follow-up note. Drafting only — this endpoint cannot send, and no endpoint here
+    sends a follow-up; the owner copies it out or mails it herself."""
+    try:
+        return followupmod.draft(cfg, conn, job_id, channel=channel)
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"draft failed: {type(e).__name__}: {e}")
+
+
+class FollowupLogIn(BaseModel):
+    channel: str = "email"
+    to_addr: str | None = None
+    subject: str = ""
+    body: str
+
+
+@app.post("/api/followups/{job_id}/log")
+def api_followup_log(job_id: str, body: FollowupLogIn, conn=Depends(view_conn)):
+    """Record that a nudge went out — this is what keeps the two-per-application ceiling and the
+    days-quiet arithmetic honest. Call it when you actually send, not when you draft."""
+    if not store.get_role(conn, job_id):
+        raise HTTPException(404, "unknown job_id")
+    seq = store.followup_add(conn, job_id, channel=body.channel, to_addr=body.to_addr,
+                             subject=body.subject, body=body.body)
+    store.followup_mark_sent(conn, job_id, seq)
+    return {"ok": True, "seq": seq}
+
+
+# Kept out of the page f-string below — JS braces and f-strings don't mix.
+_FOLLOWUP_JS = """
+<script>
+let cur=null;
+async function draft(job_id,btn){
+  const d=document.getElementById('draft');
+  btn.disabled=true; btn.textContent='drafting…';
+  const r=await fetch('/api/followups/'+encodeURIComponent(job_id)+'/draft',{method:'POST'});
+  btn.disabled=false; btn.textContent='draft';
+  if(!r.ok){d.innerHTML='<p class="tip warn">'+esc(await r.text())+'</p>';return}
+  cur=await r.json();
+  const to=cur.contact?(cur.contact.addr+'  ['+cur.contact.source+']')
+                      :('no reply address — '+cur.note);
+  d.innerHTML='<h2>'+esc(cur.company)+' — '+esc(cur.title)+' (nudge #'+cur.seq_would_be+')</h2>'+
+    '<p class="small">to: '+esc(to)+'<br>subject: '+esc(cur.subject)+'</p>'+
+    '<pre id="body">'+esc(cur.body)+'</pre>'+
+    '<button onclick="copyIt()">copy</button> '+
+    '<button class="g" onclick="logIt(this)">I sent this</button> '+
+    '<span class="small muted">logging it is what keeps the 2-nudge cap correct</span>';
+  d.scrollIntoView({behavior:'smooth'});
+}
+function esc(s){const e=document.createElement('div');e.textContent=s||'';return e.innerHTML}
+function copyIt(){navigator.clipboard.writeText(document.getElementById('body').textContent)}
+async function logIt(btn){
+  const r=await fetch('/api/followups/'+encodeURIComponent(cur.job_id)+'/log',
+    {method:'POST',headers:{'Content-Type':'application/json'},
+     body:JSON.stringify({channel:cur.channel,to_addr:cur.contact?cur.contact.addr:null,
+                          subject:cur.subject,body:document.getElementById('body').textContent})});
+  btn.textContent=r.ok?'logged ✓':'failed'; btn.disabled=true;
+}
+</script>"""
+
+
+@app.get("/followups", response_class=HTMLResponse)
+def followups_page(conn=Depends(view_conn)):
+    rows = followupmod.quiet(cfg, conn)
+    t = followupmod.tuning(cfg)
+    if not rows:
+        return _page("Follow-ups", f'<h1>⏳ Gone quiet</h1><p class="tip">Nothing has been quiet '
+                                   f'for {t["after_days"]}+ days yet.</p>')
+    items = "".join(
+        f'<tr><td class="n">{r["weighted_score"] or 0:.0f}</td>'
+        f'<td class="n">{r["days_quiet"]}d</td><td class="n">{r["followups_sent"]}</td>'
+        f'<td><b>{r["company"]}</b><div class="small muted">{r["title"][:70]}</div></td>'
+        f'<td><button onclick=\'draft("{r["job_id"]}",this)\'>draft</button></td></tr>'
+        for r in rows)
+    return _page("Follow-ups", f"""<h1>⏳ Gone quiet</h1>
+      <p class="tip">Applied {t['after_days']}+ days ago, still no reply. The note is drafted from
+      the résumé you actually submitted and the posting — nothing else, so it can't introduce a
+      claim they haven't already read. <b>Nothing sends automatically.</b> Max
+      {t['max_per_app']} per application; after the second silence, record <code>no_response</code>
+      instead of chasing a third time.</p>
+      <table><tr><th class="n">score</th><th class="n">quiet</th><th class="n">sent</th>
+      <th>role</th><th></th></tr>{items}</table>
+      <div id="draft"></div>""" + _FOLLOWUP_JS)
 
 
 @app.get("/health")

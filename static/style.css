@@ -76,6 +76,13 @@ td.actions button.queue { margin-left: 6px; }
 
 td.actions { white-space: nowrap; }
 td.actions button { padding: 2px 7px; margin-left: 2px; }
+/* The one action used most often — the extension can't always mark it, so this is the
+   manual path and it should be impossible to miss among the small icon buttons. */
+td.actions button.mark-applied {
+  background: #d1f2d9; color: #14632c; border: 1px solid #a8dcb6;
+  font-weight: 600; border-radius: 6px; padding: 2px 9px;
+}
+td.actions button.mark-applied:hover { background: #bde9c9; }
 td.actions .variant { max-width: 90px; }
 td.actions .more { max-width: 24px; }
 .status-chip { font-size: 11px; padding: 1px 6px; border-radius: 8px; background: #ececec; margin-right: 4px; }

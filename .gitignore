@@ -8,9 +8,12 @@ data/*.db-shm
 data/logs/
 
 # tailoring artifacts are personal/generated, not source
-output/prompts/*.md
-output/resumes/*.yaml
-output/resumes/*.pdf
+/output/
+
+# local snapshots and generated batch manifests
+*.bak-*
+scratch_priors/*_manifest.json
+scratch_priors/*_job.json
 
 # LOCAL SECRETS — never commit (Anthropic API key for AI autofill)
 secrets.yaml

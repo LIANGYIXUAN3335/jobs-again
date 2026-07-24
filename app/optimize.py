@@ -21,10 +21,18 @@ from . import resume_score, store, tailoring
 
 
 def _surface(tailored: dict, keywords: list[str]) -> int:
-    """Add true-but-missing skill keywords into the tailored skills. Returns how many added."""
+    """Add true-but-missing skill keywords into the tailored skills. Returns how many added.
+    Written in résumé prose (resume_score.SURFACE_AS), not raw canonical tokens — the matcher
+    reads either form, but a human reads this list too."""
     skills = tailored.setdefault("skills", [])
     have = {i.lower() for g in skills for i in g.get("items", [])}
-    fresh = [k for k in keywords if k.lower() not in have]
+    fresh, seen = [], set(have)
+    for k in keywords:
+        label = resume_score.surface_label(k)
+        if label.lower() in seen:
+            continue
+        seen.add(label.lower())
+        fresh.append(label)
     if not fresh:
         return 0
     # drop them into a clearly-labelled group so it reads as a skills list, not stuffing
