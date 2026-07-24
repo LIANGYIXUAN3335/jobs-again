@@ -15,14 +15,15 @@ def main():
     notes_all = cfgmod.load_company_notes(cfg)
     conn = store.connect_jobs(cfg)
     rows = conn.execute(
-        "SELECT job_id, company, title, jd_text, is_remote, location FROM roles").fetchall()
+        "SELECT job_id, company, title, jd_text, is_remote, location, apply_url "
+        "FROM roles").fetchall()
     n = 0
     changed = 0
     for r in rows:
         p = SimpleNamespace(
             title=r["title"] or "", jd_text=r["jd_text"] or "",
             is_remote=bool(r["is_remote"]), company=r["company"] or "",
-            location=r["location"] or "")
+            location=r["location"] or "", apply_url=r["apply_url"] or "")
         notes = scoring.notes_for(r["company"], notes_all)
         s = scoring.score(p, notes, cfg)
         old = conn.execute("SELECT weighted_score FROM roles WHERE job_id=?", (r["job_id"],)).fetchone()

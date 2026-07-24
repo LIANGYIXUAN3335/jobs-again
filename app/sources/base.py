@@ -5,11 +5,14 @@ import html
 import html.parser
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Callable
 
 import httpx
 
-ATS_CODES = {"greenhouse": "gh", "lever": "lv", "ashby": "ab"}
+ATS_CODES = {"greenhouse": "gh", "lever": "lv", "ashby": "ab",
+             "workday": "wd", "smartrecruiters": "sr", "rippling": "rp",
+             "avature": "av"}
 
 USER_AGENT = "jobscan/0.1 (personal job-search tool; low volume)"
 
@@ -26,6 +29,10 @@ class Posting:
     apply_url: str
     department: str = ""
     is_remote: bool = False
+    # Boards whose list endpoint has no JD (Workday, Rippling, SmartRecruiters) set
+    # jd_text="" and provide this callback; the scanner calls it only for postings that
+    # survive the title/location filters, so we never bulk-fetch hundreds of details.
+    fetch_jd: Callable[[], str] | None = field(default=None, repr=False, compare=False)
 
     @property
     def job_id(self) -> str:
