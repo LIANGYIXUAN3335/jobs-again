@@ -95,3 +95,23 @@ def test_back_to_new_and_notes(cfg):
     row = next(r for r in data["rows"] if r["job_id"] == "gh:x:1")
     assert row["status"] == "new"
     assert row["notes"] == "talked to a friend there"   # notes survive status churn
+
+
+def test_fresh_posting_outranks_a_higher_scoring_stale_one(cfg):
+    import datetime
+    today = store.la_today()
+    old = (datetime.date.fromisoformat(today) - datetime.timedelta(days=90)).isoformat()
+    jobs = store.connect_jobs(cfg)
+    stale = role_row("gh:x:1", title="Stale Engineer", score=78.0, first_seen=old)
+    stale["posted_at"] = old
+    fresh = role_row("gh:x:2", title="Fresh Engineer", score=72.0, first_seen=today)
+    fresh["posted_at"] = today
+    store.upsert_roles(jobs, [stale, fresh])
+
+    rows = store.fetch_view(store.connect_view(cfg), cfg)["rows"]
+    by_id = {r["job_id"]: r for r in rows}
+    assert by_id["gh:x:2"]["fresh_bonus"] == 10.0
+    assert by_id["gh:x:1"]["fresh_bonus"] == 0.0
+    # The stale role still scores higher on its own merits — only the ORDER changes.
+    assert by_id["gh:x:1"]["weighted_score"] > by_id["gh:x:2"]["weighted_score"]
+    assert [r["job_id"] for r in rows] == ["gh:x:2", "gh:x:1"]

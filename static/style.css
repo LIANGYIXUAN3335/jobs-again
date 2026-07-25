@@ -11,6 +11,9 @@ code { background: #eee; padding: 0 4px; border-radius: 3px; }
 .topbar h1 { font-size: 16px; margin: 0; }
 .counts a { margin-right: 10px; color: #444; text-decoration: none; padding: 2px 6px; border-radius: 4px; }
 .counts a.on { background: #1a1d21; color: #fff; }
+.counts a.dim { color: #94a3b8; font-size: 12px; margin-right: 6px; }
+.counts a.dim.on { background: #e2e8f0; color: #0f172a; }
+.counts .navsep { color: #cbd5e1; margin-right: 6px; }
 .counts b { font-weight: 600; }
 .runinfo { margin-left: auto; color: #8a8f98; }
 .runinfo .err { color: #c0392b; cursor: help; }
@@ -59,8 +62,16 @@ td.seen { white-space: nowrap; color: #555; }
 .chip.warn { background: #fdecea; color: #b3261e; cursor: help; }
 .chip.hide { background: #e8e8e8; color: #777; }
 .chip.sr { background: #ede9fe; color: #5b21b6; }
+/* freshness boost — ranking only, so it sits BESIDE the score rather than changing it */
+.chip.fresh { background: #e6f4ea; color: #1e7a3a; font-weight: 700; cursor: help; }
+.chip.diversify { background: #ede9fe; color: #6d28d9; font-weight: 700; cursor: help; }
 .chip.tailor { background: #e0f2fe; color: #0369a1; }
 a.chip.tailor.ready { text-decoration: none; background: #d1f2d9; color: #14632c; }
+a.chip.tailor.ready b { font-variant-numeric: tabular-nums; }
+/* résumé↔JD fit-score bands on the resume chip (separate from the job score column) */
+a.chip.tailor.ready.rs-strong { background: #d1f2d9; color: #14632c; }
+a.chip.tailor.ready.rs-ok     { background: #fef3c7; color: #92600a; }
+a.chip.tailor.ready.rs-low    { background: #fde2e0; color: #b3261e; }
 td.actions button.queue { margin-left: 6px; }
 #ingest-btn { padding: 1px 8px; font-size: 12px; }
 .chip button.co-remove { border: none; background: none; padding: 0 0 0 2px; }

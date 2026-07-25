@@ -2,8 +2,10 @@
 Usage: python -m app.web  →  http://127.0.0.1:8787"""
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,6 +19,7 @@ from . import config as cfgmod
 from . import followup as followupmod
 from . import funnel as funnelmod
 from . import gcal as gcalmod
+from . import ideas as ideasmod
 from . import ingest as ingestmod
 from . import mail as sendmail
 from . import mailcode as mailmod
@@ -38,6 +41,9 @@ def url_candidates(url: str) -> list[str]:
     c: list[str] = []
     for pat in (r"gh_jid=(\d+)", r"[?&]token=(\d+)", r"/jobs/(\d+)",
                 r"[?&]pid=(\d+)",                       # Microsoft careers: apply?pid=1970393556941507
+                # Apple: details page /en-us/details/200673880-0836/<slug> and apply flow
+                # /app/en-us/apply/200673880-0836 share the req id — the join between them.
+                r"/(?:details|apply)/(\d{6,}(?:-\d{2,5})?)",
                 # Workday req ids: .../Software-Engineer-II_R-279240, .../job/R-273932/...,
                 # .../Staff-Software-Engineer_REF078668W  → job_id ends ':R-279240'
                 r"[_/]([A-Z]{1,4}-?\d{3,}[A-Za-z0-9]*)"):
@@ -281,8 +287,16 @@ def _lookup_payload(conn, role: dict, top_role_default: bool = False) -> dict:
 
 @app.get("/api/lookup")
 def api_lookup(url: str, conn=Depends(view_conn)):
-    """The extension asks 'what role is this application page?' Returns role + profile."""
+    """The extension asks 'what role is this application page?' Returns role + profile.
+
+    Two strategies: scanner-ATS URLs carry a job id (gh_jid=, /jobs/<n>, pid=, workday req) —
+    match on that. Captured roles (Tesla/Apple/any careers site) don't, but their stored
+    apply_url IS this page — match on the URL itself, raw and canonicalized."""
+    from . import manual as manualmod
     role = store.lookup_role_by_ids(conn, url_candidates(url))
+    if not role:
+        role = store.lookup_role_by_apply_url(
+            conn, [url, manualmod.canonical_capture_url(url)])
     if not role:
         raise HTTPException(404, "no matching role for this URL")
     return _lookup_payload(conn, role)
@@ -411,6 +425,17 @@ def api_cover_letter(job_id: str, words: int = 180, conn=Depends(view_conn)):
     return {"text": text}
 
 
+def outbound_pdf_name(path: str) -> str:
+    """The filename a RECRUITER should see. On disk the tailored PDFs carry the internal
+    bookkeeping tail — "… [bb44fbf66595bca5] - 88.pdf" — and the extension uploads whatever
+    name this endpoint hands it, so applications were going out branded with our own match
+    score. Strip the [id] and the score; keep the human part ("Casey Example - Apple - Apple
+    Data Platform.pdf")."""
+    name = Path(path).name
+    name = re.sub(r"\s*\[[^\]]*\]\s*(?:-\s*\d{1,3}\s*)?(?=\.pdf$)", "", name, flags=re.I)
+    return re.sub(r"\s+(?=\.pdf$)", "", name, flags=re.I)
+
+
 @app.get("/api/roles/{job_id}/resume.pdf")
 def api_resume_pdf(job_id: str, conn=Depends(view_conn)):
     role = store.get_role(conn, job_id)
@@ -419,7 +444,10 @@ def api_resume_pdf(job_id: str, conn=Depends(view_conn)):
     p = role.get("tailored_resume_path")
     if not p or not Path(p).exists():
         raise HTTPException(404, "no tailored PDF yet")
-    return FileResponse(p, media_type="application/pdf", filename=Path(p).name)
+    clean = outbound_pdf_name(p)
+    # x-filename is what the extension names the attached file — the recruiter-facing name.
+    return FileResponse(p, media_type="application/pdf", filename=clean,
+                        headers={"x-filename": clean})
 
 
 class AnswerIn(BaseModel):
@@ -563,12 +591,23 @@ def api_capture(body: CaptureIn):
     jd = (body.jd or "").strip()
     if len(jd) < 80:
         raise HTTPException(400, "couldn't read a real job description on this page")
+    if manualmod.looks_blocked(jd):
+        raise HTTPException(400, "the site's bot protection served an 'Access Denied' page "
+                                 "instead of the job — reload the job page and capture again")
     company = (body.company or _company_from_url(body.url)).strip() or "Captured"
-    title = (body.title or "").strip() or "Software Engineer"
+    # Hash the CANONICAL url — the raw one changes with every search that led to the job,
+    # and each variant used to mint a fresh duplicate role.
+    canon = manualmod.canonical_capture_url(body.url)
+    # Site chrome is not a title (Tesla's first <h1> is its header nav; 67 roles landed as
+    # "…Skip to main content" and the family gate read 'content' as a content-marketing role).
+    # The URL slug is the reliable source when the page's own title looks like chrome.
+    title = (body.title or "").strip()
+    if not title or len(title) > 100 or manualmod.BAD_TITLE.search(title):
+        title = manualmod.title_from_url(canon) or "Software Engineer"
     loc = (body.location or "").strip()
-    jid = "cap:" + hashlib.sha1(body.url.encode()).hexdigest()[:16]
+    jid = "cap:" + hashlib.sha1(canon.encode()).hexdigest()[:16]
     jobs = store.connect_jobs(cfg)
-    manualmod.add_role(cfg, jobs, company, title, jd, apply_url=body.url, location=loc, job_id=jid)
+    manualmod.add_role(cfg, jobs, company, title, jd, apply_url=canon, location=loc, job_id=jid)
     notes = cfgmod.load_company_notes(cfg).get(cfgmod.norm_key(company), {})
     p = SimpleNamespace(title=title, jd_text=jd, is_remote="remote" in loc.lower(),
                         company=company, location=loc, apply_url=body.url)
@@ -678,6 +717,49 @@ def _page(title: str, body: str) -> HTMLResponse:
                         f'<a class="b" href="/">← back to JobScan</a>{body}')
 
 
+@app.get("/ideas", response_class=HTMLResponse)
+def ideas_page(days: int = 7):
+    """Daily idea/project radar (Show HN · GH Trending · Product Hunt · HN front).
+    Reads ideas.db; writes to it only through app.ideas (its single writer)."""
+    conn = ideasmod.connect_ideas(cfg)
+    try:
+        groups = ideasmod.recent_days(conn, days=days)
+        run = ideasmod.last_fetch(conn)
+    finally:
+        conn.close()
+    runinfo = (f'last fetch {run["run_at"][:16]} · new {run["n_new"]}'
+               + (f' · <span style="color:#b91c1c">{run["errors"]}</span>' if run["errors"] else "")
+               if run else "no fetch yet")
+    day_html = ""
+    for g in groups:
+        secs = ""
+        for s in g["sources"]:
+            rows = "".join(
+                f'<li><a href="{it["url"]}" target="_blank" rel="noopener">{it["title"]}</a>'
+                + (f' <span class="muted small">— {it["meta"]}</span>' if it["meta"] else "")
+                + "</li>"
+                for it in s["items"])
+            secs += f'<h2>{s["label"]} <span class="muted small">{len(s["items"])}</span></h2><ul class="ideas">{rows}</ul>'
+        day_html += f'<details {"open" if g is groups[0] else ""}><summary><b>{g["day"]}</b></summary>{secs}</details>'
+    if not groups:
+        day_html = '<p class="tip">Nothing yet — hit fetch, or wait for the 8:30 launchd run.</p>'
+    return _page("Ideas", f"""<h1>💡 Ideas</h1>
+<p class="muted small">{runinfo} ·
+<button onclick="this.disabled=true;this.textContent='fetching…';fetch('/api/ideas/fetch',{{method:'POST'}}).then(()=>location.reload())">fetch now</button></p>
+<style>.ideas{{margin:6px 0 14px;padding-left:20px}}.ideas li{{margin:3px 0}}
+details{{margin:10px 0}}summary{{cursor:pointer}}</style>
+{day_html}""")
+
+
+@app.post("/api/ideas/fetch")
+def api_ideas_fetch():
+    conn = ideasmod.connect_ideas(cfg)
+    try:
+        return ideasmod.fetch_all(conn)
+    finally:
+        conn.close()
+
+
 class SignalIn(BaseModel):
     stage: str | None = None
     outcome: str | None = None
@@ -709,7 +791,7 @@ def api_funnel(by: str = "score,match,company,ats", conn=Depends(view_conn)):
 
 @app.get("/funnel", response_class=HTMLResponse)
 def funnel_page(conn=Depends(view_conn)):
-    dims = ["score", "match", "company", "ats"]
+    dims = ["score", "match", "culture", "company", "ats"]
     rep = funnelmod.report(cfg, conn, dims)
     o, s, tune = rep["overall"], rep["signal"], rep["tuning"]
     if not o["applied"]:
@@ -906,6 +988,124 @@ def followups_page(conn=Depends(view_conn)):
       <table><tr><th class="n">score</th><th class="n">quiet</th><th class="n">sent</th>
       <th>role</th><th></th></tr>{items}</table>
       <div id="draft"></div>""" + _FOLLOWUP_JS)
+
+
+# ---------------------------------------------------------------- interviews (复盘 ⇄ pipeline)
+#
+# The markdown under 面试复盘/ stays the system of record (the interview-review skill writes
+# it; the atoms cron watches it). This page is the INDEX: every interview, its questions and
+# open action items, linked into the role it belongs to. Read-only on the files.
+
+_IV_BASE = None
+
+
+def _iv_base(cfg_) -> Path:
+    global _IV_BASE
+    if _IV_BASE is None:
+        iv = cfg_.get("interviews") or {}
+        _IV_BASE = Path(iv.get("dir") or (cfgmod.ROOT.parent / "面试复盘")).resolve()
+    return _IV_BASE
+
+
+@app.post("/api/interviews/ingest")
+def api_interviews_ingest(conn=Depends(view_conn)):
+    from . import interview_ingest as ivmod
+    return {"ok": True, **ivmod.ingest(cfg, conn)}
+
+
+class LinkIn(BaseModel):
+    job_id: str | None = None            # null unlinks
+
+
+@app.post("/api/interviews/{marker_id}/link")
+def api_interview_link(marker_id: str, body: LinkIn, conn=Depends(view_conn)):
+    if body.job_id and not store.get_role(conn, body.job_id):
+        raise HTTPException(404, "unknown job_id")
+    store.interview_link(conn, marker_id, body.job_id)
+    if body.job_id:
+        st = conn.execute("SELECT status FROM role_state WHERE job_id=?", (body.job_id,)).fetchone()
+        if st and st["status"] in ("applied", "interviewing"):
+            store.record_signal(conn, body.job_id, stage="interview")
+    return {"ok": True}
+
+
+@app.get("/interviews/file", response_class=HTMLResponse)
+def interviews_file(f: str):
+    """Serve one review markdown as plain text. Confined to the 面试复盘 tree — resolve() then
+    require the base as prefix, so ../ and symlink tricks can't read outside it."""
+    base = _iv_base(cfg)
+    p = (base / f).resolve()
+    if not str(p).startswith(str(base) + "/") or not p.is_file():
+        raise HTTPException(404, "no such review file")
+    return HTMLResponse(f"<meta charset='utf-8'><pre style='white-space:pre-wrap;font:13px/1.6 "
+                        f"ui-monospace,monospace;max-width:900px;margin:24px auto;padding:0 16px'>"
+                        f"{p.read_text(encoding='utf-8').replace('&', '&amp;').replace('<', '&lt;')}</pre>")
+
+
+@app.get("/interviews", response_class=HTMLResponse)
+def interviews_page(conn=Depends(view_conn)):
+    rows = store.interviews_overview(conn)
+    if not rows:
+        return _page("Interviews", '<h1>🎤 Interviews</h1><p class="tip">Nothing indexed yet — '
+                     'run <code>python -m app.interview_ingest</code> after a 复盘.</p>')
+    # candidates for the link dropdowns: her active pipeline, newest first
+    cands = [dict(r) for r in conn.execute(
+        "SELECT r.job_id, r.company, r.title FROM jobs.roles r JOIN role_state s"
+        " ON s.job_id=r.job_id WHERE s.status IN ('applied','interviewing')"
+        " ORDER BY s.applied_date DESC LIMIT 400")]
+    opts = "".join(f'<option value="{c["job_id"]}">{c["company"]} — {c["title"][:60]}</option>'
+                   for c in cands)
+    total_open = sum(r["n_actions"] - r["n_done"] for r in rows)
+
+    blocks = []
+    for r in rows:
+        items = store.interview_items_for(conn, r["marker_id"])
+        acts = [i for i in items if i["kind"] == "action"]
+        qs = [i for i in items if i["kind"] in ("tech_q", "ai_q")]
+        act_html = "".join(
+            f'<li class="{ "done" if i["done"] else "" }">{"✅" if i["done"] else "⬜"} '
+            f'{i["text"]}</li>' for i in acts)
+        q_html = "".join(f'<li>{"🤖 " if i["kind"] == "ai_q" else ""}{i["text"]}</li>' for i in qs)
+        src = json.loads(r["sources"] or "{}")
+        links = " · ".join(f'<a href="/interviews/file?f={fn}" target="_blank">{fn.split(".")[0][:28]}</a>'
+                           for fn in src)
+        if r["review_path"]:
+            links = (f'<a href="/interviews/file?f={quote(r["review_path"])}" target="_blank">'
+                     f'📄 transcript</a> · ') + links
+        if r["transcript_url"]:
+            links = (f'<a href="{r["transcript_url"]}" target="_blank" rel="noopener">'
+                     f'🎙 Otter</a> · ') + links
+        role_tag = (f'<span class="pill hi">{r["role_company"]} — {(r["role_title"] or "")[:40]}</span>'
+                    if r["job_id"] else
+                    f'<select class="lk" data-m="{r["marker_id"]}"><option value="">link to a role…</option>{opts}</select>')
+        blocks.append(f"""
+        <div class="iv">
+          <div class="ivh"><b>{r['company']}</b> · {r['happened_on']} · {r['round_type'] or '—'}
+            {role_tag}
+            <span class="small muted">act {r['n_done']}/{r['n_actions']} · q {r['n_questions']} · {links}</span></div>
+          {f'<details><summary class="small">action items</summary><ul class="ivl">{act_html}</ul></details>' if acts else ''}
+          {f'<details><summary class="small">questions asked</summary><ul class="ivl">{q_html}</ul></details>' if qs else ''}
+        </div>""")
+
+    return _page("Interviews", f"""<h1>🎤 Interviews</h1>
+      <p class="tip">每场面试的问题与 action items，索引自 <code>面试复盘/</code>（markdown 是唯一事实源，
+      这里只读）。<b>{total_open} 个 action item 还开着。</b> 勾选状态在 md 里改，跑一次 ingest 就同步。</p>
+      <p><button onclick="ing(this)">re-ingest from 面试复盘/</button></p>
+      <style>.iv{{border-bottom:1px solid #eef2f6;padding:10px 0}}.ivh{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}
+      .ivl{{margin:6px 0 2px;padding-left:18px}}.ivl li{{margin:3px 0}}.ivl li.done{{color:#94a3b8}}
+      select.lk{{font:12px -apple-system,sans-serif;max-width:260px}}</style>
+      {''.join(blocks)}
+      <script>
+      document.querySelectorAll('select.lk').forEach(s=>s.onchange=async()=>{{
+        if(!s.value) return;
+        const r=await fetch('/api/interviews/'+encodeURIComponent(s.dataset.m)+'/link',
+          {{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{job_id:s.value}})}});
+        if(r.ok) location.reload(); else alert(await r.text());
+      }});
+      async function ing(b){{b.disabled=true;b.textContent='ingesting…';
+        const r=await fetch('/api/interviews/ingest',{{method:'POST'}});
+        if(r.ok) location.reload(); else {{alert(await r.text());b.disabled=false;}}}}
+      </script>""")
 
 
 @app.get("/health")

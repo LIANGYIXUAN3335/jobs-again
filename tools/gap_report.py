@@ -68,10 +68,16 @@ def analyse(cfg: dict, conn, *, min_score=0.0, status="", company="") -> dict:
     companies: dict[str, collections.Counter] = collections.defaultdict(collections.Counter)
     unsurfaced = collections.Counter()            # TRUE for her, JD wants it, résumé omits it
     scores = []
+    non_eng = 0                                   # wrong-family roles: their gaps aren't yours
 
     for r in roles:
         jd = r["jd_text"]
-        sc = resume_score.score_resume(jd, ceiling, cfg, base_text)
+        sc = resume_score.score_resume(jd, ceiling, cfg, base_text, title=r["title"])
+        if sc.family == "non_eng":
+            # A consultant/reporter/sales JD's unmet asks are not skills to learn — counting
+            # them would put "stakeholder management" on the learn list next to Rust.
+            non_eng += 1
+            continue
         scores.append(sc.overall)
         need = (2 * len(resume_score._present(jd, resume_score._HARD_SKILLS))
                 + len(resume_score._present(jd, resume_score._SOFT_SKILLS)))
@@ -87,7 +93,7 @@ def analyse(cfg: dict, conn, *, min_score=0.0, status="", company="") -> dict:
 
     triage = {str(k).lower(): v for k, v in (cfg.get("gap_triage") or {}).items()}
     return {
-        "roles": len(roles), "scores": scores,
+        "roles": len(roles) - non_eng, "non_eng": non_eng, "scores": scores,
         "n_roles": n_roles, "points": points, "companies": companies,
         "unsurfaced": unsurfaced, "triage": triage,
     }
@@ -130,10 +136,12 @@ def render(a: dict, *, top: int) -> str:
     L = [
         "# Gap report",
         "",
-        f"{a['roles']} roles scored against the base résumé's ceiling "
+        f"{a['roles']} engineering roles scored against the base résumé's ceiling "
         f"(every true skill + every real bullet). Average ceiling "
         f"**{sum(scores) / max(len(scores), 1):.1f}/100**; "
-        f"{sum(1 for s in scores if s >= 80) * 100 // max(len(scores), 1)}% clear the apply gate.",
+        f"{sum(1 for s in scores if s >= 80) * 100 // max(len(scores), 1)}% clear the apply gate."
+        + (f" ({a['non_eng']} non-engineering-titled roles excluded — their asks are not your gaps.)"
+           if a.get("non_eng") else ""),
         "",
         "\"Match pts at stake\" = how much résumé match score closing that gap would recover "
         "across the whole corpus. It is an upper bound (coverage caps at 100), so read it as a "

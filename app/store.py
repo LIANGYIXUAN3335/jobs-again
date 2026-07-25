@@ -6,14 +6,30 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import sqlite3
 from zoneinfo import ZoneInfo
 
 from . import config as cfgmod
+from . import scoring
 from .config import db_path, norm_key, user_db_path
 
 LA = ZoneInfo("America/Los_Angeles")
 STATUSES = ["new", "applied", "interviewing", "skip", "rejected"]
+
+# The tailored PDF's résumé↔JD fit score (0-100, from resume_score.py) is baked into the
+# filename tail as " - NN.pdf" at ingest time. Parse it back out for display — this is a
+# SEPARATE number from the role's weighted_score (which is preference fit, not résumé fit).
+_RESUME_SCORE_RE = re.compile(r" - (\d{1,3})\.pdf$", re.IGNORECASE)
+
+
+def resume_score_from_path(path: str | None) -> int | None:
+    """Return the résumé fit score encoded in a tailored PDF filename, or None."""
+    if not path:
+        return None
+    m = _RESUME_SCORE_RE.search(str(path))
+    return int(m.group(1)) if m else None
+
 CLOSED_STATUSES = {"applied", "skip", "rejected"}
 
 # What happened AFTER applying. `status` answers "is this still in my review queue"; these
@@ -28,7 +44,7 @@ OUTCOMES = ["in_progress", "rejected", "no_response", "offer", "hired", "decline
 ROLE_COLS = [
     "job_id", "ats", "company", "company_norm", "title", "title_norm", "department",
     "location", "is_remote", "seniority", "apply_url", "jd_text", "jd_hash",
-    "first_seen", "last_seen", "s_stability", "s_culture", "s_depth", "s_wlb",
+    "posted_at", "first_seen", "last_seen", "s_stability", "s_culture", "s_depth", "s_wlb",
     "weighted_score", "verdict", "why", "caution", "scored_at", "updated_at",
 ]
 
@@ -37,7 +53,7 @@ CREATE TABLE IF NOT EXISTS roles (
   job_id TEXT PRIMARY KEY, ats TEXT, company TEXT, company_norm TEXT,
   title TEXT, title_norm TEXT, department TEXT, location TEXT,
   is_remote INTEGER DEFAULT 0, seniority TEXT, apply_url TEXT,
-  jd_text TEXT, jd_hash TEXT, first_seen TEXT, last_seen TEXT,
+  jd_text TEXT, jd_hash TEXT, posted_at TEXT, first_seen TEXT, last_seen TEXT,
   s_stability REAL, s_culture REAL, s_depth REAL, s_wlb REAL,
   weighted_score REAL, verdict TEXT, why TEXT, caution TEXT,
   scored_at TEXT, updated_at TEXT
@@ -68,6 +84,29 @@ CREATE TABLE IF NOT EXISTS followups (
   channel TEXT, to_addr TEXT, subject TEXT, body TEXT,
   PRIMARY KEY (job_id, seq)
 );
+-- Interview reviews (面试复盘), indexed INTO the pipeline. The markdown files under
+-- 面试复盘/ stay the system of record (the interview-review skill writes them, the atoms
+-- card cron watches them); these tables are the join layer: which jobscan role each
+-- interview belongs to, plus its questions/action items surfaced in the UI. Re-ingest is
+-- idempotent (items replaced per marker; a manually-set job_id link always survives).
+CREATE TABLE IF NOT EXISTS interviews (
+  marker_id TEXT PRIMARY KEY,          -- the atoms-source id ("2026-07-06-amazon"), or derived
+  job_id TEXT,                         -- linked jobscan role; NULL until matched
+  company TEXT, happened_on TEXT, round_type TEXT,
+  sources TEXT,                        -- json {file: heading} — where the sections live
+  transcript_url TEXT,                 -- Otter share link, from 面试复盘/README.md
+  review_path TEXT,                    -- per-interview review/transcript md, relative to 复盘 dir
+  created_at TEXT, updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS interview_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  marker_id TEXT NOT NULL,
+  kind TEXT NOT NULL,                  -- action | tech_q | ai_q
+  text TEXT NOT NULL,
+  done INTEGER DEFAULT 0,              -- actions only, read from the checkbox in the md
+  src_file TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_interview_items ON interview_items(marker_id);
 CREATE TABLE IF NOT EXISTS applied_companies (
   name_norm TEXT PRIMARY KEY, display_name TEXT, added_at TEXT
 );
@@ -174,27 +213,37 @@ def _connect(path) -> sqlite3.Connection:
 def connect_jobs(cfg: dict) -> sqlite3.Connection:
     conn = _connect(db_path(cfg))
     conn.executescript(JOBS_SCHEMA)
+    _migrate(conn, _JOBS_MIGRATIONS)
     return conn
 
 
-# Columns added to role_state after the table already existed in the wild. CREATE TABLE IF NOT
-# EXISTS is a no-op on an existing table, so they have to be ALTERed in. Additive only —
-# nothing here ever drops or rewrites a column, so an old DB keeps every status she has set.
+# Columns added to a table after it already existed in the wild. CREATE TABLE IF NOT EXISTS is
+# a no-op on an existing table, so they have to be ALTERed in. Additive only — nothing here
+# ever drops or rewrites a column, so an old DB keeps every status she has set.
 _USER_MIGRATIONS = [
     ("role_state", "stage", "TEXT"),
     ("role_state", "outcome", "TEXT"),
     ("role_state", "outcome_note", "TEXT DEFAULT ''"),
     ("role_state", "first_response_at", "TEXT"),
     ("role_state", "last_contact_at", "TEXT"),
+    ("interviews", "transcript_url", "TEXT"),
+    ("interviews", "review_path", "TEXT"),
+]
+_JOBS_MIGRATIONS = [
+    ("roles", "posted_at", "TEXT"),
 ]
 
 
-def _migrate_user(conn: sqlite3.Connection) -> None:
-    for table, col, decl in _USER_MIGRATIONS:
+def _migrate(conn: sqlite3.Connection, migrations: list[tuple[str, str, str]]) -> None:
+    for table, col, decl in migrations:
         have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         if col not in have:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     conn.commit()
+
+
+def _migrate_user(conn: sqlite3.Connection) -> None:
+    _migrate(conn, _USER_MIGRATIONS)
 
 
 def connect_user(cfg: dict) -> sqlite3.Connection:
@@ -358,6 +407,69 @@ def record_signal(conn, job_id: str, *, stage: str | None = None, outcome: str |
     return upsert_state(conn, job_id, **fields)
 
 
+# ---------- interviews (复盘 index; md files stay the source of truth) ----------
+
+def interview_upsert(conn, *, marker_id: str, company: str, happened_on: str,
+                     round_type: str, sources: str, job_id: str | None = None,
+                     transcript_url: str | None = None, review_path: str | None = None) -> None:
+    """Insert or refresh one interview. A job_id already set (auto-matched earlier or linked
+    by hand in the UI) is never cleared by a re-ingest — only filled when currently NULL.
+    transcript_url / review_path: a value parsed from the files wins; None keeps what's there."""
+    now = la_now_iso()
+    row = conn.execute("SELECT job_id FROM interviews WHERE marker_id=?", (marker_id,)).fetchone()
+    if row:
+        conn.execute(
+            "UPDATE interviews SET company=?, happened_on=?, round_type=?, sources=?,"
+            " job_id=COALESCE(job_id, ?), transcript_url=COALESCE(?, transcript_url),"
+            " review_path=COALESCE(?, review_path), updated_at=? WHERE marker_id=?",
+            (company, happened_on, round_type, sources, job_id,
+             transcript_url, review_path, now, marker_id))
+    else:
+        conn.execute(
+            "INSERT INTO interviews (marker_id, job_id, company, happened_on, round_type,"
+            " sources, transcript_url, review_path, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (marker_id, job_id, company, happened_on, round_type, sources,
+             transcript_url, review_path, now, now))
+    conn.commit()
+
+
+def interview_replace_items(conn, marker_id: str, items: list[dict]) -> None:
+    conn.execute("DELETE FROM interview_items WHERE marker_id=?", (marker_id,))
+    conn.executemany(
+        "INSERT INTO interview_items (marker_id, kind, text, done, src_file)"
+        " VALUES (?,?,?,?,?)",
+        [(marker_id, i["kind"], i["text"], int(i.get("done", 0)), i.get("src_file", ""))
+         for i in items])
+    conn.commit()
+
+
+def interview_link(conn, marker_id: str, job_id: str | None) -> None:
+    conn.execute("UPDATE interviews SET job_id=?, updated_at=? WHERE marker_id=?",
+                 (job_id, la_now_iso(), marker_id))
+    conn.commit()
+
+
+def interviews_overview(conn) -> list[dict]:
+    """Every ingested interview + item counts + the linked role (when matched)."""
+    rows = [dict(r) for r in conn.execute(
+        "SELECT i.*,"
+        " (SELECT COUNT(*) FROM interview_items x WHERE x.marker_id=i.marker_id AND x.kind='action') n_actions,"
+        " (SELECT COUNT(*) FROM interview_items x WHERE x.marker_id=i.marker_id AND x.kind='action' AND x.done=1) n_done,"
+        " (SELECT COUNT(*) FROM interview_items x WHERE x.marker_id=i.marker_id AND x.kind IN ('tech_q','ai_q')) n_questions,"
+        " r.title AS role_title, r.company AS role_company, s.status AS role_status"
+        " FROM interviews i"
+        " LEFT JOIN jobs.roles r ON r.job_id = i.job_id"
+        " LEFT JOIN role_state s ON s.job_id = i.job_id"
+        " ORDER BY i.happened_on DESC, i.marker_id")]
+    return rows
+
+
+def interview_items_for(conn, marker_id: str) -> list[dict]:
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM interview_items WHERE marker_id=? ORDER BY kind, id", (marker_id,))]
+
+
 # ---------- follow-ups (draft-only; nothing here sends) ----------
 
 def followups_for(conn, job_id: str) -> list[dict]:
@@ -472,6 +584,17 @@ def fetch_view(
         r["hidden_company"] = r["company_norm"] in applied_cos
         cd = cooldown_cos.get(r["company_norm"])
         r["cooldown"] = cd                          # {until, reason} or None
+        r["resume_score"] = resume_score_from_path(r.get("tailored_resume_path"))
+        # Recency boost, applied to the RANK only — weighted_score/verdict stay untouched so
+        # they mean the same thing this week as last week. See scoring.freshness().
+        # Hand-captured/manual roles get NO first_seen fallback: their first_seen is the
+        # moment the owner clicked capture, not the posting date — only a real posted_at
+        # (parsed from the JD) may earn them the boost.
+        f = scoring.freshness(r.get("posted_at"), r.get("first_seen"), cfg, today=today,
+                              allow_inferred=not r["job_id"].startswith(("cap:", "manual:")))
+        r["fresh"] = f
+        r["fresh_bonus"] = f["bonus"]
+        r["rank_score"] = (r["weighted_score"] or 0) + f["bonus"]
         r["badge_ref"] = None
         hidden_sig = False
         if eff == "new" and sig_mode != "off":
@@ -529,12 +652,58 @@ def fetch_view(
                 continue
         out.append(r)
 
+    # --- diversify: a bounded EXPLORATION budget (owner's ask, 2026-07-25). The weights are
+    # pure exploitation — culture 1.40 means low-culture companies never surface, so the funnel
+    # can never test whether its priors are actually true for HER. Rule: a company with ZERO
+    # applications and a low average role score gets +`bonus` on ONE role (its best), at most
+    # `max_picks` companies at a time. Rank-only, like freshness — weighted_score stays honest
+    # for the funnel. Self-retiring by design: the first application ends that company's
+    # subsidy, so each bonus buys exactly one probe. Readout: funnel's culture-prior dimension.
+    div_cfg = (cfg.get("scoring") or {}).get("diversify") or {}
+    div_picks: list[dict] = []
+    if div_cfg.get("enabled", True):
+        applied_by_co = {r["company_norm"] for r in rows
+                        if (r["own_status"] or "new") in ("applied", "interviewing")}
+        co_scores: dict[str, list] = {}
+        top_by_co: dict[str, dict] = {}
+        for r in rows:
+            if r["verdict"] != "drop" and r["weighted_score"] is not None:
+                co_scores.setdefault(r["company_norm"], []).append(r["weighted_score"])
+            if r.get("in_review") and (r["company_norm"] not in top_by_co
+                                       or r["rank_score"] > top_by_co[r["company_norm"]]["rank_score"]):
+                top_by_co[r["company_norm"]] = r
+        mean_below = float(div_cfg.get("company_mean_below", 62))
+        floor_ = float(div_cfg.get("min_role_score", 50))
+        cands = []
+        for cn, top in top_by_co.items():
+            if cn in applied_by_co or cn not in co_scores:
+                continue
+            mean = sum(co_scores[cn]) / len(co_scores[cn])
+            if mean >= mean_below or (top["weighted_score"] or 0) < floor_:
+                continue
+            cands.append((mean, top))
+        # Worst-priced companies first — the owner's ask was the "culture 特别差" tier, and
+        # that's also where a reply carries the most information about mispriced priors. A
+        # strongest-wildcard-first order was tried and spent the whole budget on mildly-low
+        # companies (Okta/Autodesk at prior ~3.0), which tests nothing. min_role_score is the
+        # quality floor that keeps this from becoming applications she can't win.
+        cands.sort(key=lambda t: t[0])
+        bonus = float(div_cfg.get("bonus", 15))
+        for mean, top in cands[:int(div_cfg.get("max_picks", 6))]:
+            top["diversify"] = {"bonus": bonus, "company_mean": round(mean, 1)}
+            top["rank_score"] += bonus
+            div_picks.append({"company": top["company"], "job_id": top["job_id"],
+                              "title": top["title"], "score": top["weighted_score"],
+                              "company_mean": round(mean, 1)})
+
     if sort == "company":
-        out.sort(key=lambda r: (r["company"], -(r["weighted_score"] or 0)))
+        out.sort(key=lambda r: (r["company"], -r["rank_score"]))
     elif sort == "first_seen":
-        out.sort(key=lambda r: (r["first_seen"] or "", r["weighted_score"] or 0), reverse=True)
-    else:
+        out.sort(key=lambda r: (r["first_seen"] or "", r["rank_score"]), reverse=True)
+    elif sort == "base_score":
         out.sort(key=lambda r: (r["weighted_score"] or 0, r["first_seen"] or ""), reverse=True)
+    else:
+        out.sort(key=lambda r: (r["rank_score"], r["first_seen"] or ""), reverse=True)
 
     # --- per-company cap: in the review tab, show at most `max` roles per company (top by
     # score), frozen for `window_days` so you work through one batch before the next surfaces.
@@ -561,7 +730,7 @@ def fetch_view(
                 # until `window_days` pass (your "re-search next week"). Cleared ones just drop out.
                 active[cn] = rec["job_ids"] & still_new
             else:
-                top = sorted(rs, key=lambda x: -(x["weighted_score"] or 0))[:cap_max]
+                top = sorted(rs, key=lambda x: -x["rank_score"])[:cap_max]
                 ids = {x["job_id"] for x in top}
                 batch_set(conn, cn, today, ids)
                 active[cn] = ids
@@ -581,6 +750,7 @@ def fetch_view(
         "companies": companies,
         "applied_companies": sorted(applied_cos.values(), key=str.lower),
         "cap_info": cap_info,
+        "diversify_picks": div_picks,
         "run": last_run(conn),
         "today": today,
     }
@@ -588,7 +758,12 @@ def fetch_view(
 
 def lookup_role_by_ids(conn: sqlite3.Connection, candidates: list[str]) -> dict | None:
     """Find a role whose raw ATS id (last segment of job_id) matches any candidate
-    pulled from an application-page URL. Prefer one that already has a tailored PDF."""
+    pulled from an application-page URL. Prefer one that already has a tailored PDF.
+
+    Second pass: the candidate id appearing inside a stored APPLY_URL. Captured roles'
+    job_ids are hashes (cap:…) that never contain the ATS id, but their apply_url does —
+    Apple's apply flow (/app/en-us/apply/200673880-0836) and its details page
+    (/en-us/details/200673880-0836/<slug>) share the req id, and that id is the only join."""
     hits = []
     for cand in candidates:
         for r in conn.execute(
@@ -599,8 +774,76 @@ def lookup_role_by_ids(conn: sqlite3.Connection, candidates: list[str]) -> dict 
         ):
             hits.append(dict(r))
     if not hits:
+        for cand in candidates:
+            if len(cand) < 6:
+                continue                       # short tokens would match half the corpus
+            # Path-delimited for medium ids; UUID-length ids (Deel's ?ats_id=<uuid>) are
+            # globally unique enough to match anywhere in the URL, including after an '='.
+            pat = f"%{cand}%" if len(cand) >= 12 else f"%/{cand}%"
+            for r in conn.execute(
+                "SELECT r.*, s.status AS own_status, s.tailor_status, s.tailored_resume_path"
+                " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
+                " WHERE r.apply_url LIKE ?",
+                (pat,),
+            ):
+                hits.append(dict(r))
+    if not hits:
         return None
     hits.sort(key=lambda d: 0 if d.get("tailored_resume_path") else 1)
+    d = hits[0]
+    d["status"] = d.pop("own_status") or "new"
+    return d
+
+
+def _canon_apply_url(url: str) -> str:
+    """Same normalization as manual.canonical_capture_url (kept local — manual imports store,
+    so importing back would be a cycle): keep only pid= when present (Eightfold boards differ
+    ONLY by pid), else drop the query; always drop the fragment and trailing slash."""
+    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+    s = urlsplit((url or "").strip())
+    q = dict(parse_qsl(s.query))
+    query = urlencode({"pid": q["pid"]}) if "pid" in q else ""
+    return urlunsplit((s.scheme, s.netloc, s.path.rstrip("/"), query, ""))
+
+
+def lookup_role_by_apply_url(conn: sqlite3.Connection, urls: list[str]) -> dict | None:
+    """Match the page the extension is on to a role by its stored apply_url.
+
+    The id-based lookup only understands scanner-ATS URL shapes (gh_jid=, /jobs/<n>, pid=…).
+    Captured roles (Tesla, Apple, any careers site) carry no such id — but their apply_url IS
+    the page they were captured from, so the URL itself is the join key. Both sides are
+    canonicalized, then: exact match, or the page is DEEPER than the stored URL at a '/'
+    boundary (…/job/x/apply). Never the reverse — a list page is a prefix of every job's URL
+    and must not resolve to one. Prefer a role with a tailored PDF, same as the id lookup."""
+    cands = [c for c in dict.fromkeys(_canon_apply_url(u) for u in urls if u) if c]
+    if not cands:
+        return None
+    stored = conn.execute(
+        "SELECT job_id, apply_url FROM jobs.roles"
+        " WHERE apply_url IS NOT NULL AND apply_url != ''").fetchall()
+    hit_ids: list[str] = []
+    for r in stored:
+        sc = _canon_apply_url(r["apply_url"])
+        if not sc:
+            continue
+        for u in cands:
+            if u == sc or u.startswith(sc + "/"):
+                hit_ids.append(r["job_id"])
+                break
+    if not hit_ids:
+        return None
+    hits = []
+    for jid in hit_ids:
+        r = conn.execute(
+            "SELECT r.*, s.status AS own_status, s.tailor_status, s.tailored_resume_path"
+            " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
+            " WHERE r.job_id = ?", (jid,)).fetchone()
+        if r:
+            hits.append(dict(r))
+    if not hits:
+        return None
+    hits.sort(key=lambda d: (0 if d.get("tailored_resume_path") else 1,
+                             -len(d.get("apply_url") or "")))   # longest (most specific) match
     d = hits[0]
     d["status"] = d.pop("own_status") or "new"
     return d

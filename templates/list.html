@@ -11,18 +11,24 @@
 <header class="topbar">
   <h1>JobScan</h1>
   <nav class="counts">
+    {# Module 1 — the PIPELINE: one object (a role) moving through stages. #}
     <a href="/?status=new" class="{{ 'on' if params.status=='new' }}">review <b>{{ counts.new }}</b></a>
     <a href="/?status=applied" class="{{ 'on' if params.status=='applied' }}">applied <b>{{ counts.applied }}</b></a>
     <a href="/?status=interviewing" class="{{ 'on' if params.status=='interviewing' }}">interviewing <b>{{ counts.interviewing }}</b></a>
-    <a href="/?status=skip" class="{{ 'on' if params.status=='skip' }}">skip <b>{{ counts.skip }}</b></a>
-    <a href="/?status=rejected" class="{{ 'on' if params.status=='rejected' }}">rejected <b>{{ counts.rejected }}</b></a>
-    <a href="/?status=all" class="{{ 'on' if params.status=='all' }}">all <b>{{ total_roles }}</b></a>
-    <a href="/apply" style="margin-left:auto">🚀 apply queue</a>
-    <a href="/browse">🌐 browse</a>
-    <a href="/replies">📥 replies</a>
+    <a href="/interviews" title="每场面试的问题与 action items，索引自 面试复盘/">🎤 复盘</a>
+    <span class="navsep">·</span>
+    {# closed states — demoted: reachable, not first-class #}
+    <a class="dim" href="/?status=skip" title="roles you passed on">skip {{ counts.skip }}</a>
+    <a class="dim" href="/?status=rejected" title="closed with a rejection">rej {{ counts.rejected }}</a>
+    <a class="dim" href="/?status=all" title="everything, with hide-reasons">all {{ total_roles }}</a>
+    {# Module 2 — feeders & follow-through tools #}
+    <a href="/browse" style="margin-left:auto" title="careers pages the scanner can't reach — capture from there">🌐 browse</a>
     <a href="/outcomes" title="what the inbox says happened to your applications">📮 outcomes</a>
     <a href="/followups" title="applications that have gone quiet">⏳ quiet</a>
+    <a class="dim" href="/replies" title="inbox reply drafts (needs thread context — parked)">📥 replies</a>
+    {# Module 3 — analytics & extras #}
     <a href="/funnel" title="applied → reply → interview → offer, by score band">📊 funnel</a>
+    <a class="dim" href="/ideas" title="daily idea radar: Show HN · GH Trending · Product Hunt">💡</a>
   </nav>
   <div class="runinfo">
     {% if run %}
@@ -72,7 +78,7 @@
   </select>
   <input name="min_score" type="number" min="0" max="100" step="5" value="{{ params.min_score }}" placeholder="min score">
   <select name="sort">
-    {% for v, label in [('score','sort: score'), ('first_seen','sort: newest'), ('company','sort: company')] %}
+    {% for v, label in [('score','sort: score + fresh'), ('base_score','sort: score only'), ('first_seen','sort: newest'), ('company','sort: company')] %}
       <option value="{{ v }}" {{ 'selected' if params.sort==v }}>{{ label }}</option>
     {% endfor %}
   </select>
@@ -102,12 +108,12 @@
     {% if r.badge_ref %}<span class="chip warn" title="A DIFFERENT posting (job {{ r.badge_ref.job_id }}{% if r.badge_ref.date %}, {{ r.badge_ref.date }}{% endif %}) with the same company + same title — you marked that one “{{ r.badge_ref.status }}”. THIS is a separate/re-listed job ID, so it stays in review.">⚠ same title · {{ r.badge_ref.status }} before</span>{% endif %}
     {% if r.hidden_company %}<span class="chip hide" title="company is in the hidden list">co-hidden</span>{% endif %}
     {% if r.cooldown %}<span class="chip warn" title="application cooldown — {{ r.cooldown.reason }}. Scanner skips this company and it's hidden from review until then.">⏳ cooldown to {{ r.cooldown.until }}</span>{% endif %}
-    {% if r.tailor_status == 'ready' %}<a class="chip tailor ready" href="/api/roles/{{ r.job_id }}/resume.pdf" target="_blank" title="download tailored PDF">📄 resume</a>
+    {% if r.tailor_status == 'ready' %}<a class="chip tailor ready{% if r.resume_score is not none %} rs-{{ 'strong' if r.resume_score >= 85 else ('ok' if r.resume_score >= 75 else 'low') }}{% endif %}" href="/api/roles/{{ r.job_id }}/resume.pdf" target="_blank" title="download tailored PDF · résumé↔JD fit score {{ r.resume_score if r.resume_score is not none else '?' }}/100 (85+ strong, 75-84 ok, &lt;75 weak) — separate from the job score on the left">📄 resume{% if r.resume_score is not none %} <b>{{ r.resume_score }}</b>{% endif %}</a>
     {% elif r.tailor_status and r.tailor_status != 'none' %}<span class="chip tailor" title="prompt written to output/prompts — generate with Claude Code, then Ingest">{{ r.tailor_status }}</span>{% endif %}
     <a class="apply" href="{{ r.apply_url }}" target="_blank" rel="noopener" title="open application page">↗</a>
   </td>
-  <td class="loc">{% if r.is_remote %}<span class="chip remote">remote</span>{% endif %}<span title="{{ r.location }}">{{ r.location|truncate(34, True) }}</span></td>
-  <td class="num score"><b>{{ '%.0f'|format(r.weighted_score or 0) }}</b></td>
+  <td class="loc">{% if r.is_remote %}<span class="chip remote">remote</span>{% endif %}<span title="{{ r.location or '' }}">{{ (r.location or '')|truncate(34, True) }}</span></td>
+  <td class="num score"><b>{{ '%.0f'|format(r.weighted_score or 0) }}</b>{% if r.fresh_bonus %}<span class="chip fresh" title="freshness boost +{{ '%.0f'|format(r.fresh_bonus) }} — {{ 'posted' if r.fresh.posted_known else 'first seen' }} {{ r.fresh.date }} ({{ r.fresh.age_days }}d ago). Ranking only: the {{ '%.0f'|format(r.weighted_score or 0) }} on the left is the job's own score and does not change as it ages.">+{{ '%.0f'|format(r.fresh_bonus) }}</span>{% endif %}{% if r.diversify %}<span class="chip diversify" title="🎲 diversify +{{ '%.0f'|format(r.diversify.bonus) }} — first-ever application to {{ r.company }} (company avg score {{ r.diversify.company_mean }}, zero applications so far). One wildcard per company, at most a handful at a time; the subsidy disappears the moment any application goes out. Ranking only — the score on the left is the job's own and is unchanged.">🎲+{{ '%.0f'|format(r.diversify.bonus) }}</span>{% endif %}</td>
   <td class="chips" title="stability {{ r.s_stability }} · culture {{ r.s_culture }} · depth {{ r.s_depth }} · wlb {{ r.s_wlb }}">
     {{ r.s_stability }}·{{ r.s_culture }}·{{ r.s_depth }}·{{ r.s_wlb }}
   </td>
@@ -116,7 +122,7 @@
     {% if r.why %}<div class="why" title="{{ r.why }}">{{ r.why|truncate(60, True) }}</div>{% endif %}
     {% if r.caution %}<div class="caution" title="{{ r.caution }}">{{ r.caution|truncate(60, True) }}</div>{% endif %}
   </td>
-  <td class="seen">{{ r.first_seen }}{% if r.first_seen == today %} <span class="chip new">today</span>{% endif %}</td>
+  <td class="seen">{% if r.posted_at %}<span title="posted on the board {{ r.posted_at }}">📅 {{ r.posted_at }}</span>{% else %}<span title="this board publishes no posting date — showing when the scanner first saw it">{{ (r.first_seen or '')[:10] }}</span>{% endif %}{% if r.first_seen == today %} <span class="chip new">today</span>{% endif %}</td>
   <td class="actions">
     <span class="status-chip" data-status="{{ r.status }}">{{ r.status }}</span>
     <select class="variant" title="resume variant recorded when marking applied">
