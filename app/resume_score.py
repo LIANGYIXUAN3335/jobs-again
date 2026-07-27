@@ -134,6 +134,85 @@ _TITLE_TERMS = ["software engineer", "backend", "back-end", "back end", "distrib
                 "developer", "services", "database", "reliability"]
 
 
+# ---------- role family: is this even the job this résumé is for? ----------
+#
+# Found the hard way (2026-07-24): a Plaid REPORTER posting scored 94/100 against her backend
+# résumé — the same as real backend roles. Keyword coverage can only answer "of what the JD asks
+# in our vocabulary, how much does the résumé cover"; a journalism JD asks for almost nothing in
+# our vocabulary, so coverage saturates at ~100 on 2 matched terms. No amount of coverage math
+# fixes that, because the question it can't ask is categorical: WRONG ROLE FAMILY.
+#
+# So the family check is title-driven and explicit. Empirically validated against all 2875
+# titles in the DB (155 flagged, every one eyeballed). JD-side corroboration was measured and
+# rejected: sales-engineer JDs name-drop 3+ languages while some real dev JDs name zero, so JD
+# evidence can't tell those apart — the title can.
+#
+# Precedence (first match wins):
+#   0. cfg resume_scoring.family_eng_allow — owner's substring whitelist, for the occasional
+#      company that titles a real dev role like a field role (e.g. Adobe's
+#      "Senior Application Engineer - Photoshop" is plausibly a product SWE).
+#   1. ENG_CORE  — "<eng-prefix> engineer/developer" adjacency: software/backend/production/….
+#      Protects "Sr. Production Engineer, Solutions Engineering" (the team suffix does not
+#      outvote the role noun) and "Software Engineer, Payments Partner Integrations".
+#   2. SALESY    — customer-facing engineer compounds (sales/solutions/support/success/field/
+#      customer/partner/applications engineer, developer advocate/relations, business
+#      developer). "(?<!software )applications? engineer" spares Workday's real
+#      "Software Application Engineer".
+#   3. bare engineer/developer/programmer word → eng.
+#   4. NON_ENG   — consultant/strategist/reporter/analyst/sales/PM/recruiter/… families.
+#   5. unknown   — no cap, but no free title points either.
+_FAMILY_ENG_CORE = re.compile(
+    r"\b(?:software|backend|back.?end|full.?stack|production|infra(?:structure)?|platform|"
+    r"systems?|data|security|cloud|reliability|site.?reliability|machine.?learning|ml|ai|"
+    r"network|storage|database|devops|embedded|firmware|distributed|forward.?deployed)"
+    r"[- ]engineer|\bswe\b|\bsde\b|member of technical staff|software developer", re.I)
+_FAMILY_SALESY = re.compile(
+    r"(?<!software )applications?[- ]engineer|"
+    # gtm/revenue added 2026-07-25: ClickHouse's "GTM Engineer, AI & Automation" (go-to-market)
+    # slipped through on the bare 'engineer' rule and became a diversify wildcard.
+    r"\b(?:sales|solutions?|support|success|field|customer|partner|gtm|revenue)[- ]engineer|"
+    r"\bdeveloper[- ](?:advocate|relations|marketing|evangelist)|\bbusiness[- ]developer",
+    re.I)
+_FAMILY_ENG_WORD = re.compile(
+    r"\bengineer(?:ing)?\b|\bdeveloper\b|\bprogrammer\b|\btechnologist\b", re.I)
+_FAMILY_NON_ENG = re.compile(
+    r"\breporter\b|\bjournalist\b|\beditor\b|\bwriter\b|\bcontent\b|\bmarketing\b|\bbrand\b|"
+    r"\bcommunications?\b|public relations|\bsales\b|account (?:executive|manager|director)|"
+    r"business development|\brepresentative\b|\bpartner\b|\bpartnerships?\b|\bconsultant\b|"
+    r"\bconsulting\b|\badvisors?\b|\badvisory\b|\bstrategist\b|\bstrategy\b|\bevangelist\b|"
+    r"\badvocate\b|\banalyst\b|\brecruit(?:er|ing)?\b|\bsourcer\b|\btalent\b|\bpeople\b|"
+    r"human resources|\bhr\b|\blegal\b|\bcounsel\b|\battorney\b|\bparalegal\b|\bfinance\b|"
+    r"\bfinancial\b|\baccountant\b|\baccounting\b|\bpayroll\b|\btreasury\b|\btax\b|"
+    r"\bprocurement\b|\bbuyer\b|\bdesigner\b|\bux\b|\bui\b|product manager|product management|"
+    r"program manager|project manager|product marketing|product owner|chief of staff|"
+    r"executive assistant|\badministrative\b|office (?:manager|coordinator)|\bworkplace\b|"
+    r"\bcommunity\b|customer (?:success|experience|support)|support specialist|success manager|"
+    r"\btrainer\b|\binstructor\b|\bcoach\b|\btechnician\b|\bfellows?\b|\bfellowship\b|"
+    r"\bresearcher\b|\bscientist\b|\binvestigator\b|\bsupervisor\b|\bassociate\b|\bcto\b",
+    re.I)
+
+
+def role_family(title: str | None, cfg: dict | None = None) -> str:
+    """'eng' | 'non_eng' | 'unknown' — from the role TITLE (the JD can't be trusted for this;
+    see the block comment above)."""
+    t = (title or "").strip()
+    if not t:
+        return "unknown"
+    allow = ((cfg or {}).get("resume_scoring") or {}).get("family_eng_allow") or []
+    tl = t.lower()
+    if any(str(a).lower() in tl for a in allow):
+        return "eng"
+    if _FAMILY_ENG_CORE.search(t):
+        return "eng"
+    if _FAMILY_SALESY.search(t):
+        return "non_eng"
+    if _FAMILY_ENG_WORD.search(t):
+        return "eng"
+    if _FAMILY_NON_ENG.search(t):
+        return "non_eng"
+    return "unknown"
+
+
 def _find(text: str, variants: list[str]) -> bool:
     """A variant containing regex metacharacters is used as a raw pattern — that's the escape
     hatch for the ambiguous tokens. Matching is case-insensitive overall, so a variant that
@@ -177,7 +256,7 @@ def jd_keyword_plan(jd_text: str, base_text: str) -> tuple[list[str], list[str]]
 @dataclass
 class ResumeScore:
     overall: int
-    verdict: str                       # apply | hold
+    verdict: str                       # strong | apply | improve | drop
     skills_coverage: int
     title_alignment: int
     achievements: int
@@ -188,20 +267,24 @@ class ResumeScore:
     missing_soft: list[str] = field(default_factory=list)
     coverable: list[str] = field(default_factory=list)   # missing but TRUE (in base) → safe to add
     true_gaps: list[str] = field(default_factory=list)   # missing and NOT in base → honest gap
+    family: str = "unknown"            # eng | non_eng | unknown (see role_family)
 
     def summary_line(self) -> str:
+        fam = "  ⛔ WRONG ROLE FAMILY" if self.family == "non_eng" else ""
         return (f"match {self.overall}/100 ({self.verdict.upper()}) · "
                 f"skills {self.skills_coverage} · title {self.title_alignment} · "
-                f"metrics {self.achievements} · parse {self.parseability}")
+                f"metrics {self.achievements} · parse {self.parseability}{fam}")
 
 
-def score_resume(jd_text: str, merged: dict, cfg: dict, base_text: str | None = None) -> ResumeScore:
+def score_resume(jd_text: str, merged: dict, cfg: dict, base_text: str | None = None,
+                 *, title: str | None = None) -> ResumeScore:
     rs = (cfg or {}).get("resume_scoring") or {}
     floor = float(rs.get("floor", 65))
     target = float(rs.get("target", rs.get("gate", 80)))   # `gate` kept as a fallback for old configs
     strong = float(rs.get("strong", 85))
     jd = jd_text or ""
     rtext = _resume_text(merged)
+    fam = role_family(title, cfg) if title else "unknown"
 
     jd_hard = _present(jd, _HARD_SKILLS)
     jd_soft = _present(jd, _SOFT_SKILLS)
@@ -213,15 +296,34 @@ def score_resume(jd_text: str, merged: dict, cfg: dict, base_text: str | None = 
     matched_soft = sorted(jd_soft & r_soft)
     missing_soft = sorted(jd_soft - r_soft)
 
-    # skills coverage: hard skills weigh 2×, soft 1× (ATS match is mostly hard skills)
+    # skills coverage: hard skills weigh 2×, soft 1× (ATS match is mostly hard skills),
+    # SHRUNK toward a skeptical prior by k pseudo-units of evidence. Raw got/need let any JD
+    # that asks for ≤2 things in our vocabulary hand out a perfect 100 — that is how a
+    # journalism posting outscored real backend roles: near-zero evidence read as certainty.
+    # (got + k·p0) / (need + k) makes low-evidence coverage converge on p0 (a deliberate
+    # "probably mediocre") and rich-JD coverage stay data-driven; an empty JD now scores p0,
+    # not 100. k is in weighted units (6 ≈ three hard skills of evidence).
+    K = float(rs.get("shrink_k", 6))
+    P0 = float(rs.get("shrink_prior", 0.60))
     got = 2 * len(matched_hard) + len(matched_soft)
     need = 2 * len(jd_hard) + len(jd_soft)
-    skills_coverage = round(100 * got / need) if need else 100
+    skills_coverage = round(100 * (got + K * P0) / (need + K))
 
-    # title alignment: does the resume echo the JD's role family?
-    jd_titles = {t for t in _TITLE_TERMS if t in jd.lower()}
+    # title alignment: does the resume echo the JD's role family? The old "no title terms in
+    # the JD → free 100" default REWARDED non-engineering JDs (a reporter posting contains no
+    # engineering title terms, so it got full marks exactly where it deserved zero). Absent
+    # evidence is now neutral-at-best, and a non-eng title is 0 outright.
+    jd_blob = f"{title or ''}\n{jd}".lower()
+    jd_titles = {t for t in _TITLE_TERMS if t in jd_blob}
     r_titles = {t for t in _TITLE_TERMS if t in rtext.lower()}
-    title_alignment = round(100 * len(jd_titles & r_titles) / len(jd_titles)) if jd_titles else 100
+    if fam == "non_eng":
+        title_alignment = 0
+    elif jd_titles:
+        title_alignment = round(100 * len(jd_titles & r_titles) / len(jd_titles))
+    elif fam == "eng":
+        title_alignment = 70           # title says engineer; the JD text just never echoed terms
+    else:
+        title_alignment = 30           # nothing anywhere says this is her role family
 
     # achievements: share of experience bullets carrying a concrete number/metric
     bullets = [b for j in merged.get("experience", []) for b in j.get("bullets", [])]
@@ -236,6 +338,11 @@ def score_resume(jd_text: str, merged: dict, cfg: dict, base_text: str | None = 
 
     overall = round(0.60 * skills_coverage + 0.15 * title_alignment
                     + 0.15 * achievements + 0.10 * parseability)
+    # Wrong role family is categorical, not gradual: no coverage arithmetic may rescue a
+    # journalism/sales/consulting posting into the apply queue. Capped below tailor_min (50)
+    # so these also stop being auto-tailored, and verdict-forced to drop.
+    if fam == "non_eng":
+        overall = min(overall, int(rs.get("family_cap", 40)))
 
     # truth-safe feedback: split what's missing into "coverable" (true, in base) vs real gaps.
     base_present = _present(base_text or "", {**_HARD_SKILLS, **_SOFT_SKILLS}) if base_text else set()
@@ -243,7 +350,8 @@ def score_resume(jd_text: str, merged: dict, cfg: dict, base_text: str | None = 
     coverable = sorted(m for m in all_missing if m in base_present)
     true_gaps = sorted(m for m in all_missing if m not in base_present)
 
-    verdict = ("strong" if overall >= strong else "apply" if overall >= target
+    verdict = ("drop" if fam == "non_eng"
+               else "strong" if overall >= strong else "apply" if overall >= target
                else "improve" if overall >= floor else "drop")
     return ResumeScore(
         overall=overall, verdict=verdict,
@@ -251,5 +359,5 @@ def score_resume(jd_text: str, merged: dict, cfg: dict, base_text: str | None = 
         achievements=achievements, parseability=parseability,
         matched_hard=matched_hard, missing_hard=missing_hard,
         matched_soft=matched_soft, missing_soft=missing_soft,
-        coverable=coverable, true_gaps=true_gaps,
+        coverable=coverable, true_gaps=true_gaps, family=fam,
     )
