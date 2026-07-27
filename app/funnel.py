@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import re
 import statistics
 import sys
 
@@ -42,17 +41,10 @@ def tuning(cfg: dict) -> dict:
     return {**DEFAULTS, **(cfg.get("funnel") or {})}
 
 
-_PDF_SCORE = re.compile(r" - (\d{1,3})\.pdf$")
-
-
 def _match_score(path: str | None) -> int | None:
-    """The résumé match score, read back off the filename the tailoring step writes
-    ("Casey Example - Stripe - Money as a Service [6176758] - 80.pdf"). That filename is the
-    system's own convention and the only place the per-role match score is persisted."""
-    if not path:
-        return None
-    m = _PDF_SCORE.search(path)
-    return int(m.group(1)) if m else None
+    """The résumé match score, read back off the tailored PDF's filename — delegates to
+    store.resume_score_from_path so the convention is parsed in exactly one place."""
+    return store.resume_score_from_path(path)
 
 
 def _band(v, edges: list[int], unit: str = "") -> str:
@@ -69,6 +61,7 @@ def _band(v, edges: list[int], unit: str = "") -> str:
 def load(cfg: dict, conn) -> list[dict]:
     """Every application that actually went out, with what has happened to it since."""
     tune = tuning(cfg)
+    notes_all = cfgmod.load_company_notes(cfg)   # culture priors — the diversify experiment's readout
     rows = [dict(r) for r in conn.execute(
         "SELECT r.job_id, r.company, r.ats, r.title, r.seniority, r.is_remote,"
         "       r.weighted_score, r.verdict,"
@@ -96,6 +89,7 @@ def load(cfg: dict, conn) -> list[dict]:
         out.append({
             **r,
             "age_days": age,
+            "culture_prior": (notes_all.get(cfgmod.norm_key(r["company"])) or {}).get("culture_prior"),
             "match": _match_score(r["tailored_resume_path"]),
             "responded": responded,
             "interviewed": rank >= store.STAGE_RANK["interview"],
@@ -108,6 +102,18 @@ def load(cfg: dict, conn) -> list[dict]:
     return out
 
 
+def _culture_band(a: dict) -> str:
+    """The diversify experiment's readout axis: do low-culture-prior companies actually reply
+    less often FOR HER? If they don't, the priors are mispriced and worth loosening; if they
+    do, the exploration bonus was cheap tuition. Bands chosen so Tesla-grade (<2.5) is its own
+    bucket and 'no prior on file' never contaminates a real band."""
+    v = a.get("culture_prior")
+    if v is None:
+        return "no prior"
+    return "<2.5 rough" if v < 2.5 else "2.5-2.9 low" if v < 3.0 else \
+           "3.0-3.4 mid" if v < 3.5 else "3.5+ good"
+
+
 _DIMENSIONS = {
     "score":     lambda a: _band(round(a["weighted_score"] or 0), [60, 70, 80, 90]),
     "match":     lambda a: _band(a["match"], [70, 80, 85, 90]),
@@ -116,6 +122,7 @@ _DIMENSIONS = {
     "seniority": lambda a: a["seniority"] or "?",
     "remote":    lambda a: "remote" if a["is_remote"] else "onsite/hybrid",
     "verdict":   lambda a: a["verdict"] or "?",
+    "culture":   _culture_band,
 }
 
 
@@ -213,7 +220,7 @@ def _fmt_rate(row: dict) -> str:
 
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--by", default="score,match,company,ats",
+    ap.add_argument("--by", default="score,match,culture,company,ats",
                     help="comma-separated: " + " ".join(_DIMENSIONS))
     args = ap.parse_args(argv)
     dims = [d.strip() for d in args.by.split(",") if d.strip() in _DIMENSIONS]

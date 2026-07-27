@@ -60,7 +60,9 @@ def optimize(cfg: dict, conn, job_id: str, max_rounds: int = 6) -> dict:
     added_total = 0
     for _ in range(max_rounds):
         merged = tailoring.merge(base, tailored)
-        sc = resume_score.score_resume(jd, merged, cfg, base_text)
+        sc = resume_score.score_resume(jd, merged, cfg, base_text, title=role.get("title"))
+        if sc.family == "non_eng":
+            break                              # wrong role family — no keyword can fix that
         if sc.overall >= sc_gate(cfg):
             break
         n = _surface(tailored, sc.coverable)   # only ever surfaces TRUE-for-her keywords
@@ -72,7 +74,7 @@ def optimize(cfg: dict, conn, job_id: str, max_rounds: int = 6) -> dict:
     sc = res["score"]
     return {
         "company": role["company"], "job_id": job_id, "overall": sc.overall,
-        "verdict": sc.verdict, "surfaced": added_total,
+        "verdict": sc.verdict, "family": sc.family, "surfaced": added_total,
         "true_gaps": sc.true_gaps, "line": sc.summary_line(),
     }
 
@@ -86,20 +88,48 @@ def main(argv: list[str]) -> None:
     cfg = cfgmod.load_config()
     conn = store.connect_view(cfg)
     if argv and argv[0] == "--all":
+        # A batch over every yaml on disk MUST survive individual bad files: purged roles
+        # leave orphan yamls whose job_id is no longer in the DB, and one of those used to
+        # kill the whole run on file #N with 1300 left to go.
         rdir = cfgmod.resolve_path(cfg["output_dirs"]["resumes"])
-        jobs = [yaml.safe_load(p.read_text())["job_id"] for p in sorted(rdir.glob("*.yaml"))]
+        jobs = []
+        for p in sorted(rdir.glob("*.yaml")):
+            try:
+                jid = (yaml.safe_load(p.read_text(encoding="utf-8")) or {}).get("job_id")
+            except Exception as e:  # noqa: BLE001
+                print(f"⏭️  {p.name}: unreadable yaml ({e})", flush=True)
+                continue
+            if jid:
+                jobs.append(jid)
+            else:
+                print(f"⏭️  {p.name}: no job_id", flush=True)
     else:
         jobs = argv
     if not jobs:
         print("usage: python -m app.optimize <job_id> | --all"); return
     gate = sc_gate(cfg)
     mark = {"strong": "🟢", "apply": "✅", "improve": "🟡", "drop": "⏸️ "}
-    for jid in jobs:
-        r = optimize(cfg, conn, jid)
-        print(f"\n{mark.get(r['verdict'], '  ')} {r['company']:16} {r['line']}   (+{r['surfaced']} surfaced)")
-        if r["overall"] < gate and r["true_gaps"]:
+    bands: dict = {}
+    skipped = wrong_family = 0
+    for i, jid in enumerate(jobs, 1):
+        try:
+            r = optimize(cfg, conn, jid)
+        except Exception as e:  # noqa: BLE001 — skip and continue; the batch must finish
+            skipped += 1
+            print(f"⏭️  [{i}/{len(jobs)}] {jid}: {type(e).__name__}: {e}", flush=True)
+            continue
+        bands[r["verdict"]] = bands.get(r["verdict"], 0) + 1
+        if r.get("family") == "non_eng":
+            wrong_family += 1
+        print(f"{mark.get(r['verdict'], '  ')} [{i}/{len(jobs)}] {r['company']:16} {r['line']}"
+              f"   (+{r['surfaced']} surfaced)", flush=True)
+        if r["overall"] < gate and r["true_gaps"] and r.get("family") != "non_eng":
             print(f"    to reach {gate:.0f} you'd need — confirm any you actually have: "
-                  f"{', '.join(r['true_gaps'])}")
+                  f"{', '.join(r['true_gaps'])}", flush=True)
+    if len(jobs) > 1:
+        print(f"\n=== {len(jobs)} résumés: " +
+              " · ".join(f"{k} {v}" for k, v in sorted(bands.items())) +
+              f" · wrong-family {wrong_family} · skipped {skipped}", flush=True)
 
 
 if __name__ == "__main__":

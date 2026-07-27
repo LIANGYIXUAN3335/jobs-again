@@ -38,12 +38,14 @@ def prescreen(cfg: dict, min_score: float = 0.0) -> list[dict]:
         "WHERE jd_text IS NOT NULL AND jd_text != ''").fetchall()
     out = []
     for r in rows:
-        sc = resume_score.score_resume(r["jd_text"], merged, cfg, base_text)
+        sc = resume_score.score_resume(r["jd_text"], merged, cfg, base_text, title=r["title"])
         req = len(sc.matched_hard) + len(sc.missing_hard)      # hard skills the JD asks for
-        # Pure coverage% is degenerate: a thin / non-engineering JD asks for almost nothing,
-        # so she "covers" ~100%. Rank by ABSOLUTE hard-skill overlap (technical richness she
-        # actually meets); coverage% only breaks ties. `req` exposes shallow JDs.
+        # Rank by ABSOLUTE hard-skill overlap; coverage% breaks ties. This was the original
+        # workaround for thin-JD coverage saturation — the scorer itself now also handles it
+        # (evidence shrinkage + role-family gate in resume_score), so `ceiling` here and the
+        # score everywhere else finally agree about shallow and non-engineering JDs.
         out.append({"ceiling": sc.overall, "hit": len(sc.matched_hard), "req": req,
+                    "family": sc.family,
                     "company": r["company"], "title": r["title"], "job_id": r["job_id"],
                     "missing": sc.missing_hard})
     out = [r for r in out if r["ceiling"] >= min_score]
