@@ -2,6 +2,7 @@
 No model, no API key. Sub-scores 0-5; weighted total normalized to 0-100."""
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import re
@@ -9,6 +10,8 @@ from dataclasses import dataclass
 
 from .config import norm_key
 from .filters import _hit
+from .filters import _first_hit
+from .resume_score import role_family
 from .sources.base import Posting
 
 MAX_RAW = None  # computed from weights at call time
@@ -29,6 +32,11 @@ class Score:
 def config_hash(cfg: dict) -> str:
     """Any change to weights/thresholds/keyword maps triggers a full rescore."""
     payload = {k: cfg.get(k) for k in ("weights", "verdict_thresholds", "scoring")}
+    # `freshness` lives under scoring: for tidiness but never touches a stored score — it is
+    # applied at rank time. Tuning it must not trigger a pointless rescore of every role.
+    if isinstance(payload.get("scoring"), dict):
+        payload["scoring"] = {k: v for k, v in payload["scoring"].items()
+                              if k not in ("freshness", "diversify")}   # rank-time knobs — no rescore needed
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -64,6 +72,14 @@ _HARD_REQUIRED = re.compile(
     rf"[^.\n]{{0,60}}?(?:{_GATE})"
     rf"|(?:{_GATE})[^.\n]{{0,40}}?(?:expert|required|must)", re.I)
 _ALT_LANG = re.compile(r"\b(?:Go|Golang|Python|Java)\b", re.I)
+
+# Unfilled ATS template postings (seen on Twilio's greenhouse board): the JD still carries
+# literal authoring placeholders, so there is nothing real to match a résumé against and the
+# posting is probably not an active search. Penalized (sinks in review), NOT dropped —
+# owner's call: keep them visible so a few can still leak through to apply.
+_TEMPLATE_JD = re.compile(
+    r"<\s*job\s*title\s*>|&lt;\s*job\s*title\s*&gt;|\[\s*insert\s+[a-z ]{0,30}\]"
+    r"|\{\{\s*[a-z_ ]{1,30}\s*\}\}", re.I)
 
 # --- geography: she is US-based; a Tel Aviv or Hanoi posting is not an opportunity ---
 _US_STATES = (r"Alabama|Alaska|Arizona|Arkansas|California|Colorado|Connecticut|Delaware|Florida|"
@@ -149,6 +165,13 @@ def _eligibility(text: str, jd_text: str, sc: dict) -> tuple[float, list[tuple[s
         else:
             pen += full / 2
             notes_out.append(("hard tech gate mentioned", -full / 2))
+
+    # Unfilled template posting: heavy penalty so it sinks to the bottom of review, but no
+    # hard drop — it stays visible and applyable if the owner wants to take the flyer.
+    if _TEMPLATE_JD.search(jd_text or ""):
+        tp = float(el.get("template_jd_penalty", 25))
+        pen += tp
+        notes_out.append(("unfilled template JD (placeholders in posting)", -tp))
     return pen, notes_out, drop
 
 
@@ -222,6 +245,24 @@ def score(posting: Posting, notes: dict, cfg: dict) -> Score:
             getattr(posting, "location", "") or "", getattr(posting, "apply_url", "") or ""):
         hard_drop = True
         el_notes.append(("outside the US", -99.0))
+    # Wrong role family (consultant / strategist / sales engineer / reporter / …): the intake
+    # filter deliberately biases to recall — "Professional Services Consultant" survives it via
+    # the 'services' substring, a fintech Reporter via 'fintech'. That is intake's job; being
+    # the gate is THIS layer's job. Without it these reach the review queue and auto-tailor
+    # (78 wrong-family roles got real tailored résumés before this check existed).
+    if sc.get("drop_non_eng_titles", True) and role_family(posting.title, cfg) == "non_eng":
+        hard_drop = True
+        el_notes.append(("non-engineering role family", -99.0))
+    # Clearance/citizenship gate, re-checked at SCORE time with the full JD. The intake
+    # filter (filters.py) runs before lazy-JD adapters (workday/smartrecruiters/rippling/
+    # avature) have fetched the body, so citizenship requirements buried in the JD slip
+    # past it — this is the net that catches those. Same config list keeps the two in sync.
+    fl = cfg.get("filters") or {}
+    if fl.get("drop_clearance", True):
+        hit = _first_hit(fl.get("clearance_exclude", []), text)
+        if hit:
+            hard_drop = True
+            el_notes.append((f"clearance/citizenship: {hit}", -99.0))
     neg.extend(el_notes)
     weighted = round(max(0.0, weighted - pen), 1)
 
@@ -251,3 +292,72 @@ def score(posting: Posting, notes: dict, cfg: dict) -> Score:
 
 def notes_for(company: str, all_notes: dict[str, dict]) -> dict:
     return all_notes.get(norm_key(company), {})
+
+
+# --- freshness: a RANKING preference, deliberately not part of weighted_score ---
+# A job's four-dimension score answers "is this a good job", and that does not change as the
+# posting ages — but how urgently it is worth looking at does. Keeping the two apart means:
+# (a) weighted_score stays comparable over time, so funnel.py's "which score bands actually
+# convert" calibration is not polluted by when a role happened to be scanned; (b) the bonus
+# is recomputed on every page load, so it decays on its own without a nightly rescore, which
+# a stored bonus would need in order not to go stale.
+
+def freshness_tuning(cfg: dict) -> dict:
+    f = ((cfg.get("scoring") or {}).get("freshness") or {})
+    return {
+        "enabled": bool(f.get("enabled", True)),
+        "bonus": float(f.get("bonus", 10)),
+        "full_days": int(f.get("full_days", 2)),
+        "zero_days": int(f.get("zero_days", 14)),
+        "infer_from_first_seen": bool(f.get("infer_from_first_seen", True)),
+        "inferred_factor": float(f.get("inferred_factor", 1.0)),
+    }
+
+
+def freshness(posted_at: str | None, first_seen: str | None, cfg: dict,
+              today: str | None = None, allow_inferred: bool = True) -> dict:
+    """Points to add to a role's RANK score for being newly posted.
+
+    Full `bonus` while the posting is <= full_days old, then a straight line down to 0 at
+    zero_days. Never negative: an old posting is not penalised, it just stops being boosted.
+
+    `posted_at` is what the board said. `first_seen` is only a proxy for the two boards that
+    publish no date (Rippling, Avature) — accurate for roles that appeared while the daily
+    scan was already running, wrong for anything swept up in a first-ever scan of a board,
+    which is why it is separated out in the return value and can be down-weighted.
+
+    `allow_inferred=False` disables the first_seen fallback entirely — pass it for
+    hand-captured / manually-added roles, where first_seen is the moment the OWNER clicked
+    capture, which says nothing about when the job was posted (a months-old posting captured
+    today is NOT fresh).
+    """
+    t = freshness_tuning(cfg)
+    out = {"bonus": 0.0, "age_days": None, "posted_known": bool(posted_at), "date": None}
+    if not t["enabled"]:
+        return out
+    day = (posted_at or "")[:10]
+    inferred = False
+    if not day and t["infer_from_first_seen"] and allow_inferred:
+        day = (first_seen or "")[:10]
+        inferred = True
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day or ""):
+        return out
+    try:
+        d0 = datetime.date.fromisoformat(day)
+        d1 = datetime.date.fromisoformat(today) if today else datetime.date.today()
+    except ValueError:
+        return out
+    age = (d1 - d0).days
+    out["date"] = day
+    out["age_days"] = age
+    if age <= t["full_days"]:                     # includes clock-skew negatives
+        raw = t["bonus"]
+    elif age >= t["zero_days"]:
+        raw = 0.0
+    else:
+        span = max(1, t["zero_days"] - t["full_days"])
+        raw = t["bonus"] * (t["zero_days"] - age) / span
+    if inferred:
+        raw *= t["inferred_factor"]
+    out["bonus"] = round(max(0.0, raw), 1)
+    return out

@@ -8,7 +8,7 @@ import time
 
 import httpx
 
-from .base import Posting, strip_html
+from .base import Posting, posted_day_relative, strip_html
 
 PAGE = 20
 
@@ -75,6 +75,8 @@ def fetch(client: httpx.Client, company: str, slug: str, retries: int = 2) -> li
             jd_text="",
             apply_url=f"{base}/en-US/{site}{path}",
             is_remote="remote" in (j.get("locationsText") or "").lower(),
+            # Workday exposes no date field, only the rendered "Posted 5 Days Ago" string.
+            posted_at=posted_day_relative(j.get("postedOn") or ""),
             fetch_jd=_jd,
         ))
     return out

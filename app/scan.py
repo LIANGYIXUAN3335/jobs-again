@@ -103,6 +103,9 @@ def run_scan(cfg: dict, only: set[str] | None = None, mode: str = "local") -> di
                 "department": p.department, "location": p.location,
                 "is_remote": int(p.is_remote), "seniority": seniority,
                 "apply_url": p.apply_url, "jd_text": p.jd_text, "jd_hash": h,
+                # Never let a board that went quiet on dates blank out one we already have —
+                # a lost posted_at silently demotes the role to the first_seen fallback.
+                "posted_at": p.posted_at or (prev["posted_at"] if prev is not None else None),
                 "first_seen": today, "last_seen": today, "updated_at": now,
                 **sc,
             })

@@ -62,7 +62,8 @@ def main() -> None:
 
     merged = tailoring.merge(base, tailored)
     sc = resume_score.score_resume(
-        role.get("jd_text", ""), merged, cfg, tailoring._base_text(base)
+        role.get("jd_text", ""), merged, cfg, tailoring._base_text(base),
+        title=role.get("title"),
     )
     strong = float((cfg.get("resume_scoring") or {}).get("strong", 85))
     out = {
@@ -73,6 +74,7 @@ def main() -> None:
         "strong_target": strong,
         "is_strong": sc.overall >= strong,
         "verdict": sc.verdict,
+        "family": sc.family,                     # non_eng → capped at 40; don't bother refining
         "skills_coverage": sc.skills_coverage,   # 60% of overall — the main lever
         "title_alignment": sc.title_alignment,   # 15% — echo the JD role family
         "achievements": sc.achievements,         # 15% — bullets carrying a number/%
