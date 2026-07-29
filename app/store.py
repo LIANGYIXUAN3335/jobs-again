@@ -206,7 +206,10 @@ def _connect(path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    # 60s not 5s: launchd wake-from-sleep coalescing can fire the 08:20 linkedin job and
+    # the 09:00 scan together, and a full-DB rescore holds a write txn far longer than 5s.
+    # WAL keeps readers unblocked either way; a colliding writer should wait, not crash.
+    conn.execute("PRAGMA busy_timeout=60000")
     return conn
 
 

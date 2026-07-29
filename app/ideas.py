@@ -48,6 +48,11 @@ CREATE TABLE IF NOT EXISTS fetch_log(
   n_new  INTEGER NOT NULL,
   errors TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS digests(
+  day        TEXT PRIMARY KEY,   -- LA date, YYYY-MM-DD
+  content    TEXT NOT NULL,      -- JSON: {"tldr": str, "groups": [{"label", "items": [{"title","url","why"}]}]}
+  created_at TEXT NOT NULL
+);
 """
 
 
@@ -208,6 +213,19 @@ def recent_days(conn: sqlite3.Connection, days: int = 7) -> list[dict]:
 
 def last_fetch(conn: sqlite3.Connection) -> dict | None:
     r = conn.execute("SELECT * FROM fetch_log ORDER BY run_at DESC LIMIT 1").fetchone()
+    return dict(r) if r else None
+
+
+def save_digest(conn: sqlite3.Connection, day: str, content: str) -> None:
+    conn.execute("INSERT INTO digests(day, content, created_at) VALUES(?,?,?) "
+                 "ON CONFLICT(day) DO UPDATE SET content=excluded.content,"
+                 " created_at=excluded.created_at",
+                 (day, content, datetime.datetime.now(LA).isoformat(timespec="seconds")))
+    conn.commit()
+
+
+def latest_digest(conn: sqlite3.Connection) -> dict | None:
+    r = conn.execute("SELECT * FROM digests ORDER BY day DESC LIMIT 1").fetchone()
     return dict(r) if r else None
 
 

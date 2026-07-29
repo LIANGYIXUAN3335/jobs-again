@@ -62,8 +62,14 @@ def main(enriched_dir: str) -> None:
     for jid, why in skipped:
         print(f"  - {jid}  {why}")
 
-    if added:
-        print("\nrescoring …")
+    # Rescore if we added anything OR a previous run's rescore failed and left li: roles
+    # unscored (add_role commits with weighted_score NULL before rescore runs) — without
+    # this, a crashed rescore would leave them unscored forever: the next run skips them
+    # as "already in DB" and `added` stays empty.
+    unscored = conn.execute("SELECT COUNT(*) FROM roles WHERE job_id LIKE 'li:%' "
+                            "AND weighted_score IS NULL").fetchone()[0]
+    if added or unscored:
+        print(f"\nrescoring … ({len(added)} new, {unscored} previously unscored)")
         subprocess.run([str(BASE / ".venv/bin/python"), str(BASE / "tools/rescore.py")],
                        cwd=BASE, check=True)
 

@@ -16,6 +16,9 @@ data/logs/
 scratch_priors/*_manifest.json
 scratch_priors/*_job.json
 
+# raw LinkedIn guest-scrape output — regenerated each nightly run
+scratch_priors/linkedin_enriched_archive/
+
 # LOCAL SECRETS — never commit (Anthropic API key for AI autofill)
 secrets.yaml
 secrets/
