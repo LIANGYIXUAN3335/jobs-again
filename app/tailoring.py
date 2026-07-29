@@ -361,7 +361,8 @@ def ingest_file(cfg: dict, conn, yaml_file: Path) -> dict:
         raise TailorError(f"{yaml_file.name}: job_id {job_id!r} not in DB")
     base = load_base(cfg)
     merged = merge(base, tailored)
-    sc = resume_score.score_resume(role.get("jd_text", ""), merged, cfg, _base_text(base))
+    sc = resume_score.score_resume(role.get("jd_text", ""), merged, cfg, _base_text(base),
+                                   title=role.get("title"))
     # filename carries name + company + role + score; sweep this role's older scored copies
     # and the legacy job-id-named PDF so only the current one remains.
     rdir = cfgmod.resolve_path(cfg["output_dirs"]["resumes"])
