@@ -5,19 +5,26 @@ __pycache__/
 .DS_Store
 data/*.db-wal
 data/*.db-shm
-data/jobs.sqlite
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*_backup.json
+data/mail_label_*.json
 data/logs/
 
 # tailoring artifacts are personal/generated, not source
 /output/
 
-# local snapshots and generated batch manifests
+# local snapshots and generated research batches
 *.bak-*
-scratch_priors/*_manifest.json
-scratch_priors/*_job.json
+scratch_priors/*.json
+scratch_priors/*.md
 
 # raw LinkedIn guest-scrape output — regenerated each nightly run
 scratch_priors/linkedin_enriched_archive/
+
+# local runtime caches and recovery snapshots
+.backups/
 
 # LOCAL SECRETS — never commit (Anthropic API key for AI autofill)
 secrets.yaml

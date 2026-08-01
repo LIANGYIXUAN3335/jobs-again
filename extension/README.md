@@ -41,6 +41,22 @@ generic label-based filler and will fill the standard fields; report any that mi
 mapping can be tightened. It also fires inside the ATS iframe when a company embeds the
 form on its own careers page (`all_frames`).
 
+## Applying in several tabs at once
+
+Supported — the content script is injected per tab and runs independently, and the service
+worker is a stateless API proxy. Two things make it hold up:
+
+- **The pin is claimed per tab.** The server's `/api/pin` is a single global slot, so the
+  next ↗ click used to steal an older tab's role and silently attach the wrong tailored
+  résumé. Now the frame that actually renders a panel off the pin copies it into that tab's
+  `sessionStorage` (keyed by origin) and `DELETE`s the server slot, so the next ↗ owns the
+  slot outright. `GET /api/pinned` stays idempotent on purpose — with `all_frames` on, a
+  probing iframe must not consume a pin it never uses.
+  Remaining race: firing two ↗ clicks back-to-back *before* the first tab's script boots.
+- **Backgrounded tabs re-arm themselves.** Chrome throttles a hidden tab's timers to ~1/min,
+  so the boot poll's window is wall-clock rather than a tick count, and `visibilitychange`
+  starts a fresh window whenever a tab becomes visible with no panel up.
+
 ## Troubleshooting
 
 - Panel doesn't appear → the URL didn't match a stored role. Confirm the role is in the DB

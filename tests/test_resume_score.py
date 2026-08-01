@@ -143,3 +143,44 @@ def test_empty_jd_scores_the_prior_not_perfection():
     sc = _score("", "Software Engineer")
     assert sc.skills_coverage == 60         # (0 + k·p0) / (0 + k) = p0
     assert sc.overall < 80                  # an empty JD is unknown, not a perfect match
+
+
+def test_non_software_engineering_titles_are_wrong_family():
+    from app.resume_score import role_family
+
+    """Engineering, but not HER engineering. The taxonomy was binary, so hardware/EE/safety
+    titles landed in 'eng' and got the full coverage arithmetic — which INVERTS on them: the
+    skill vocabulary only knows software, so the JD's real asks are invisible, the few generic
+    words it does contain all match, and coverage saturates. Measured before the fix: Anduril's
+    Battery Engineer 93 and Harness Engineer 90 vs its real Senior SWE, Stateful Systems 82."""
+    for t in ["Senior Battery Engineer (Drones)", "Senior Harness Engineer, Omen",
+              "Environmental Health and Safety Senior Engineer", "Senior Facilities Engineer",
+              "Senior PCB Engineer", "Senior Thermal Engineer", "Senior Signal Integrity Engineer",
+              "Vehicle Systems Safety", "Senior Co-Packaged Optics Process Engineer",
+              "Senior Digital Design Engineer", "Senior IC Packaging Development Engineer"]:
+        assert role_family(t) == "non_eng", t
+
+
+def test_a_software_role_in_a_hardware_domain_stays_engineering():
+    from app.resume_score import role_family
+
+    """The guard that stops the rule over-firing: the domain word is a modifier, the job is
+    still software. Each of these was a real false positive while calibrating."""
+    for t in ["Senior Software Engineer, Stateful Systems",
+              "Harness and Platform Engineer, AI Safety and Security",
+              "Software Linux Engineer - Installation and Packaging",
+              "Senior Systems Software Engineer, Semiconductor Systems",
+              "Senior Software Engineer, Meta Factory Agent Harness",
+              "Backend Engineer", "Site Reliability Engineer", "Data Engineer",
+              "Security Engineer", "Machine Learning Engineer", "Platform Engineer"]:
+        assert role_family(t) == "eng", t
+
+
+def test_data_center_and_manufacturing_are_not_rescued_by_stray_software_words():
+    from app.resume_score import role_family
+
+    """Two false RESCUES found while calibrating: 'Data Center' contains 'data', and 'Mass
+    Production Infrastructure Manufacture Engineer' contains 'infrastructure'. In both the
+    software-ish word names a building or a pipeline, not the job."""
+    assert role_family("Data Center Engineering and Operations EHS Engineer") == "non_eng"
+    assert role_family("Senior Mass Production Infrastructure Manufacture Engineer") == "non_eng"

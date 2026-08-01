@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from pathlib import Path
 from urllib.parse import quote
 
@@ -15,6 +16,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from . import ai as aimod
+from . import company_board as boardmod
 from . import config as cfgmod
 from . import followup as followupmod
 from . import funnel as funnelmod
@@ -40,6 +42,11 @@ def url_candidates(url: str) -> list[str]:
     """Raw ATS ids that might appear in an application-page URL."""
     c: list[str] = []
     for pat in (r"gh_jid=(\d+)", r"[?&]token=(\d+)", r"/jobs/(\d+)",
+                # LinkedIn puts a path segment between /jobs/ and the id, so the plain
+                # `/jobs/(\d+)` above never fired and every li: role was invisible to the
+                # extension: /jobs/view/<id>/, and the id also rides as a query param on
+                # the search/collections pages where the JD opens in a side panel.
+                r"/jobs/view/(\d+)", r"[?&]currentJobId=(\d+)",
                 r"[?&]pid=(\d+)",                       # Microsoft careers: apply?pid=1970393556941507
                 # Apple: details page /en-us/details/200673880-0836/<slug> and apply flow
                 # /app/en-us/apply/200673880-0836 share the req id — the join between them.
@@ -164,21 +171,32 @@ def index(
     seen: str = "all",
     remote: str = "",
     seniority: str = "",
-    sort: str = "score",
+    # 'diversity' = keep select_daily's company interleave (each company's lead role first,
+    # then everyone's #2, …). Default in the review tab because it is the order she works
+    # top-down in; the other options re-sort those same rows.
+    sort: str = "diversity",
+    rot: str = "",
     conn=Depends(view_conn),
 ):
     try:
         ms = float(min_score)
     except (TypeError, ValueError):
         ms = 0.0
+    # Rotation cursor for the review queue. Lives ONLY in the URL — nothing is stored, so
+    # refresh/back never move the page and there is no frozen "today's batch" to go stale.
+    try:
+        rot_i = max(0, int(rot))
+    except (TypeError, ValueError):
+        rot_i = 0
     data = store.fetch_view(
         conn, cfg, status=status, q=q, company=company, min_score=ms,
         verdict=verdict, seen=seen, remote=remote, seniority=seniority, sort=sort,
+        rot=rot_i,
     )
     params = {
         "status": status, "q": q, "company": company, "min_score": min_score if ms else "",
         "verdict": verdict, "seen": seen, "remote": remote, "seniority": seniority,
-        "sort": sort,
+        "sort": sort, "rot": rot_i or "",
     }
     return templates.TemplateResponse(request, "list.html", {
         **data,
@@ -306,6 +324,66 @@ def api_lookup(url: str, conn=Depends(view_conn)):
     return _lookup_payload(conn, role)
 
 
+class PinIn(BaseModel):
+    job_id: str
+
+
+@app.post("/api/pin")
+def api_pin(body: PinIn, conn=Depends(view_conn)):
+    """'I'm applying to this role right now.' Set by the ↗ link in the UI, just before the
+    apply page opens. This is the ONLY join back to a role whose apply_url can't be matched
+    from the landing page — a LinkedIn role's apply_url is the LinkedIn page, but Apply there
+    hands you off to the employer's own ATS, whose URL shares no id with our li:<id>."""
+    if not store.get_role(conn, body.job_id):
+        raise HTTPException(404, "unknown job_id")
+    store.set_apply_pin(conn, body.job_id)
+    return {"ok": True, "job_id": body.job_id}
+
+
+@app.get("/api/pins")
+def api_pins(conn=Depends(view_conn)):
+    """EVERY live pin, newest first, each in the same shape as /api/lookup.
+
+    The extension asks for this only after its URL lookup fails, and then picks the one whose
+    company actually appears on the page. Returning the whole set (rather than the server
+    picking) is the point: only the extension can see the page, and a server-side pick is
+    exactly what mislabelled a Precisely form with a Temporal role."""
+    out = []
+    for pin in store.get_apply_pins(conn):
+        role = store.get_role(conn, pin["job_id"])
+        if not role:
+            continue                  # role deleted/delisted since the ↗ — skip, don't 500
+        payload = _lookup_payload(conn, role)
+        payload["from_pin"] = True    # the panel says so — this was intent, not a URL match
+        payload["pinned_at"] = pin["pinned_at"]
+        out.append(payload)
+    return {"pins": out}
+
+
+@app.get("/api/pinned")
+def api_pinned(conn=Depends(view_conn)):
+    """The most recent live pin. Kept for older extension builds — current ones call /api/pins
+    and choose by page. 404 when there is none (or it went stale)."""
+    job_id = store.get_apply_pin(conn)
+    if not job_id:
+        raise HTTPException(404, "no active pin")
+    role = store.get_role(conn, job_id)
+    if not role:
+        raise HTTPException(404, "pinned role no longer exists")
+    payload = _lookup_payload(conn, role)
+    payload["from_pin"] = True        # the panel says so — this was intent, not a URL match
+    return payload
+
+
+@app.delete("/api/pin")
+def api_unpin(job_id: str | None = None, conn=Depends(view_conn)):
+    """Clear one pin (the frame that claimed it releases just its own) or, with no job_id,
+    every pin. Per-role is what multi-pin needs — clearing all on one claim would put us back
+    to losing the other tabs' roles."""
+    store.clear_apply_pin(conn, job_id)
+    return {"ok": True, "cleared": job_id or "all"}
+
+
 _PAY = re.compile(r"\$\s*([0-9]{2,3}(?:,[0-9]{3})+|[0-9]{5,6})(?!\s*%)", re.I)
 
 
@@ -371,12 +449,18 @@ def api_top_role(company: str, conn=Depends(view_conn)):
     is the best default. Returns the same shape as /api/lookup so the extension treats it
     identically. Falls back to profile-only (404) if the company has no tailored role."""
     cn = cfgmod.norm_key(company)
+    # Skip roles that are already done. Without this the guess kept landing on the company's
+    # single best role — which, for 79 of 210 companies with résumés (38%), is one already
+    # applied to. The panel then said "⚠ you already marked THIS role applied" about a role
+    # the owner was NOT looking at, and offered ITS tailored résumé for the form on screen.
+    # You are standing on an application form, so the only useful guess is an open role.
     row = conn.execute(
         "SELECT r.job_id FROM jobs.roles r LEFT JOIN role_state s ON s.job_id=r.job_id"
         " WHERE r.company_norm=? AND s.tailor_status='ready' AND s.tailored_resume_path IS NOT NULL"
+        " AND COALESCE(s.status,'new') NOT IN ('applied','interviewing','rejected')"
         " ORDER BY r.weighted_score DESC LIMIT 1", (cn,)).fetchone()
     if not row:
-        raise HTTPException(404, f"no tailored role for {company!r}")
+        raise HTTPException(404, f"no un-applied tailored role for {company!r}")
     role = store.get_role(conn, row["job_id"])
     return _lookup_payload(conn, role, top_role_default=True)
 
@@ -429,15 +513,40 @@ def api_cover_letter(job_id: str, words: int = 180, conn=Depends(view_conn)):
     return {"text": text}
 
 
+_DASHES = dict.fromkeys("‐‑‒–—―−⁃", "-")
+
+
 def outbound_pdf_name(path: str) -> str:
     """The filename a RECRUITER should see. On disk the tailored PDFs carry the internal
     bookkeeping tail — "… [bb44fbf66595bca5] - 88.pdf" — and the extension uploads whatever
     name this endpoint hands it, so applications were going out branded with our own match
     score. Strip the [id] and the score; keep the human part ("Casey Example - Apple - Apple
-    Data Platform.pdf")."""
+    Data Platform.pdf").
+
+    The result must be pure ASCII: this name also rides out as the raw `x-filename` header,
+    and Starlette encodes custom headers as latin-1, so ONE en-dash in a job title (xAI posts
+    "Software Engineer– X Core Product") raised UnicodeEncodeError and 500'd the whole
+    download — the extension could never attach a résumé for 22 roles across 12 companies.
+    Folding also tidies the separator wreckage those titles leave ("- – X Core" → "- X Core")."""
     name = Path(path).name
     name = re.sub(r"\s*\[[^\]]*\]\s*(?:-\s*\d{1,3}\s*)?(?=\.pdf$)", "", name, flags=re.I)
-    return re.sub(r"\s+(?=\.pdf$)", "", name, flags=re.I)
+    name = re.sub(r"\s+(?=\.pdf$)", "", name, flags=re.I)
+    name = name.translate(str.maketrans(_DASHES))
+    # NFKD + ignore turns é into e and drops anything with no ASCII form (│, ®, emoji).
+    name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    # Tidy the STEM only — the separator collapse below would otherwise eat the dot of
+    # ".pdf" on the degenerate names an empty title leaves behind ("… - ..pdf").
+    stem = name[:-4] if name.lower().endswith(".pdf") else name
+    # A dropped/folded char can leave a dangling separator run: "- – X" → "- - X" → "- X",
+    # "- . – Cloud" → "- Cloud". Keep collapsing until it stops changing.
+    while True:
+        collapsed = re.sub(r"\s*-\s*(?:[-.,;:|·]+\s*)+", " - ", stem)
+        if collapsed == stem:
+            break
+        stem = collapsed
+    stem = re.sub(r"\s{2,}", " ", stem).strip()
+    stem = re.sub(r"^[-.,;:|·\s]+|[-.,;:|·\s]+$", "", stem)   # no leading/trailing separator
+    return f"{stem}.pdf" if stem else "resume.pdf"
 
 
 @app.get("/api/roles/{job_id}/resume.pdf")
@@ -625,16 +734,19 @@ def api_capture(body: CaptureIn):
 
 
 # Careers pages for the companies the daily scanner can't reach — bookmark /browse and skim daily.
+# Trimmed 2026-07-30 to the boards that have ACTUALLY produced a role. Dropped Atlassian,
+# Circle and HashiCorp: each sat here since the list was written and has never yielded a
+# single row in the DB (0 captured, 0 manual, 0 via LinkedIn), so they were pure daily noise.
+# The rest have earned their place — browser capture is where ~160 of these roles came from
+# (Tesla 65, Microsoft 56, Apple 16, Retool 11, Deel 7, Google 7, Wise 4), and LinkedIn's
+# keyword sweep does NOT cover them: it reaches Microsoft/Google/LinkedIn only.
 _UNSUPPORTED_LINKS = {
     "Apple": "https://jobs.apple.com/en-us/search?search=software%20engineer&location=united-states-USA&sort=newest",
     "Microsoft": "https://jobs.careers.microsoft.com/global/en/search?q=software%20engineer&lc=United%20States&exp=Experienced%20professionals",
     "Google": "https://www.google.com/about/careers/applications/jobs/results?q=software%20engineer&location=United%20States",
-    "Atlassian": "https://www.atlassian.com/company/careers/all-jobs?team=Engineering&location=Americas",
     "Tesla": "https://www.tesla.com/careers/search/?query=software%20engineer&region=5",
     "Wise": "https://wise.jobs/jobs/?search=software+engineer",
     "LinkedIn": "https://careers.linkedin.com/jobs?keywords=software%20engineer",
-    "Circle": "https://www.circle.com/careers",
-    "HashiCorp": "https://www.hashicorp.com/careers/open-positions",
     "Retool": "https://retool.com/careers#jobs",
     "Deel": "https://www.deel.com/careers/",
 }
@@ -721,6 +833,17 @@ def _page(title: str, body: str) -> HTMLResponse:
                         f'<a class="b" href="/">← back to JobScan</a>{body}')
 
 
+def _streak(it: dict) -> str:
+    """'在榜 N 天' badge — sustained presence is the cheap stand-in for a star slope, so a
+    6-day repo reads differently from a one-day spike. Silent for single-day items."""
+    days = it.get("days_seen") or 1
+    if days <= 1:
+        return ""
+    peak, score = it.get("peak_score") or 0, it.get("score") or 0
+    tail = f" · 峰值 {peak:,}" if peak > score else ""
+    return f' <span class="streak">在榜 {days} 天{tail}</span>'
+
+
 @app.get("/ideas", response_class=HTMLResponse)
 def ideas_page(days: int = 7):
     """Daily idea/project radar (Show HN · GH Trending · Product Hunt · HN front).
@@ -760,6 +883,7 @@ def ideas_page(days: int = 7):
             rows = "".join(
                 f'<li><a href="{it["url"]}" target="_blank" rel="noopener">{it["title"]}</a>'
                 + (f' <span class="muted small">— {it["meta"]}</span>' if it["meta"] else "")
+                + _streak(it)
                 + "</li>"
                 for it in s["items"])
             secs += f'<h2>{s["label"]} <span class="muted small">{len(s["items"])}</span></h2><ul class="ideas">{rows}</ul>'
@@ -770,6 +894,8 @@ def ideas_page(days: int = 7):
 <p class="muted small">{runinfo} ·
 <button onclick="this.disabled=true;this.textContent='fetching…';fetch('/api/ideas/fetch',{{method:'POST'}}).then(()=>location.reload())">fetch now</button></p>
 <style>.ideas{{margin:6px 0 14px;padding-left:20px}}.ideas li{{margin:3px 0}}
+.streak{{background:#ecfdf5;color:#047857;border:1px solid #a7f3d0;border-radius:9px;
+padding:0 6px;font-size:11px;white-space:nowrap;margin-left:4px}}
 details{{margin:10px 0}}summary{{cursor:pointer}}
 .digest{{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px 18px;margin:14px 0}}
 .digest h3{{margin:12px 0 2px;font-size:14px}}.digest li{{margin:7px 0}}</style>
@@ -1130,6 +1256,71 @@ def interviews_page(conn=Depends(view_conn)):
       async function ing(b){{b.disabled=true;b.textContent='ingesting…';
         const r=await fetch('/api/interviews/ingest',{{method:'POST'}});
         if(r.ok) location.reload(); else {{alert(await r.text());b.disabled=false;}}}}
+      </script>""")
+
+
+@app.get("/api/companies")
+def api_companies(refresh: bool = False):
+    """Per-company board off the mail threads. `refresh` costs an IMAP pass (~2 min); without
+    it this reads the cache the labelling run leaves behind, which is what makes it page-load
+    cheap. Read-only."""
+    try:
+        return boardmod.load(cfg, refresh=refresh)
+    except Exception as e:
+        raise HTTPException(502, f"board failed: {type(e).__name__}: {e}")
+
+
+@app.get("/companies", response_class=HTMLResponse)
+def companies_page():
+    """Whose turn is it, per company. Companion to the Gmail `Interviews/<Company>` labels —
+    same thread grouping, so a row here and a label there are the same pile of mail."""
+    return _page("Companies", """<h1>🏢 每家公司走到哪一步</h1>
+      <p class="tip">按邮件线程聚合，一家公司一行 —— 和 Gmail 里的
+      <code>Interviews/&lt;公司&gt;</code> 标签是同一批邮件。
+      <b>🔴 该你回信</b> · <b>🟡 等太久了，该 follow up</b>。
+      读缓存，秒开；<i>refresh</i> 才会重新读邮箱（约 2 分钟）。</p>
+      <p><button onclick="load(false)">Load</button>
+         <button onclick="load(true)">Refresh from Gmail</button>
+         <label class="small muted"><input type="checkbox" id="dead" onchange="render()">
+           显示已冷 / 已挂（超过 45 天没动静的）</label></p>
+      <div id="sum"></div><div id="out"></div>
+      <script>
+      function esc(s){const e=document.createElement('div');e.textContent=s||'';return e.innerHTML}
+      async function load(refresh){
+        const o=document.getElementById('out');
+        o.innerHTML='<p class="muted">'+(refresh?'reading Gmail…':'loading…')+'</p>';
+        const r=await fetch('/api/companies?refresh='+(refresh?'true':'false'));
+        if(!r.ok){o.innerHTML='<p class="tip warn">'+esc(await r.text())+'</p>';return}
+        window._d=await r.json(); render();
+      }
+      function render(){
+        const d=window._d; if(!d) return;
+        const s=d.summary, showDead=document.getElementById('dead').checked;
+        document.getElementById('sum').innerHTML=
+          '<p class="small muted">'+d.account+' · <b>'+s.live+'</b> 个在跑（'+
+          '<b>'+s.your_turn+'</b> 该你回 · '+s.waiting+' 等对方 · '+s.booked+' 已排期）· '+
+          s.cold+' 个已冷 · '+s.closed+' 个已挂</p>';
+        const rows=d.rows.filter(r=>showDead||(!r.dead&&!r.cold));
+        const mark={2:'🔴',1:'🟡',0:'　'};
+        document.getElementById('out').innerHTML=rows.map(r=>
+          '<div style="border-bottom:1px solid #eef2f6;padding:10px 0;'+
+          (r.dead||r.cold?'opacity:.45':'')+'">'+
+          '<span style="font-size:15px">'+mark[r.urgency]+'</span> '+
+          '<b style="font-size:15px">'+esc(r.company)+'</b> '+
+          '<span class="pill '+(r.dead||r.cold?'lo':(r.rank>=3?'hi':'md'))+'">'+
+            esc(r.stage_label)+'</span> '+
+          '<span class="small muted">'+r.messages+' 封 · '+r.threads+' 个线程 · 最后 '+
+            r.last_date+'（'+r.quiet_days+' 天前）</span>'+
+          '<div class="small" style="margin-top:3px">'+esc(r.action)+'</div>'+
+          '<div class="small muted">'+esc(r.last_subject)+'</div>'+
+          '<div class="small muted">🏷 '+esc(r.label)+'</div>'+
+          '</div>').join('')+
+          (d.review.length?'<h3 style="margin-top:22px">认不出公司的线程 ('+d.review.length+
+            ')</h3><p class="small muted">没有打标签，也没进上面的表 —— 需要你看一眼</p>'+
+            d.review.map(t=>'<div class="small" style="padding:4px 0">'+t.last_date+' · '+
+              esc(t.why)+' · '+esc(t.subject)+'</div>').join(''):'');
+      }
+      load(false);
       </script>""")
 
 

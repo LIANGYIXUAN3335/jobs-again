@@ -10,6 +10,7 @@ import re
 import sqlite3
 from zoneinfo import ZoneInfo
 
+from . import budget
 from . import config as cfgmod
 from . import scoring
 from .config import db_path, norm_key, user_db_path
@@ -123,6 +124,24 @@ CREATE TABLE IF NOT EXISTS reply_queue (
   draft TEXT, references_hdr TEXT, in_reply_to TEXT,
   status TEXT DEFAULT 'pending',        -- pending | sent | dismissed
   found_at TEXT, sent_at TEXT
+);
+-- The "I'm applying to THIS one right now" pins. A LinkedIn role's apply_url is the LinkedIn
+-- page; clicking Apply there lands on the employer's own ATS, whose URL shares no id with our
+-- li:<id> role — so the extension's URL lookup can never join them back (see
+-- store.lookup_role_by_ids). Clicking ↗ in the UI records the intent here; the extension asks
+-- for it only after its URL lookup fails, and only within a short TTL so a stale pin can't
+-- attach yesterday's résumé to today's form.
+--
+-- One row PER ROLE, not a single global slot. The slot version lost every ↗ but the last, and
+-- the owner's actual habit is to open a batch of tabs and click ↗ down the list — so by the
+-- time a form was filled the slot held whatever was clicked last. That silently labelled a
+-- Precisely posting with a Temporal role (2026-07-31) and would have attached Temporal's
+-- résumé. company_norm is denormalised in on purpose: the extension has to pick the pin that
+-- matches the page it is on, and that decision must not need a join back to jobs.roles.
+CREATE TABLE IF NOT EXISTS apply_pins (
+  job_id TEXT PRIMARY KEY,
+  company_norm TEXT,
+  pinned_at TEXT NOT NULL
 );
 """
 
@@ -247,6 +266,11 @@ def _migrate(conn: sqlite3.Connection, migrations: list[tuple[str, str, str]]) -
 
 def _migrate_user(conn: sqlite3.Connection) -> None:
     _migrate(conn, _USER_MIGRATIONS)
+    # apply_pin (single row, id=1) → apply_pins (one row per role). Not an additive column, so
+    # _migrate can't express it. Nothing is carried over and nothing is lost that matters: a
+    # pin is intent that expires in 45 minutes, and the replacement is written by the next ↗.
+    conn.execute("DROP TABLE IF EXISTS apply_pin")
+    conn.commit()
 
 
 def connect_user(cfg: dict) -> sqlite3.Connection:
@@ -368,6 +392,83 @@ def set_status(conn, job_id: str, status: str, resume_variant: str | None = None
 
 def set_notes(conn, job_id: str, notes: str) -> dict:
     return upsert_state(conn, job_id, notes=notes)
+
+
+# ---------- apply pins (see apply_pins in USER_SCHEMA) ----------
+
+PIN_TTL_MIN = 45     # a pin older than this is stale — an application session doesn't last longer
+
+
+def _pin_is_fresh(pinned_at) -> bool:
+    try:
+        when = datetime.datetime.fromisoformat(pinned_at)
+    except (TypeError, ValueError):
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    age_min = (datetime.datetime.now(datetime.timezone.utc) - when).total_seconds() / 60
+    return age_min <= PIN_TTL_MIN
+
+
+def set_apply_pin(conn, job_id: str) -> None:
+    """Record 'I'm applying to this role right now'. Adds to the live set — it does NOT
+    replace the others, because opening a batch of tabs and clicking ↗ down the list is the
+    normal way this gets used, and every one of those clicks is a real statement of intent."""
+    # Microseconds, not seconds: two ↗ clicks land in the same second all the time, and when
+    # several pins fit the same page we pick the newest — a tie there is a coin flip between
+    # two employers' résumés.
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        row = conn.execute(
+            "SELECT company_norm FROM jobs.roles WHERE job_id=?", (job_id,)
+        ).fetchone()
+    except sqlite3.OperationalError:
+        row = None          # user DB opened without the jobs DB attached — pin still works,
+                            # it just carries no company and can't be matched by company alone
+    conn.execute(
+        "INSERT INTO apply_pins (job_id, company_norm, pinned_at) VALUES (?, ?, ?)"
+        " ON CONFLICT(job_id) DO UPDATE SET pinned_at=excluded.pinned_at,"
+        " company_norm=excluded.company_norm",
+        (job_id, (row["company_norm"] if row else None) or "", now),
+    )
+    _prune_apply_pins(conn)
+    conn.commit()
+
+
+def _prune_apply_pins(conn) -> None:
+    """Drop pins past the TTL. Done on every write so the table stays a handful of rows and
+    a stale pin can never be picked, even if the reader forgets to check."""
+    # Same precision as the writer, so the string compare below matches chronological order.
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(minutes=PIN_TTL_MIN)).isoformat()
+    conn.execute("DELETE FROM apply_pins WHERE pinned_at < ?", (cutoff,))
+
+
+def get_apply_pins(conn) -> list[dict]:
+    """Every live pin, newest first. The caller picks which one fits the page it is on —
+    this layer deliberately does not guess, because guessing is what produced the
+    Temporal-résumé-on-a-Precisely-form bug."""
+    rows = conn.execute(
+        "SELECT job_id, company_norm, pinned_at FROM apply_pins"
+        " ORDER BY pinned_at DESC, rowid DESC"        # rowid breaks any residual timestamp tie
+    ).fetchall()
+    return [dict(r) for r in rows if _pin_is_fresh(r["pinned_at"])]
+
+
+def get_apply_pin(conn) -> str | None:
+    """The most recent live pin's job_id, or None. Back-compat for callers (and older
+    extension builds) that still want a single answer — prefer get_apply_pins."""
+    pins = get_apply_pins(conn)
+    return pins[0]["job_id"] if pins else None
+
+
+def clear_apply_pin(conn, job_id: str | None = None) -> None:
+    """Clear one pin (the frame that claimed it) or all of them."""
+    if job_id:
+        conn.execute("DELETE FROM apply_pins WHERE job_id=?", (job_id,))
+    else:
+        conn.execute("DELETE FROM apply_pins")
+    conn.commit()
 
 
 def record_signal(conn, job_id: str, *, stage: str | None = None, outcome: str | None = None,
@@ -545,6 +646,19 @@ def seed_applied_companies(cfg: dict) -> None:
 
 # ---------- the review view (join of both files) ----------
 
+def _sort_rows(out: list[dict], sort: str) -> None:
+    """Order the rows in place. `rank_score` = weighted_score + freshness bonus, so the
+    default already IS 'score + fresh'; `base_score` is the freshness-free view."""
+    if sort == "company":
+        out.sort(key=lambda r: (r["company"], -(r["rank_score"] or 0)))
+    elif sort == "first_seen":
+        out.sort(key=lambda r: (r["first_seen"] or "", r["rank_score"] or 0), reverse=True)
+    elif sort == "base_score":
+        out.sort(key=lambda r: (r["weighted_score"] or 0, r["first_seen"] or ""), reverse=True)
+    else:
+        out.sort(key=lambda r: (r["rank_score"] or 0, r["first_seen"] or ""), reverse=True)
+
+
 def fetch_view(
     conn: sqlite3.Connection,
     cfg: dict,
@@ -557,7 +671,8 @@ def fetch_view(
     seen: str = "all",
     remote: str = "",
     seniority: str = "",
-    sort: str = "score",
+    sort: str = "diversity",     # keep select_daily's company interleave; see _sort_rows
+    rot: int = 0,
 ) -> dict:
     rows = [dict(r) for r in conn.execute(
         "SELECT r.*, s.status AS own_status, s.notes, s.applied_date,"
@@ -699,14 +814,7 @@ def fetch_view(
                               "title": top["title"], "score": top["weighted_score"],
                               "company_mean": round(mean, 1)})
 
-    if sort == "company":
-        out.sort(key=lambda r: (r["company"], -r["rank_score"]))
-    elif sort == "first_seen":
-        out.sort(key=lambda r: (r["first_seen"] or "", r["rank_score"]), reverse=True)
-    elif sort == "base_score":
-        out.sort(key=lambda r: (r["weighted_score"] or 0, r["first_seen"] or ""), reverse=True)
-    else:
-        out.sort(key=lambda r: (r["rank_score"], r["first_seen"] or ""), reverse=True)
+    _sort_rows(out, sort)
 
     # --- per-company cap: in the review tab, show at most `max` roles per company (top by
     # score), frozen for `window_days` so you work through one batch before the next surfaces.
@@ -714,7 +822,20 @@ def fetch_view(
     cap_cfg = cfg.get("per_company_cap") or {}
     cap_max = int(cap_cfg.get("max", 0) or 0)
     cap_info: dict[str, dict] = {}
-    if status == "new" and cap_max > 0:
+    budget_info: dict = {}
+    if status == "new" and budget.enabled(cfg):
+        # New three-knob budget supersedes the display-only per-company cap entirely:
+        # stock (lifetime per company) + pace (strict-company rate limits) + daily buckets.
+        out, budget_info = budget.select_daily(out, rows, cfg, today, rot=rot)
+        counts["new"] = len(out)
+        # select_daily re-orders by its own company ring, which silently made the sort
+        # dropdown a no-op in the review tab (all four options returned byte-identical
+        # lists). Re-apply the chosen sort AFTERWARDS: 'diversity' keeps the interleave
+        # select_daily just built, anything else re-sorts those same rows. Which roles you
+        # get never depends on the sort — only their order does.
+        if sort and sort != "diversity":
+            _sort_rows(out, sort)
+    elif status == "new" and cap_max > 0:
         window = int(cap_cfg.get("window_days", 7))
         stale = (datetime.date.fromisoformat(today) - datetime.timedelta(days=window)).isoformat()
         review_by_co: dict[str, list] = {}
@@ -753,6 +874,7 @@ def fetch_view(
         "companies": companies,
         "applied_companies": sorted(applied_cos.values(), key=str.lower),
         "cap_info": cap_info,
+        "budget": budget_info,
         "diversify_picks": div_picks,
         "run": last_run(conn),
         "today": today,

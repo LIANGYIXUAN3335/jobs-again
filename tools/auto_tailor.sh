@@ -8,6 +8,17 @@ cd /path/to/interview/workspace/jobscan
 mkdir -p data/logs
 LOG=data/logs/autotailor.log
 CLAUDE="$HOME/.local/bin/claude"
+
+# Single-run lock. This used to be safe by construction — one launchd job, once a day. It is
+# now also invoked at the END of the scan and LinkedIn pipelines (so roles get a résumé the
+# moment they land, instead of waiting for the next 09:45), which means two runs can overlap.
+# Two headless Claude sessions writing the same YAMLs would interleave garbage.
+LOCK=data/logs/.autotailor.lock
+if ! mkdir "$LOCK" 2>/dev/null; then
+    echo "$(date) auto_tailor already running — exiting" >>"$LOG"; exit 0
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+
 echo "===== $(date) auto_tailor start =====" >>"$LOG"
 
 # 1. prep — pick guardrail-passing roles, write prompts + manifest (pure Python, no LLM)

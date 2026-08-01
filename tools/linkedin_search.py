@@ -25,7 +25,7 @@ sys.path.insert(0, str(BASE))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import linkedin_guest as lg  # noqa: E402
-from app import config as cfgmod, store  # noqa: E402
+from app import budget, config as cfgmod, store  # noqa: E402
 
 PENDING = "scratch_priors/linkedin_alerts_pending.json"
 SEEN = "scratch_priors/linkedin_alert_seen.json"
@@ -66,6 +66,30 @@ def main() -> None:
         pending = []
     in_pending = {str(j.get("id")) for j in pending}
 
+    # Company-targeted groups (f_C=<id>) are only worth a request while that company still
+    # has application budget left. Apple is the case that forced this: its f_C group was
+    # added the same day its stock hit 9/8, so every one of the ~30 cards it would pull each
+    # night was destined to be filtered out by budget before it could ever be applied to —
+    # while still consuming enrich_cap. Check the quota first, skip the group if it's spent.
+    # A group needs `company:` (the company_norm key) for this; without it we can't tell.
+    if any(g.get("company_id") for g in searches):
+        user = store.connect_view(cfg)
+        try:
+            all_rows = store.fetch_view(user, cfg, status="all")["rows"]
+            stock = budget.stock_status(all_rows, cfg)
+        finally:
+            user.close()
+        kept = []
+        for g in searches:
+            cn = (g.get("company") or "").lower()
+            s = stock.get(cn) if cn else None
+            if g.get("company_id") and s and s["retired"]:
+                print(f"  skip f_C={g['company_id']} ({s['company']}): 配额已用满 "
+                      f"{s['used']}/{s['limit']} — 抓回来也投不出去")
+                continue
+            kept.append(g)
+        searches = kept
+
     client = lg.make_client()
     today = datetime.date.today().isoformat()
     fresh: list[dict] = []
@@ -75,7 +99,8 @@ def main() -> None:
             print(f"CIRCUIT BREAK: {BREAKER} consecutive blocked queries — stopping sweep")
             break
         label = f"{group.get('keywords', '?')} × {group.get('location', '?')}" \
-                + (" × remote" if group.get("remote") else "")
+                + (" × remote" if group.get("remote") else "") \
+                + (f" × f_C={group['company_id']}" if group.get("company_id") else "")
         cards_total, new_here = 0, 0
         for page in range(pages):
             params = {
@@ -86,6 +111,16 @@ def main() -> None:
             }
             if group.get("remote"):
                 params["f_WT"] = "2"
+            # Company-targeted sweep. `f_C` is LinkedIn's company facet and takes the NUMERIC
+            # company id — putting the company NAME in `keywords` does not work and is worse
+            # than useless: measured 2026-07-30, "Apple software engineer" returned Google 4 /
+            # Microsoft 3 / Adobe 1 / Amazon 1 and zero Apple, "Tesla software engineer"
+            # returned GM 4 / Rivian / Waymo / Nuro. LinkedIn reads the name semantically and
+            # serves competitors. With f_C the same probe was 8/8 Apple and 10/10 Tesla.
+            # Ids can't be scraped (guest HTML exposes only the slug, /company/ pages 999) —
+            # read one off the f_C= parameter in your own browser's job-search URL.
+            if group.get("company_id"):
+                params["f_C"] = str(group["company_id"])
             lg.polite_pause(delay)
             try:
                 resp = client.get(f"{lg.SEARCH_URL}?{urlencode(params)}")

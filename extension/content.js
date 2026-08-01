@@ -2091,6 +2091,7 @@
         .chip.none{ background:#fdecea; color:#b42318; }
         .chip.applied-warn{ display:block; background:#fde2e1; color:#b42318; font-weight:600; margin-bottom:6px; }
         .chip.company-warn{ display:block; background:#fff3cd; color:#7a5c00; margin-bottom:6px; cursor:help; }
+        .chip.pin{ display:block; background:#e8eefb; color:#1e3a8a; margin-bottom:6px; cursor:help; }
         button{ display:flex; align-items:center; justify-content:center; gap:7px; font:inherit; font-weight:600;
           cursor:pointer; border:1px solid #e2e8f0; border-radius:9px; background:#f8fafc; color:#0f172a;
           padding:9px 12px; margin-top:9px; width:100%; transition:filter .12s, background .12s; }
@@ -2129,17 +2130,50 @@
     $(".role").textContent = `${role.company} — ${role.title}`;
     // "Did I already apply?" — the panel's most useful glance. THIS role applied → strong red;
     // else other roles at the same company applied → amber heads-up.
+    //
+    // The wording has to track HOW SURE we are which role this is. Matched from the URL, the
+    // role IS this page and "THIS role" is literally true. Guessed (top_role_default) or
+    // pinned, it is a different claim — and saying "THIS role" about a guess is exactly the
+    // contradiction the owner hit: JobScan showed an un-applied role while the panel insisted
+    // the role was already applied, because they were talking about two different rows.
+    const guessed = role.top_role_default || role.from_pin;
     let appliedWarn = "";
     if (role.this_status === "applied" || role.this_status === "interviewing") {
-      appliedWarn = `<div class="chip applied-warn">⚠ you already marked THIS role “${role.this_status}”</div>`;
+      appliedWarn = guessed
+        ? `<div class="chip company-warn" title="This role was not matched from the page URL, so this may not be the posting you are on.">⚠ the role shown here (“${role.title}”) is marked “${role.this_status}” — but it was not matched from this URL, so it may not be this posting</div>`
+        : `<div class="chip applied-warn">⚠ you already marked THIS role “${role.this_status}”</div>`;
     } else if ((role.company_applied || []).length) {
       const a = role.company_applied;
       const names = a.slice(0, 2).map((x) => x.title).join("; ") + (a.length > 2 ? ` +${a.length - 2} more` : "");
       appliedWarn = `<div class="chip company-warn" title="${a.map((x) => x.title + " · " + x.status + (x.date ? " · " + x.date : "")).join("\n")}">↩ you've applied to ${role.company} before (${a.length}): ${names}</div>`;
     }
-    $(".status").innerHTML = appliedWarn + (role.has_tailored_pdf
+    // This page's URL did NOT identify the role — it came from the ↗ you clicked in JobScan.
+    // Say so loudly: everything below (résumé, salary, AI answers) is for THAT role, and if you
+    // wandered to a different posting in between, this is the moment to notice.
+    const pinNote = role.no_role_match
+      // Worst case for silence: we know the company but NOT which posting, so nothing below is
+      // role-specific. Say it in the loudest chip we have, because the failure this guards
+      // against (filling a form believing the panel matched it) looks identical to success.
+      ? `<div class="chip applied-warn" title="Neither the URL nor any ↗ pin identified this posting, so JobScan is only filling profile-level fields (name, email, links). No role-specific résumé, salary or AI answer is available here.">🚫 JobScan does NOT know which job this is — profile fields only</div>`
+      : role.from_pin
+      ? `<div class="chip pin" title="This page's URL doesn't match any role in JobScan (normal for LinkedIn roles, which hand off to the employer's own ATS). Using a role you clicked ↗ on whose company also appears on this page. Close the panel if that's not this job.">📌 from the ↗ you clicked in JobScan — not matched from this URL</div>`
+      // A company-level guess is weaker than a pin: nobody chose it, the server just took the
+      // company's best un-applied role with a résumé. Everything below (résumé file, salary,
+      // AI answers) belongs to THAT role, so it has to be as visible as the pin note.
+      : role.top_role_default
+      ? `<div class="chip pin" title="This page's URL carries no job id (common on Google/Microsoft careers), so JobScan guessed the company's best open role that has a tailored résumé. If this is not the posting you are on, close the panel — the résumé below belongs to the role named above.">🎲 guessed from company — URL had no job id</div>`
+      : "";
+    // Pins that were live but belong to a different employer. Naming them turns a confusing
+    // non-event ("why is there no résumé?") into a readable one ("those are for other tabs").
+    const rejectedNote = (role.pins_rejected || []).length
+      ? `<div class="chip company-warn" title="${(role.pins_rejected || []).join("\n")}">📌 ${role.pins_rejected.length} other pinned role(s) ignored — they belong to a different company than this page</div>`
+      : "";
+    // "no tailored résumé" means the upload below is the BASE résumé, not one written for this
+    // JD. Spell that out — "text only" read as a formatting note, not as "wrong file".
+    const resumeChip = role.has_tailored_pdf
       ? '<span class="chip ready">tailored résumé ready</span>'
-      : '<span class="chip none">no tailored résumé — text only</span>');
+      : `<span class="chip none" title="No tailored PDF exists for this role, so nothing role-specific will be attached. Tailor it in JobScan first if this application matters.">⚠ no tailored résumé for this role — base/profile fields only</span>`;
+    $(".status").innerHTML = pinNote + rejectedNote + appliedWarn + resumeChip;
     const log = (m, cls) => { const d = document.createElement("div"); if (cls) d.className = cls; d.textContent = m; $(".log").appendChild(d); };
 
     $(".x").onclick = () => { abortFill = true; host.remove(); };   // closing the panel also stops a fill
@@ -2321,6 +2355,31 @@
   let shownFor = null;   // URL the panel is currently shown for
   let busy = false;      // avoid overlapping lookups while the DOM churns
 
+  // ---- the server now keeps one pin PER ROLE (apply_pins), so a newer ↗ no longer evicts an
+  //      older tab's role. This claim step still earns its keep: the first frame to resolve a
+  //      role off a pin copies it into sessionStorage (inherently per-tab, survives reload +
+  //      SPA nav) and releases just that row, so later re-resolves in this tab are free and
+  //      the live pin set stays small and honest about what is still un-applied.
+  const PIN_KEY = "jobscan:claimed-pin";
+  function claimedPin() {
+    try {
+      const raw = sessionStorage.getItem(PIN_KEY);
+      if (!raw) return null;
+      const saved = JSON.parse(raw);
+      // Same tab navigated to a different employer: a pin claimed for company A must not
+      // follow you to company B. A real URL match always outranks this anyway.
+      return saved && saved.origin === location.origin ? saved.role : null;
+    } catch (e) { return null; }        // sandboxed frames throw on sessionStorage access
+  }
+  function claimPin(role) {
+    try {
+      sessionStorage.setItem(PIN_KEY, JSON.stringify({ origin: location.origin, role }));
+    } catch (e) { /* no storage in this frame — worst case we ask the server again */ }
+    // Release only THIS role's pin — the other tabs' pins are other roles you still intend to
+    // apply to. Fire-and-forget; the TTL is still the backstop.
+    send({ type: "unpin", jobId: role && role.job_id });
+  }
+
   async function tryShow() {
     if (busy) return;
     // Workday renders its own widgets (no file input on most steps) — detect its form fields.
@@ -2356,19 +2415,77 @@
         return "";
       };
       const company = hostCompany();
+      // The pin comes BEFORE the host/company guesses: it is a statement of intent ("I clicked
+      // ↗ on this exact role a minute ago"), which beats "the top-scored role at whatever
+      // company this host looks like". It is also the ONLY thing that rescues a LinkedIn role —
+      // Apply on LinkedIn hands off to the employer's ATS, whose URL carries no id we store, so
+      // no amount of URL parsing can reach li:<id>. The server expires the pin, so a stale one
+      // can't quietly attach yesterday's résumé.
+      // …but a pin is a statement about ONE role, not a licence to label any page. It is
+      // company-blind, so within its 45-minute life it would attach itself — and its tailored
+      // résumé — to whatever un-matched application form you happened to open next. That
+      // really happened: a pin on a Temporal role labelled a Precisely posting
+      // (precisely.com carries no id we store and isn't in HOST_CO, so both other paths were
+      // silent and the pin won by default). Filling a Precisely form with Temporal's résumé
+      // is the worst outcome this panel can produce, so require the page to actually look
+      // like the pinned company before believing it.
+      const pinFitsPage = (r) => {
+        const co = (r && r.company || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+        if (!co || co.length < 3) return false;
+        const hay = (location.hostname + location.pathname + " " + (document.title || "") +
+                     " " + (document.body ? document.body.innerText.slice(0, 4000) : ""))
+                    .toLowerCase().replace(/[^a-z0-9]+/g, "");
+        return hay.includes(co);
+      };
+      let freshPin = false;
+      let pinsRejected = [];       // pins that were live but belong to some other employer
+      if (!role) {
+        // Same test for the tab's already-claimed pin. Its `origin` guard is too coarse on
+        // shared ATS hosts: job-boards.greenhouse.io/temporal and .../precisely are the SAME
+        // origin, so a claimed pin would follow you between two unrelated employers.
+        const claimed = claimedPin();
+        role = claimed && pinFitsPage(claimed) ? claimed : null;
+        if (!role) {
+          // ALL live pins, not just the newest. Clicking ↗ down a list of tabs is the normal
+          // workflow, so the newest pin is routinely NOT the one whose form is open — asking
+          // for a single pin meant the other tabs silently got the wrong role's résumé.
+          const p = await send({ type: "pins" });
+          const live = (p && p.roles) || [];
+          const fits = live.filter(pinFitsPage);
+          pinsRejected = live.filter((r) => !fits.includes(r));
+          if (fits.length) { role = fits[0]; freshPin = true; }   // newest of the ones that fit
+          for (const r of pinsRejected) {
+            console.info("[JobScan] ignoring pin —", r.company, "does not appear on this page");
+          }
+        }
+      }
       if (!role && company) {
         const top = await send({ type: "topRole", company });
         if (top && top.found) role = top.role;
         else {
           const p = await send({ type: "profile" });
-          if (p && p.ok) role = { ...p, company, title: "profile fill (no role match)", has_tailored_pdf: false };
+          if (p && p.ok) role = { ...p, company, title: "profile fill (no role match)",
+                                  has_tailored_pdf: false, no_role_match: true };
         }
       }
-      if (!role) { console.info("[JobScan] no matching role for", location.href); return; }
+      // Still nothing: stay silent, as before. Showing a panel here would mean inventing a
+      // role for a page we can't identify, which is the opposite of what C is for.
+      if (!role) {
+        if (pinsRejected.length) {
+          console.info("[JobScan] no panel — none of the", pinsRejected.length,
+                       "live pins appear on this page:",
+                       pinsRejected.map((r) => r.company).join(", "));
+        } else {
+          console.info("[JobScan] no matching role for", location.href);
+        }
+        return;
+      }
+      role = { ...role, pins_rejected: pinsRejected.map((r) => `${r.company} — ${r.title}`) };
       const old = document.getElementById("jobscan-panel");
       if (old) old.remove();
       shownFor = location.href;
       panel(role);
+      if (freshPin) claimPin(role);   // only now — a frame that merely probed must not eat it
     } finally { busy = false; }
   }
 
@@ -2516,15 +2633,44 @@
   pillTick();
   setInterval(pillTick, 1500);
 
-  // 1) poll for ~20s after load (covers the form rendering after a click to "Apply")
-  let ticks = 0;
-  const poll = setInterval(() => { tryShow(); if (++ticks > 40) clearInterval(poll); }, 500);
+  // 1) poll for ~20s after load (covers the form rendering after a click to "Apply").
+  //    The budget is WALL-CLOCK, not a tick count: Chrome throttles a background tab's
+  //    timers to roughly one tick a minute, so counting ticks used to spend the whole
+  //    budget while the SPA was still rendering — then clearInterval killed the poll for
+  //    good and the panel never appeared on that tab again. That is the "open a second tab
+  //    and the first one stops filling" bug.
+  const POLL_MS = 20000;
+  let deadline = Date.now() + POLL_MS;
+  let poll = null;
+  function startPoll() {
+    if (poll) return;
+    poll = setInterval(() => {
+      tryShow();
+      if (Date.now() > deadline) { clearInterval(poll); poll = null; }
+    }, 500);
+  }
+  startPoll();
   // 2) react to DOM changes (form injected without a reload)
   new MutationObserver(() => tryShow()).observe(document.documentElement, { childList: true, subtree: true });
   // 3) react to SPA navigation (URL changed without a full page load)
   let lastUrl = location.href;
   setInterval(() => {
-    if (location.href !== lastUrl) { lastUrl = location.href; shownFor = null; ticks = 0; tryShow(); }
+    if (location.href !== lastUrl) {
+      lastUrl = location.href; shownFor = null;
+      deadline = Date.now() + POLL_MS; startPoll();
+      tryShow();
+    }
   }, 800);
+  // 4) a backgrounded tab coming back into view. Its poll window may have expired while
+  //    throttled, and the SPA likely finished rendering while it was frozen — so no
+  //    mutation will fire either. Nothing else re-arms it: returning to a tab is not a URL
+  //    change. Give it a fresh window whenever it is visible with no panel up.
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") return;
+    if (document.getElementById("jobscan-panel")) return;
+    shownFor = null;
+    deadline = Date.now() + POLL_MS; startPoll();
+    tryShow();
+  });
   tryShow();
 })();

@@ -1,13 +1,17 @@
 """Daily auto-tailor PREP (no LLM, no cost): pick the review-visible roles that pass the
-guardrails (score >= auto_tailor.min_score, no résumé yet, within the per-company cap),
-write their tailoring prompts, and emit a manifest for the headless Claude Code step to work
-through. Prints how many were queued (0 => the shell wrapper skips the LLM step entirely).
+guardrails, write their tailoring prompts, and emit a manifest for the headless Claude Code
+step to work through. Prints how many were queued (0 => the shell wrapper skips the LLM step).
+
+With `application_budget` on (the default since 2026-07-30) the guardrail is simply "is it in
+today's review queue" — budget.select_daily already applied binary eligibility, the per-company
+stock cap, strict-company pacing, and the daily bucket mix. The legacy score gate
+(auto_tailor.min_score) is only used when application_budget.enabled is false.
 """
 import json
 import sys
 
 sys.path.insert(0, ".")
-from app import config as cfgmod, store, tailoring  # noqa: E402
+from app import budget, config as cfgmod, store, tailoring  # noqa: E402
 
 MANIFEST = "scratch_priors/autotailor_manifest.json"
 
@@ -17,27 +21,40 @@ def main():
     at = cfg.get("auto_tailor") or {}
     if not at.get("enabled"):
         print("auto_tailor disabled"); _write([]); return
-    min_score = float(at.get("min_score", 75))
-    strong_min = float(at.get("strong_min_score", 70))   # strong-verdict roles qualify earlier
-    cap = int(at.get("max_per_day", 30))
-
     conn = store.connect_view(cfg)
-    # status="all": the per-company DISPLAY cap only applies to the "new" view, and it was
-    # hiding brand-new qualifying roles at full companies (Salesforce's 16th role never
-    # reached the nightly tailor). Filter by the per-row in_review flag instead — same
-    # eligibility semantics (new + not hidden/cooldown/drop), no display cap.
-    d = store.fetch_view(conn, cfg, status="all")
-    todo = [r for r in d["rows"]
-            if r.get("in_review")
-            and r.get("tailor_status") != "ready" and r.get("verdict") != "drop"
-            and ((r["weighted_score"] or 0) >= min_score
-                 or (r.get("verdict") == "strong"
-                     and (r["weighted_score"] or 0) >= strong_min))]
-    # Rank, not raw score: within a day's cap, spend the tailoring budget on the roles that
-    # only just went up — the gate above is still the raw score, so freshness cannot let a
-    # weak role in, it only reorders the ones already qualified.
-    todo.sort(key=lambda r: -r.get("rank_score", r["weighted_score"] or 0))
-    todo = todo[:cap]
+
+    if budget.enabled(cfg):
+        # Contract (owner 2026-07-30): "what the review queue shows me today is what should
+        # have a résumé today". No score gate at all — application_budget already decided
+        # eligibility (binary) and volume, so re-gating on score here would reintroduce
+        # exactly the bug we removed: a 66-point role at a company with zero applications is
+        # worth more than Nvidia's 14th 78-point role.
+        #
+        # ONE PER COMPANY (2026-07-31). The queue now lists every eligible role interleaved by
+        # company rather than one per company, so "everything the queue shows" became ~1800
+        # rows / ~1000 untailored — a batch no subscription run finishes. The owner's actual
+        # ask is company-level: "所有可以投的公司我都需要一份简历". The interleave puts each
+        # company's lead role first, so taking the first row per company is exactly that set,
+        # and it is the row she reaches first when working top-down.
+        d = store.fetch_view(conn, cfg, status="new")
+        seen: set[str] = set()
+        leads = [r for r in d["rows"]
+                 if not (r["company_norm"] in seen or seen.add(r["company_norm"]))]
+        todo = [r for r in leads if r.get("tailor_status") != "ready"]
+        cap = len(todo)
+    else:
+        min_score = float(at.get("min_score", 75))
+        strong_min = float(at.get("strong_min_score", 70))
+        cap = int(at.get("max_per_day", 30))
+        d = store.fetch_view(conn, cfg, status="all")
+        todo = [r for r in d["rows"]
+                if r.get("in_review")
+                and r.get("tailor_status") != "ready" and r.get("verdict") != "drop"
+                and ((r["weighted_score"] or 0) >= min_score
+                     or (r.get("verdict") == "strong"
+                         and (r["weighted_score"] or 0) >= strong_min))]
+        todo.sort(key=lambda r: -r.get("rank_score", r["weighted_score"] or 0))
+        todo = todo[:cap]
 
     manifest = []
     for r in todo:
@@ -49,7 +66,8 @@ def main():
         except Exception as e:  # noqa: BLE001
             print(f"  skip {r['job_id']}: {e}", file=sys.stderr)
     _write(manifest)
-    print(f"auto_tailor prep: {len(manifest)} roles queued (score>={min_score:g}, cap {cap})")
+    gate = "budget: today's review queue" if budget.enabled(cfg) else f"score>={min_score:g}"
+    print(f"auto_tailor prep: {len(manifest)} roles queued ({gate}, cap {cap})")
 
 
 def _write(manifest):
