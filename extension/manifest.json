@@ -27,7 +27,8 @@
     "*://www.circle.com/careers/*",
     "*://www.hashicorp.com/careers/*",
     "*://retool.com/careers/*",
-    "*://www.deel.com/careers/*"
+    "*://www.deel.com/careers/*",
+    "*://jobs.deel.com/*"
   ],
   "background": { "service_worker": "background.js" },
   "action": { "default_popup": "popup.html", "default_title": "JobScan Apply Helper" },
@@ -53,7 +54,8 @@
         "*://www.circle.com/careers/*",
         "*://www.hashicorp.com/careers/*",
         "*://retool.com/careers/*",
-        "*://www.deel.com/careers/*"
+        "*://www.deel.com/careers/*",
+        "*://jobs.deel.com/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle",

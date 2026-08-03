@@ -2237,7 +2237,20 @@
         const res = await send({ type: "resume", jobId: role.job_id });
         if (res && res.ok) {
           const ok = attachResume(b64ToBytes(res.b64), res.name);
-          log(ok ? "résumé PDF attached ✓" : "couldn't find a résumé upload field", ok ? "good" : "warn");
+          if (!ok && /jobs\.apple\.com/.test(location.hostname)) {
+            // Apple keeps a PROFILE-level resume. While one is attached, the upload input
+            // (#attachfile-resume-fileupload) is not rendered at all — and the attached file
+            // is whatever the LAST application uploaded, i.e. the wrong résumé for this role.
+            // Removing her stored file is her call, not ours (we never overwrite user data):
+            // point at the exact fix instead of failing mutely.
+            const removeBtn = [...document.querySelectorAll("button")]
+              .find((b) => /^remove\b/i.test((b.textContent || "").trim()));
+            log(removeBtn
+              ? "Apple has a previous résumé attached (probably from your last application). Click its Remove link, then hit Fill again — the right PDF attaches automatically."
+              : "couldn't find a résumé upload field", "warn");
+          } else {
+            log(ok ? "résumé PDF attached ✓" : "couldn't find a résumé upload field", ok ? "good" : "warn");
+          }
         } else {
           log("résumé fetch failed: " + (res && res.error), "warn");
         }
@@ -2318,7 +2331,8 @@
         : (IS_SR
           ? (deepAll("input#first-name-input, input#email-input, sr-question-field-radio, sr-question-field-select")[0]
              || (/\/screening/i.test(location.pathname) ? deepAll("input[role=combobox]")[0] : null))  // shadow DOM; page 2 = /screening
-          : document.querySelector('input[type=file], #first_name, [name*="resume" i]')));
+          : document.querySelector('input[type=file], #first_name, [name*="resume" i],'
+              + ' #attachfile-resume-fileupload, [id^="attachfile-"]')));
     if (!hasForm) return;                                    // not on the application form yet
     if (shownFor === location.href && document.getElementById("jobscan-panel")) return;
     busy = true;
@@ -2326,12 +2340,23 @@
       const res = await send({ type: "lookup", url: location.href });
       if (!res) { console.warn("[JobScan] no response — is JobScan running on http://127.0.0.1:8787 ?"); return; }
       let role = res.found ? res.role : null;
-      // Google/Microsoft careers URLs carry no job id. Owner's rule: default to the company's
-      // TOP-scored role (she applies high-score-first, so the first is the best guess) and use
-      // ITS tailored résumé. Only if the company has no tailored role, fall back to profile-only.
-      if (!role && (IS_GOOGLE || IS_MICROSOFT || IS_SR)) {
-        const company = IS_GOOGLE ? "Google" : IS_MICROSOFT ? "Microsoft"
-          : ((location.pathname.match(/\/company\/([^/]+)/) || [])[1] || "").replace(/[-_]/g, " ");
+      // Careers sites whose URLs carry no matchable job id. Owner's rule: default to the
+      // company's TOP-scored role (she applies high-score-first, so the first is the best
+      // guess) and use ITS tailored résumé; profile-only as the last resort. LinkedIn is
+      // deliberately absent — no automation there during an active search.
+      const HOST_CO = { tesla: "Tesla", "jobs.apple": "Apple", atlassian: "Atlassian",
+                        "wise.jobs": "Wise", circle: "Circle", hashicorp: "HashiCorp",
+                        retool: "Retool", deel: "Deel" };
+      const hostCompany = () => {
+        if (IS_GOOGLE) return "Google";
+        if (IS_MICROSOFT) return "Microsoft";
+        if (IS_SR) return ((location.pathname.match(/\/company\/([^/]+)/) || [])[1] || "").replace(/[-_]/g, " ");
+        const h = location.hostname + location.pathname;
+        for (const k in HOST_CO) if (h.includes(k)) return HOST_CO[k];
+        return "";
+      };
+      const company = hostCompany();
+      if (!role && company) {
         const top = await send({ type: "topRole", company });
         if (top && top.found) role = top.role;
         else {
@@ -2351,11 +2376,68 @@
   //      careers site the daily scanner can't reach). Reads the posting off the DOM and sends
   //      it to the local server, which scores it + queues it for tailoring. Always available as
   //      a small pill so she can browse any careers page and pull in whatever looks good. ----
-  function extractJob() {
-    const clean = (s) => (s || "").replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
-    let title = (document.querySelector("h1") || {}).textContent
-      || (document.title || "").split(/[|\-–—·•]/)[0];
-    title = (title || "").trim().slice(0, 160);
+  const cleanTxt = (s) => (s || "").replace(/\s+\n/g, "\n").replace(/\n{3,}/g, "\n\n").trim();
+
+  // Microsoft (an Eightfold board): list + detail-panel SPA. The DOM's biggest text block is
+  // the LIST, so reading pixels captures forty job titles and no JD. The selected job's pid is
+  // in the URL and the board serves a public same-origin JSON API — use the data, not the pixels.
+  async function extractEightfold() {
+    const pid = (location.search.match(/[?&]pid=(\d+)/) || [])[1];
+    if (!pid) return { hint: "click a job first — the URL needs its pid= so I know which one" };
+    try {
+      const domain = location.hostname.split(".").slice(-2).join(".");
+      const r = await fetch(`${location.origin}/api/apply/v2/jobs/${pid}?domain=${domain}`);
+      if (!r.ok) return null;                       // fall through to the generic reader
+      const j = await r.json();
+      const div = document.createElement("div");
+      div.innerHTML = j.job_description || "";
+      const jd = cleanTxt(div.innerText || div.textContent || "");
+      if (jd.length < 80) return null;
+      return { title: (j.name || j.posting_name || "").slice(0, 160), jd: jd.slice(0, 14000),
+               location: (j.locations || [])[0] || j.location || "" };
+    } catch (e) { return null; }
+  }
+
+  // Google careers: the results page keeps the list on screen next to the open job, and every
+  // list card has an h1/h3 of its own — "biggest block" grabs the list. The JD pane is the one
+  // thing recognizable WITHOUT Google's rotating obfuscated class names: its section headings.
+  function extractGoogleCareers() {
+    const heads = [...document.querySelectorAll("h3")].filter((h) =>
+      /^(about the job|minimum qualifications|preferred qualifications|responsibilities)/i
+        .test((h.textContent || "").trim()));
+    if (heads.length < 2)
+      return { hint: "open a specific job first — this looks like the results list" };
+    const parts = [];
+    for (const h of heads) {
+      let txt = (h.textContent || "").trim() + "\n";
+      for (let n = h.nextElementSibling; n && n.tagName !== "H3"; n = n.nextElementSibling)
+        txt += (n.innerText || "") + "\n";
+      parts.push(txt);
+    }
+    const title = (((document.querySelector("main h2") || document.querySelector("h2") || {})
+      .textContent) || (document.title || "").split(/[|—–-]/)[0] || "").trim().slice(0, 160);
+    return { title, jd: cleanTxt(parts.join("\n")).slice(0, 14000) };
+  }
+
+  // Site chrome is not a title. Tesla's careers SPA puts its header nav in the FIRST <h1>
+  // ("Tesla homepageCareersSkip to main content") — which then poisoned every capture's
+  // role-family classification. Walk ALL h1s past the chrome, then og:title, then <title>.
+  const chromey = (s) => !s || s.length > 100
+    || /skip to (main )?content|homepage|cookie|sign.?in|log.?in|access denied|^careers?$|^menu$/i.test(s.trim());
+  function saneTitle() {
+    for (const h of document.querySelectorAll("h1, h2[class*='title' i], [class*='job-title' i]")) {
+      const t = (h.textContent || "").trim();
+      if (!chromey(t)) return t.slice(0, 160);
+    }
+    const og = document.querySelector('meta[property="og:title"]');
+    const cand = (((og && og.content) || document.title || "").split(/[|–—·•]/)[0] || "").trim();
+    return chromey(cand) ? "" : cand.slice(0, 160);
+  }
+
+  async function extractJob() {
+    if (IS_MICROSOFT) { const r = await extractEightfold(); if (r) return r; }
+    if (IS_GOOGLE) { const r = extractGoogleCareers(); if (r) return r; }
+    const title = saneTitle();   // server re-derives from the URL slug if this comes back empty
     // biggest sensible text block wins — description containers first, then main/article, then body
     const cands = [...document.querySelectorAll(
       '[class*="description" i],[id*="description" i],[class*="job" i][class*="detail" i],'
@@ -2366,7 +2448,7 @@
       if (t.length > bestLen) { best = t; bestLen = t.length; }
     }
     if (bestLen < 300) best = (document.body.innerText || "").trim();
-    return { title, jd: clean(best).slice(0, 14000) };
+    return { title, jd: cleanTxt(best).slice(0, 14000) };
   }
 
   function capturePill() {
@@ -2394,15 +2476,18 @@
     const cap = shadow.querySelector(".cap"), out = shadow.querySelector(".out");
     cap.onclick = async () => {
       if (cap.classList.contains("busy")) return;
-      const { title, jd } = extractJob();
-      if (jd.length < 80) {
+      cap.classList.add("busy"); cap.textContent = "📥 reading…";
+      const ex = await extractJob();
+      cap.classList.remove("busy"); cap.textContent = "📥 Capture to JobScan";
+      if (!ex || ex.hint || !ex.jd || ex.jd.length < 80) {
         out.hidden = false; out.className = "out warn";
-        out.textContent = "couldn't read a job description on this page";
+        out.textContent = (ex && ex.hint) || "couldn't read a job description on this page";
         return;
       }
       cap.classList.add("busy"); cap.textContent = "📥 capturing…";
       out.hidden = false; out.className = "out"; out.textContent = "scoring…";
-      const res = await send({ type: "capture", payload: { url: location.href, title, jd, location: "" } });
+      const res = await send({ type: "capture",
+        payload: { url: location.href, title: ex.title, jd: ex.jd, location: ex.location || "" } });
       cap.classList.remove("busy"); cap.textContent = "📥 Capture to JobScan";
       if (res && res.ok) {
         out.className = "out good";
@@ -2413,10 +2498,23 @@
       }
     };
   }
-  // show the pill everywhere EXCEPT the ATS application forms the main panel already owns
-  const ON_ATS_FORM = IS_GOOGLE || IS_SR || IS_WORKDAY || IS_MICROSOFT || IS_ASHBY
-    || /greenhouse|lever|ashby|myworkday|smartrecruiters|rippling|avature/i.test(location.hostname);
-  if (!ON_ATS_FORM) capturePill();
+  // The pill belongs on every careers page the daily scanner can NOT reach. Scanner-covered
+  // ATS hosts stay pill-free (capturing those would just duplicate scanned roles). Google and
+  // Microsoft are exactly the hosts capture EXISTS FOR, yet they were suppressed here as "ATS
+  // form pages" — the fill panel only appears once a real application form renders, so their
+  // browse/list/detail pages had neither panel nor pill and capture was unreachable. Now the
+  // pill shows whenever the panel isn't up, and yields the moment it is.
+  const SCANNER_ATS = IS_SR || IS_WORKDAY || IS_ASHBY
+    || /greenhouse|lever|ashbyhq|myworkday|smartrecruiters|rippling|avature/i.test(location.hostname);
+  function pillTick() {
+    if (SCANNER_ATS) return;
+    const panelUp = !!document.getElementById("jobscan-panel");
+    const pill = document.getElementById("jobscan-capture");
+    if (panelUp && pill) pill.remove();            // the apply form owns the UI
+    else if (!panelUp && !pill) capturePill();     // browse/list/detail pages get the pill (back)
+  }
+  pillTick();
+  setInterval(pillTick, 1500);
 
   // 1) poll for ~20s after load (covers the form rendering after a click to "Apply")
   let ticks = 0;
