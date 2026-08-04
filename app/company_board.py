@@ -39,7 +39,9 @@ _STALE_THEM, _STALE_YOU = 7, 2
 # Past this, silence stops being urgent and starts being an answer. Without it the board opens
 # on a recruiter screen you ghosted in September 2025 shouting "you owe a reply (304 days)",
 # and the four processes actually in flight this week sit below the fold.
-_COLD = 45
+# 2026-08-03 user 拍板从 45 收紧到 15：求职节奏下，15 天没动静的线就当凉了（Nvidia/OCBridge/
+# Gamma/Temu 全是这一刀收进已冷的）。手动 booked/closed 标记不受影响。
+_COLD = 15
 
 
 # outcomes' patterns are tuned for a decision that WRITES to the DB, so they demand a full
@@ -175,7 +177,12 @@ def build(threads: list[dict], overrides: dict[str, dict] | None = None) -> list
                                    and bool(_BOOKED.search(last.get("subject") or "")))
         if forced_booked and not dead and best_rank < _RANK["interview"]:
             stage = "interview"                     # 人说约上面试了，阶段至少是面试中
-        cold = not dead and quiet >= _COLD
+        # "进行中"必须是一场真对话：你回过 / 到过 OA·拒信这种真阶段 / 有日历邀请 / 人工
+        # 标记过。单向来信（猎头冷启动、Ccsend/Gmass 这类工具信）不占进行中，直接归已冷
+        # （2026-08-03 user 审完 Gmail 标签拍板）。
+        conversation = (best_rank >= _RANK["assessment"] or bool(rejected_on) or booked
+                        or any(m.get("from_me") for m in msgs) or bool(ov))
+        cold = not dead and (quiet >= _COLD or not conversation)
         if dead:
             turn, urgency = "closed", 0
             action = (f"手动结案（{(ov.get('set_at') or '')[:10]}）" if forced_dead else "已结束")
