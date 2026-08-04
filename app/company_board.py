@@ -48,7 +48,11 @@ _COLD = 45
 # plainly an interview thread, and under-reading it would show the row as mere contact.
 _BARE = [("onsite", re.compile(r"\bon-?site\b|final round", re.I)),
          ("interview", re.compile(r"\binterviews?\b", re.I)),
-         ("assessment", re.compile(r"\bassessment\b|\bcoding (?:test|challenge)\b", re.I))]
+         ("assessment", re.compile(r"\bassessment\b|\bcoding (?:test|challenge)\b", re.I)),
+         # "Next Steps with Microsoft" 这类约面线程的标题。放在 assessment 之后——
+         # OA 邮件也爱说 next steps，先让更具体的词赢。排除 "Next Steps for Your
+         # (Job) Application"——那是 ATS 投递后的群发（Cisco/Jobgether 误报过面试中）。
+         ("interview", re.compile(r"\bnext steps?\b(?!\s+for\s+your\s+(?:job\s+)?application)", re.I))]
 
 
 def _classify(subject: str) -> str | None:
@@ -73,7 +77,34 @@ _BOOKED = re.compile(
     r"reminder|canceled|cancelled)\s*[:：]|"
     r"^\s*invitation from an unknown sender\s*[:：]|"       # Gmail's wording for the same thing
     r"(?:has been|is|was) scheduled|appointment booked|calendar invite|"
+    r"upcoming interview\b|interview reminder\b|"
     r"you'?re all set|see you (?:on|at)\b", re.I)
+
+
+# 机器人邮件：投递回执、系统通知。它们既不算"真人回过音"，也没资格决定"该谁回"——
+# 2026-08-03 之前 Microsoft 行就是被最新一封 "Thank you for your application!" 回执
+# 拖成了错误的球权/时间。
+_NOREPLY = re.compile(r"no-?reply|donotreply|do-not-reply|notification|mailer-daemon", re.I)
+
+# 广播/回执类标题：job alert、课程营销、表单确认……哪怕发件人像真人，也不构成欠账。
+# （Nvidia 的课程推广、Mercor 的表单回执、Snowflake 的 Job Alert 都曾顶着"你欠一封回信"。）
+_BULKISH = re.compile(
+    r"job alert|new jobs?\b|newsletter|digest\b|webinar|course\b|certificat|"
+    r"we'?re hiring|now hiring|journey begins|profile has been submitted|"
+    r"thank you for filling out|roundup|top picks", re.I)
+
+
+def _ackish(m: dict) -> bool:
+    subj = m.get("subject") or ""
+    if _BULKISH.search(subj):
+        return True
+    if applied_scan._CONFIRM.search(subj) and not applied_scan._NOT_CONFIRM.search(subj):
+        return True
+    if outcomes._NOT_A_RESPONSE.search(subj):
+        return True
+    # no-reply 发件人 + 读不出任何信号的标题 = 系统信。拒信/OA 邀请常从 no-reply 发，
+    # 但它们的标题能被 _classify 认出来，不会走到这一步。
+    return bool(_NOREPLY.search(m.get("from") or "")) and _classify(subj) in (None, "applied")
 
 
 def _days_since(iso: str) -> int:
@@ -83,8 +114,8 @@ def _days_since(iso: str) -> int:
         return 0
 
 
-def build(threads: list[dict]) -> list[dict]:
-    """One row per company, most-urgent first."""
+def build(threads: list[dict], overrides: dict[str, dict] | None = None) -> list[dict]:
+    """One row per company, most-urgent first. `overrides` = store.company_overrides 的人工拍板。"""
     by_co: dict[str, list[dict]] = collections.defaultdict(list)
     for t in threads:
         if t.get("company") and t.get("tier") == "auto":
@@ -92,6 +123,9 @@ def build(threads: list[dict]) -> list[dict]:
 
     rows = []
     for company, ts in by_co.items():
+        ov = (overrides or {}).get(company)
+        if ov and ov["action"] == "hidden":
+            continue
         msgs = [dict(m, _thr=t["thrid"]) for t in ts for m in t.get("messages", [])]
         msgs.sort(key=lambda m: m.get("date") or "")
         if not msgs:
@@ -112,20 +146,44 @@ def build(threads: list[dict]) -> list[dict]:
                 best, best_rank = stage, _RANK.get(stage, -1)
             evidence.setdefault(stage, {"date": m.get("date"), "subject": m.get("subject", "")[:110]})
 
-        last = msgs[-1]
+        # 真人回音门槛（2026-08-03 拍板）：一家公司如果收到的全是机器人回执（"我们收到了
+        # 你的申请"），它就还不是一个"进程"，不上榜。到过 OA/拒信等真信号、或被人工标记过
+        # 的除外。这就是 Fellow Program 这类"投了没人理"的行消失的地方。
+        human_in = any(not m.get("from_me") and not _ackish(m) for m in msgs)
+        if not ov and not human_in and best_rank < _RANK["assessment"] and not rejected_on:
+            continue
+
+        # "该谁回"只看有分量的邮件：机器人回执不改变球权、不重置沉默计时。
+        meaningful = [m for m in msgs if m.get("from_me") or not _ackish(m)]
+        # ✓已处理：user 在邮件之外回过了（平台里回的/电话里说的/日历上定的）。等价于
+        # "当天发过一封信"；之后再来新邮件排在它后面，欠账自然复活。
+        if ov and ov["action"] == "acked":
+            meaningful = sorted(
+                meaningful + [{"from_me": True, "date": (ov.get("set_at") or "")[:10],
+                               "subject": "（已处理 — 手动标记）"}],
+                key=lambda m: m.get("date") or "")
+        last = (meaningful or msgs)[-1]
         last_date = last.get("date") or ""
-        dead = bool(rejected_on) and rejected_on >= (last_date or "")
-        stage = "rejected" if dead else best
+        forced_dead = bool(ov and ov["action"] == "closed")
+        forced_booked = bool(ov and ov["action"] == "booked")
+        dead = (bool(rejected_on) and rejected_on >= (last_date or "")) or forced_dead
+        stage = "rejected" if (dead and not forced_dead) else best
         from_me = bool(last.get("from_me"))
         quiet = _days_since(last_date)
 
-        booked = not from_me and bool(_BOOKED.search(last.get("subject") or ""))
+        booked = forced_booked or (not dead and not from_me
+                                   and bool(_BOOKED.search(last.get("subject") or "")))
+        if forced_booked and not dead and best_rank < _RANK["interview"]:
+            stage = "interview"                     # 人说约上面试了，阶段至少是面试中
         cold = not dead and quiet >= _COLD
         if dead:
-            turn, urgency, action = "closed", 0, "已结束"
-        elif booked and not cold:
+            turn, urgency = "closed", 0
+            action = (f"手动结案（{(ov.get('set_at') or '')[:10]}）" if forced_dead else "已结束")
+        elif booked and (forced_booked or not cold):
             turn, urgency = "booked", 0
-            action = f"已排期 · {last_date} 那封是日历邀请，不用回"
+            cold = False
+            action = ("已排期（手动标记）" if forced_booked
+                      else f"已排期 · {last_date} 那封是日历邀请，不用回")
         elif cold:
             turn = "them" if from_me else "you"
             urgency = 0
@@ -136,13 +194,27 @@ def build(threads: list[dict]) -> list[dict]:
             action = f"等回复 {quiet} 天，可以 follow up 了" if quiet >= _STALE_THEM else "等对方回复"
         else:
             turn = "you"
-            urgency = 2 if quiet >= _STALE_YOU else 1
-            action = f"⚠️ 你欠一封回信（{quiet} 天）" if quiet >= _STALE_YOU else "该你回复"
+            # "欠回信"只对你参与过的进程成立：你回过邮件、或到过 OA/拒信这种真阶段。
+            # 猎头冷启动/营销信你从没接过茬的，不算账——不然 40 家"该你回"里 30 家是噪音。
+            engaged = (best_rank >= _RANK["assessment"] or bool(rejected_on)
+                       or any(m.get("from_me") for m in msgs))
+            if _classify(last.get("subject", "")) == "assessment":
+                # OA 邀请要的是"去做题"，不是回信。Snowflake/Airbnb 的 HackerRank 邀请
+                # 曾把看板刷成一排"你欠一封回信"。
+                urgency = 0
+                action = f"OA 邀请（{quiet} 天前）— 做或放弃都不用回邮件"
+            elif engaged:
+                urgency = 2 if quiet >= _STALE_YOU else 1
+                action = f"⚠️ 你欠一封回信（{quiet} 天）" if quiet >= _STALE_YOU else "该你回复"
+            else:
+                urgency = 0
+                action = f"对方主动接触，你没接过茬（{quiet} 天）— 想接就回，不接就 🙈"
 
         rows.append({
             "company": company,
             "stage": stage, "stage_label": _LABEL.get(stage, stage), "rank": _RANK.get(stage, -1),
             "turn": turn, "urgency": urgency, "action": action, "cold": cold, "dead": dead,
+            "override": ov["action"] if ov else None,
             "quiet_days": quiet, "last_date": last_date,
             "last_subject": (last.get("subject") or "")[:110],
             "last_from": (last.get("from") or "")[:70],
@@ -165,7 +237,7 @@ def summary(rows: list[dict]) -> dict:
     return {
         "companies": len(rows),
         "live": len(live),
-        "your_turn": sum(1 for r in live if r["turn"] == "you"),
+        "your_turn": sum(1 for r in live if r["turn"] == "you" and r["urgency"] >= 1),
         "waiting": sum(1 for r in live if r["turn"] == "them"),
         "booked": sum(1 for r in live if r["turn"] == "booked"),
         "stale": sum(1 for r in live if r["urgency"] >= 1),
@@ -184,7 +256,12 @@ def load(cfg: dict, refresh: bool = False, query: str = "is:starred") -> dict:
         mail_label.CACHE.write_text(__import__("json").dumps(res, indent=1, ensure_ascii=False))
     else:
         res = __import__("json").loads(mail_label.CACHE.read_text())
-    rows = build(res.get("threads", []))
+    conn = store.connect_user(cfg)
+    try:
+        ov = store.company_overrides(conn)
+    finally:
+        conn.close()
+    rows = build(res.get("threads", []), ov)
     return {"account": res.get("account", ""), "rows": rows, "summary": summary(rows),
             "review": [t for t in res.get("threads", []) if t.get("tier") == "review"]}
 

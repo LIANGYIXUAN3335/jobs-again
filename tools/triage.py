@@ -8,7 +8,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, ".")
-from app import config as cfgmod, inbox, store  # noqa: E402
+from app import config as cfgmod, heartbeats, inbox, store  # noqa: E402
 
 
 def notify(title: str, message: str):
@@ -22,6 +22,15 @@ def notify(title: str, message: str):
 
 def main():
     cfg = cfgmod.load_config()
+
+    # 体检巡查：其他定时任务谁失联/谁上次失败。只对"新出现的"红灯叫一次（好→坏翻转），
+    # 恢复后再坏会再叫；红灯明细看 /health。放在最前面——就算 inbox 关了也要巡查。
+    reds = heartbeats.alert_new_reds()
+    if reds:
+        names = "、".join(r["zh"] for r in reds[:4])
+        print(f"heartbeat red: {[r['name'] for r in reds]}")
+        notify("JobScan · 体检红灯", f"{names} — 打开 JobScan → 体检表看详情")
+
     if not (cfg.get("inbox") or {}).get("enabled"):
         print("inbox triage disabled in config")
         return

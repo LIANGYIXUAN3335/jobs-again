@@ -119,12 +119,27 @@ def _facts(cfg: dict, role: dict) -> str:
     for job in base.get("experience", []):
         parts.append(f"\n{job['title']} @ {job['company']} ({job['dates']}, {job['location']}):")
         parts.extend(f"  - {b}" for b in job.get("bullets_master", []))
-    # If a tailored résumé exists for this exact role, its summary is good extra grounding.
-    yp = tailoring.resume_yaml_path(cfg, role["company"], role["job_id"])
-    if yp.exists():
-        t = yaml.safe_load(yp.read_text(encoding="utf-8")) or {}
-        if t.get("summary"):
-            parts.append("\nTailored summary for this role: " + t["summary"].strip())
+    # If a tailored résumé exists for this exact role, ground the answers in it — not just the
+    # summary but the re-aimed bullets: they are the EXACT claims the submitted PDF makes for
+    # this role, and an answer that re-derives a different angle from the master list above
+    # will contradict the résumé the reader has open in the other tab (2026-08-01, ✨ button).
+    try:
+        yp = tailoring.resume_yaml_path(cfg, role["company"], role["job_id"])
+        if yp.exists():
+            t = yaml.safe_load(yp.read_text(encoding="utf-8")) or {}
+            if t.get("summary"):
+                parts.append("\nTailored summary for this role: " + t["summary"].strip())
+            tb = [(e.get("company", ""), b)
+                  for e in (t.get("experience") or []) for b in (e.get("bullets") or [])]
+            if tb:
+                parts.append("Claims the submitted résumé makes for THIS role — answers must "
+                             "stay consistent with these (same projects, same numbers, no new "
+                             "specifics):")
+                parts.extend(f"  - [{co}] {b}" for co, b in tb[:14])
+            if t.get("angle"):
+                parts.append(f"Positioning angle of that résumé: {str(t['angle']).strip()}")
+    except Exception:
+        pass    # grounding is best-effort — a malformed YAML must not break form filling
     return "\n".join(parts)
 
 

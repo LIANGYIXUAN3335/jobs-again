@@ -274,3 +274,84 @@ def test_autotailor_takes_one_role_per_company(cfg):
              if not (r["company_norm"] in seen or seen.add(r["company_norm"]))]
     assert [r["job_id"] for r in leads] == ["gh:a:1", "gh:b:1"]
     assert len(rows) == 3            # the queue still shows A's second role
+
+
+# ---- duplicate rows: li: shadow ↔ ATS canonical (2026-08-01) --------------------------------
+# LinkedIn discovery and the board scanner both find the same physical posting. The extension
+# marks the ATS row (it resolves by the employer page's URL); the UI shows the li: row — so an
+# application "didn't stick" from the owner's seat, and funnel/budget counted the pair twice.
+
+def test_marking_either_twin_applied_cascades_to_the_other(cfg):
+    jobs = store.connect_jobs(cfg)
+    store.upsert_roles(jobs, [
+        role_row("li:1", company="Precisely", title="Associate Software Engineer"),
+        role_row("gh:precisely:9", company="Precisely", title="Associate Software Engineer"),
+        # same title at ANOTHER company — must never be touched by the cascade
+        role_row("gh:other:7", company="Other Co", title="Associate Software Engineer"),
+    ])
+    view = store.connect_view(cfg)
+
+    store.set_status(view, "gh:precisely:9", "applied", resume_variant="tailored")
+
+    li = view.execute("SELECT * FROM role_state WHERE job_id='li:1'").fetchone()
+    assert li["status"] == "applied"                      # cascaded
+    assert li["applied_with_resume"] == "tailored"
+    assert li["duplicate_of"] == "gh:precisely:9"         # link self-healed, shadow side only
+    assert view.execute("SELECT * FROM role_state WHERE job_id='gh:other:7'").fetchone() is None
+
+
+def test_ambiguous_or_containment_titles_never_link(cfg):
+    """Two same-title ATS rows (multi-location) → no safe answer → no link. And 'Software
+    Engineer' must not link to 'Senior Software Engineer' — containment cascades an
+    application onto a job never applied to."""
+    jobs = store.connect_jobs(cfg)
+    store.upsert_roles(jobs, [
+        role_row("li:2", company="Gamma", title="Software Engineer"),
+        role_row("gh:gamma:1", company="Gamma", title="Software Engineer"),
+        role_row("gh:gamma:2", company="Gamma", title="Software Engineer"),   # second candidate
+        role_row("li:3", company="Melio", title="Software Engineer"),
+        role_row("gh:melio:1", company="Melio", title="Senior Software Engineer"),
+    ])
+    view = store.connect_view(cfg)
+    assert store.find_twin(view, "li:2") is None          # ambiguous
+    assert store.find_twin(view, "li:3") is None          # containment ≠ same job
+    store.set_status(view, "li:3", "applied")
+    assert view.execute("SELECT status FROM role_state WHERE job_id='gh:melio:1'").fetchone() is None
+
+
+def test_reconcile_backfills_history_without_restamping_dates(cfg):
+    jobs = store.connect_jobs(cfg)
+    store.upsert_roles(jobs, [
+        role_row("li:4", company="Atticus", title="Fullstack Engineer"),
+        role_row("ab:atticus:x", company="Atticus", title="Fullstack Engineer"),
+    ])
+    view = store.connect_view(cfg)
+    # history: the li: row was applied days ago and carries the tailored PDF
+    store.upsert_state(view, "li:4", status="applied", applied_date="2026-07-20",
+                       applied_with_resume="tailored", tailor_status="ready",
+                       prompt_path="/p/x.md", tailored_resume_path="/r/x.pdf")
+
+    stats = store.reconcile_duplicates(view)
+    assert stats["linked"] == 1
+
+    ab = view.execute("SELECT * FROM role_state WHERE job_id='ab:atticus:x'").fetchone()
+    assert ab["status"] == "applied"
+    assert ab["applied_date"] == "2026-07-20"             # history copied, NOT today
+    assert ab["tailored_resume_path"] == "/r/x.pdf"       # extension needs it on the ATS row
+    # idempotent: second run changes nothing
+    again = store.reconcile_duplicates(view)
+    assert again["status_mirrored"] == 0 and again["tailor_copied"] == 0
+
+
+def test_twins_link_across_divergent_title_norms(cfg):
+    """The LinkedIn ingest and the board scanner normalised titles differently at different
+    times ('fullstackengineer' vs 'fullstack engineer' — the real Atticus pair), so strict
+    title_norm equality silently missed most true twins."""
+    jobs = store.connect_jobs(cfg)
+    a = role_row("li:5", company="Atticus", title="Fullstack Engineer")
+    a["title_norm"] = "fullstackengineer"                 # old LinkedIn-ingest style
+    b = role_row("ab:atticus:y", company="Atticus", title="Fullstack Engineer")
+    b["title_norm"] = "fullstack engineer"                # scanner style
+    store.upsert_roles(jobs, [a, b])
+    view = store.connect_view(cfg)
+    assert store.find_twin(view, "li:5") == "ab:atticus:y"

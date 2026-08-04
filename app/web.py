@@ -21,6 +21,7 @@ from . import config as cfgmod
 from . import followup as followupmod
 from . import funnel as funnelmod
 from . import gcal as gcalmod
+from . import heartbeats as hbmod
 from . import ideas as ideasmod
 from . import ingest as ingestmod
 from . import mail as sendmail
@@ -48,6 +49,9 @@ def url_candidates(url: str) -> list[str]:
                 # the search/collections pages where the JD opens in a side panel.
                 r"/jobs/view/(\d+)", r"[?&]currentJobId=(\d+)",
                 r"[?&]pid=(\d+)",                       # Microsoft careers: apply?pid=1970393556941507
+                # Gem-hosted boards: jobs.gem.com/<company>/<id> — bare trailing number, and the
+                # ids are Greenhouse-shaped when the company migrated (Retool, 2026-08-01)
+                r"gem\.com/[^/?#]+/(\d{6,})",
                 # Apple: details page /en-us/details/200673880-0836/<slug> and apply flow
                 # /app/en-us/apply/200673880-0836 share the req id — the join between them.
                 r"/(?:details|apply)/(\d{6,}(?:-\d{2,5})?)",
@@ -292,6 +296,7 @@ def _lookup_payload(conn, role: dict, top_role_default: bool = False) -> dict:
         "ai_enabled": aimod.available(cfg),
         "auto_dropdowns": bool(ai_cfg.get("auto_dropdowns", True)),
         "auto_cover_letter": bool(ai_cfg.get("auto_cover_letter", False)),
+        "field_button": bool(ai_cfg.get("field_button", True)),   # ✨ per-field AI draft chips
         "this_status": role.get("status") or "new",     # THIS role's own status
         "company_applied": [                             # OTHER roles at this company already done
             {"title": r["title"], "status": r["status"], "date": r["applied_date"]}
@@ -1270,6 +1275,20 @@ def api_companies(refresh: bool = False):
         raise HTTPException(502, f"board failed: {type(e).__name__}: {e}")
 
 
+class _OverrideIn(BaseModel):
+    company: str
+    action: str | None = None      # closed | hidden | booked | None = 撤销
+
+
+@app.post("/api/companies/override")
+def companies_override(inp: _OverrideIn, conn=Depends(view_conn)):
+    """人工改写公司行。机器从邮件读出的只是提议——这里是人拍板的地方。"""
+    if inp.action not in (None, "closed", "hidden", "booked", "acked"):
+        raise HTTPException(422, "action must be closed / hidden / booked / acked / null")
+    store.set_company_override(conn, inp.company, inp.action)
+    return {"ok": True}
+
+
 @app.get("/companies", response_class=HTMLResponse)
 def companies_page():
     """Whose turn is it, per company. Companion to the Gmail `Interviews/<Company>` labels —
@@ -1278,6 +1297,8 @@ def companies_page():
       <p class="tip">按邮件线程聚合，一家公司一行 —— 和 Gmail 里的
       <code>Interviews/&lt;公司&gt;</code> 标签是同一批邮件。
       <b>🔴 该你回信</b> · <b>🟡 等太久了，该 follow up</b>。
+      只显示<b>有真人回过音</b>的公司（纯投递回执的不上榜）。机器读错了就用每行的小按钮改：
+      📅 已排期 / ✕ 结案 / 🙈 隐藏，随时可撤销。
       读缓存，秒开；<i>refresh</i> 才会重新读邮箱（约 2 分钟）。</p>
       <p><button onclick="load(false)">Load</button>
          <button onclick="load(true)">Refresh from Gmail</button>
@@ -1286,6 +1307,23 @@ def companies_page():
       <div id="sum"></div><div id="out"></div>
       <script>
       function esc(s){const e=document.createElement('div');e.textContent=s||'';return e.innerHTML}
+      function ovBtns(r){
+        const co=encodeURIComponent(r.company),
+              zh={closed:'手动结案',hidden:'隐藏',booked:'已排期',acked:'已处理'};
+        const a=(act,label,tip)=>'<a href="#" title="'+tip+'" onclick="return ov(`'+co+'`,'+
+          (act?'`'+act+'`':'null')+')">'+label+'</a>';
+        if(r.override) return '已手动标记：'+zh[r.override]+' '+a(null,'撤销','清除人工标记');
+        return a('acked','✓ 已处理','在邮件之外回过了（平台/电话/日历）——欠账清零，来新邮件会自动复活')+' · '+
+               a('booked','📅 已排期','约面藏在正文/日历里，机器没读出来时点这个')+' · '+
+               a('closed','✕ 结案','这条线结束了（含你拒了对方的情况）')+' · '+
+               a('hidden','🙈 隐藏','误认的公司/不想再看');
+      }
+      async function ov(co,action){
+        await fetch('/api/companies/override',{method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({company:decodeURIComponent(co),action})});
+        await load(false); return false;
+      }
       async function load(refresh){
         const o=document.getElementById('out');
         o.innerHTML='<p class="muted">'+(refresh?'reading Gmail…':'loading…')+'</p>';
@@ -1313,7 +1351,7 @@ def companies_page():
             r.last_date+'（'+r.quiet_days+' 天前）</span>'+
           '<div class="small" style="margin-top:3px">'+esc(r.action)+'</div>'+
           '<div class="small muted">'+esc(r.last_subject)+'</div>'+
-          '<div class="small muted">🏷 '+esc(r.label)+'</div>'+
+          '<div class="small muted">🏷 '+esc(r.label)+' · '+ovBtns(r)+'</div>'+
           '</div>').join('')+
           (d.review.length?'<h3 style="margin-top:22px">认不出公司的线程 ('+d.review.length+
             ')</h3><p class="small muted">没有打标签，也没进上面的表 —— 需要你看一眼</p>'+
@@ -1324,9 +1362,35 @@ def companies_page():
       </script>""")
 
 
-@app.get("/health")
-def health():
-    return {"ok": True}
+@app.get("/api/health")
+def api_health():
+    rows = hbmod.read()
+    return {"ok": not hbmod.red(rows), "tasks": rows}
+
+
+@app.get("/health", response_class=HTMLResponse)
+def health_page():
+    """体检表：每个定时任务经 tools/hb_run.sh 打卡，这里读卡画灯（app/heartbeats.py）。"""
+    rows = hbmod.read()
+    icon = {"ok": "🟢", "fail": "🔴", "stale": "🔴", "never": "⚪"}
+    order = {"fail": 0, "stale": 1, "ok": 2, "never": 3}
+    rows.sort(key=lambda r: order[r["status"]])
+    trs = "".join(
+        f"<tr><td>{icon[r['status']]}</td><td><b>{r['zh']}</b> <span class='d'>{r['name']}</span></td>"
+        f"<td>{r['cadence']}</td><td>{r['finished'] or '—'}</td>"
+        f"<td>{('%ds' % r['duration_s']) if r['duration_s'] is not None else '—'}</td>"
+        f"<td>{r['detail']}</td></tr>"
+        for r in rows)
+    n_red = len(hbmod.red(rows))
+    verdict = (f'<p class="tip" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">'
+               f'🔴 {n_red} 个任务出问题 — 看红灯行。</p>' if n_red
+               else '<p class="tip">🟢 所有定时任务都在按时打卡。</p>')
+    return _page("Health", f"""<h1>🩺 定时任务体检表</h1>
+      {verdict}
+      <p class="tip">原理：每个任务干完活会打一张卡。太久没打卡 = 失联；打了卡但退出码非 0 = 上次失败；
+      ⚪ = 新任务还没到运行时间。看板网页本身不用打卡 — 你能打开这页就说明它活着。
+      值班员每天 5 次巡查，发现<b>新出现的</b>红灯会弹 Mac 通知。</p>
+      <table><tr><th></th><th>任务</th><th>节奏</th><th>上次打卡</th><th>用时</th><th>状态</th></tr>{trs}</table>""")
 
 
 if __name__ == "__main__":

@@ -89,3 +89,28 @@ def test_ingest_renders_pdf(cfg, tmp_path):
     assert pdf.read_bytes()[:4] == b"%PDF"
     assert store.get_role(conn, "gh:stripe:123")["tailor_status"] == "ready"
     assert res["gaps"]
+
+
+def test_facts_ground_answers_in_the_tailored_resume(cfg, tmp_path):
+    """✨ button (2026-08-01): answers must speak the same angle as the submitted PDF, so
+    _facts must carry the tailored YAML's summary AND bullets when one exists for the role."""
+    import yaml as _yaml
+    from app import ai as aimod, tailoring
+
+    role = {"job_id": "li:4437046992", "company": "Precisely", "title": "Associate SWE"}
+    yp = tailoring.resume_yaml_path(cfg, role["company"], role["job_id"])
+    yp.write_text(_yaml.safe_dump({
+        "summary": "Full-stack engineer who ships guardrails end to end.",
+        "angle": "AI-first product engineering",
+        "experience": [{"company": "TikTok",
+                        "bullets": ["Cut invalid submissions ~30% via state-machine guardrails"]}],
+    }), encoding="utf-8")
+
+    facts = aimod._facts(cfg, role)
+    assert "ships guardrails end to end" in facts
+    assert "Cut invalid submissions ~30%" in facts
+    assert "AI-first product engineering" in facts
+
+    # no tailored YAML → facts still build (grounding is best-effort, never a hard dependency)
+    role2 = {"job_id": "gh:none:1", "company": "NoSuchCo", "title": "SWE"}
+    assert "Name:" in aimod._facts(cfg, role2)

@@ -72,7 +72,7 @@ _NOISE_DOMAINS = {
     "coursera.org", "m.learn.coursera.org", "ieee.org", "em3009.ieee.org", "deliver.ieee.org",
     "peeref.com", "simplepractice.com", "notifications.lyrahealth.com", "memberclicks-mail.net",
     "mailer.predictiveindex.com", "edgecity.live", "wethehobby.com", "dhs.gov", "uscis.gov",
-    "manus.im", "news.manus.im", "educative.io", "deeplearning.ai", "udemy.com",
+    "manus.im", "news.manus.im", "educative.io", "formation.dev", "deeplearning.ai", "udemy.com",
     "students.udemy.com", "aaai.org", "wiley.com", "email2.wiley.com", "teladoc.com",
     "teladochealth.com", "tickerkey.com", "notion.so", "simplify.jobs", "monster.com",
     "notifications.monster.com", "wellfound.com", "hi.wellfound.com",
@@ -230,6 +230,13 @@ def _gazetteer(cfg) -> list[tuple[re.Pattern, str]]:
     return out
 
 
+def _case_ok(matched: str, gname: str) -> bool:
+    """全小写的普通英文词不当公司名（2026-08-03 "Loop 公司"事故）：营销邮件标题里的
+    "couldn't pass the loop" / "interview loop" 曾造出一家叫 Loop 的公司。真公司提及
+    带大写（"Loop | SWE"）；官方名字本身就是全小写的（gname 全小写）不受此限。"""
+    return matched != matched.lower() or gname == gname.lower()
+
+
 def _label_name(company: str) -> str:
     """Gmail label component: no `/` (would nest), no quotes, single-spaced. Canonicalised HERE
     as well as at scan time, so a naming fix takes effect on the existing cache without a
@@ -367,7 +374,8 @@ def _resolve(text: str, domains: list[str], gaz, subjects: list[str] | None = No
     """
     real = [d for d in domains if d and not _is_vendor(d) and not _is_noise(d)]
     jobbish = bool(_JOBBISH.search(text))
-    hits = [(m.start(), gname) for pat, gname in gaz for m in [pat.search(text)] if m]
+    hits = [(m.start(), gname) for pat, gname in gaz for m in [pat.search(text)]
+            if m and _case_ok(m.group(0), gname)]
     named = {g for _, g in hits}
     # Compared on letters-and-digits only: a domain can never carry the space in
     # "Cockroach Labs", so `cockroachlabs.com` has to be able to find it.
@@ -559,7 +567,16 @@ def plan(cfg: dict, threads: list[dict], tiers=("auto",)) -> dict:
     by_co: dict[str, list[dict]] = collections.defaultdict(list)
     for t in todo:
         by_co[_label_name(t["company"])].append(t)
-    rows = {_label_name(r["company"]): r for r in company_board.build(threads)}
+    try:
+        conn = store.connect_user(cfg)
+        try:
+            ov = store.company_overrides(conn)
+        finally:
+            conn.close()
+    except Exception:
+        ov = {}
+    # 传人工拍板进去：手动结案的公司，Gmail 标签也要进 3-已挂 —— 一行一标签同一事实。
+    rows = {_label_name(r["company"]): r for r in company_board.build(threads, ov)}
     # A company with no board row has no dated mail to judge; treat it as live rather than
     # silently burying it in 已挂.
     return {co: (_bucket_of(rows.get(co, {})), ts) for co, ts in by_co.items()}

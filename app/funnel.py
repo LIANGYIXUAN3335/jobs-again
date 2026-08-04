@@ -68,7 +68,12 @@ def load(cfg: dict, conn) -> list[dict]:
         "       s.status, s.applied_date, s.stage, s.outcome,"
         "       s.first_response_at, s.last_contact_at, s.tailored_resume_path"
         " FROM jobs.roles r JOIN role_state s ON s.job_id = r.job_id"
-        " WHERE s.applied_date IS NOT NULL")]
+        " WHERE s.applied_date IS NOT NULL"
+        # A linked pair (li: shadow + ATS canonical, see role_state.duplicate_of) is ONE
+        # physical application — count the canonical row only. The shadow still counts if
+        # its canonical partner somehow lacks an applied_date (dangling link after a prune).
+        "   AND (s.duplicate_of IS NULL OR s.duplicate_of NOT IN"
+        "        (SELECT job_id FROM role_state WHERE applied_date IS NOT NULL))")]
     today = datetime.date.fromisoformat(store.la_today())
     out = []
     for r in rows:
