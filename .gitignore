@@ -5,6 +5,7 @@ __pycache__/
 .DS_Store
 data/*.db-wal
 data/*.db-shm
+data/jobs.sqlite
 data/logs/
 
 # tailoring artifacts are personal/generated, not source
