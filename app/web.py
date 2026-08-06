@@ -159,7 +159,7 @@ def index(
     status: str = "new",
     q: str = "",
     company: str = "",
-    min_score: float = 0.0,
+    min_score: str = "",   # str, not float: an empty <input type="number"> submits "", which 422s a float param
     verdict: str = "",
     seen: str = "all",
     remote: str = "",
@@ -167,12 +167,16 @@ def index(
     sort: str = "score",
     conn=Depends(view_conn),
 ):
+    try:
+        ms = float(min_score)
+    except (TypeError, ValueError):
+        ms = 0.0
     data = store.fetch_view(
-        conn, cfg, status=status, q=q, company=company, min_score=min_score,
+        conn, cfg, status=status, q=q, company=company, min_score=ms,
         verdict=verdict, seen=seen, remote=remote, seniority=seniority, sort=sort,
     )
     params = {
-        "status": status, "q": q, "company": company, "min_score": min_score or "",
+        "status": status, "q": q, "company": company, "min_score": min_score if ms else "",
         "verdict": verdict, "seen": seen, "remote": remote, "seniority": seniority,
         "sort": sort,
     }
@@ -721,12 +725,31 @@ def _page(title: str, body: str) -> HTMLResponse:
 def ideas_page(days: int = 7):
     """Daily idea/project radar (Show HN · GH Trending · Product Hunt · HN front).
     Reads ideas.db; writes to it only through app.ideas (its single writer)."""
+    from html import escape as esc
     conn = ideasmod.connect_ideas(cfg)
     try:
         groups = ideasmod.recent_days(conn, days=days)
         run = ideasmod.last_fetch(conn)
+        dig = ideasmod.latest_digest(conn)
     finally:
         conn.close()
+    digest_html = ""
+    if dig:
+        try:
+            d = json.loads(dig["content"])
+            secs = "".join(
+                f'<h3>{esc(str(g["label"]))}</h3><ul class="ideas">' + "".join(
+                    f'<li><a href="{esc(it["url"])}" target="_blank" rel="noopener">{esc(it["title"])}</a>'
+                    f'<br><span class="muted small">{esc(it["why"])}</span></li>'
+                    for it in g["items"]) + "</ul>"
+                for g in d["groups"])
+            digest_html = (
+                f'<div class="digest"><h2 style="margin-top:0">📋 晨报'
+                f' <span class="muted small">{esc(dig["day"])} · sonnet</span></h2>'
+                f'<p><b>{esc(str(d["tldr"]))}</b></p>{secs}</div>'
+                '<h2 class="muted" style="font-size:15px">原始抓取</h2>')
+        except Exception:
+            digest_html = ""       # malformed digest → page still works on the raw list
     runinfo = (f'last fetch {run["run_at"][:16]} · new {run["n_new"]}'
                + (f' · <span style="color:#b91c1c">{run["errors"]}</span>' if run["errors"] else "")
                if run else "no fetch yet")
@@ -747,8 +770,10 @@ def ideas_page(days: int = 7):
 <p class="muted small">{runinfo} ·
 <button onclick="this.disabled=true;this.textContent='fetching…';fetch('/api/ideas/fetch',{{method:'POST'}}).then(()=>location.reload())">fetch now</button></p>
 <style>.ideas{{margin:6px 0 14px;padding-left:20px}}.ideas li{{margin:3px 0}}
-details{{margin:10px 0}}summary{{cursor:pointer}}</style>
-{day_html}""")
+details{{margin:10px 0}}summary{{cursor:pointer}}
+.digest{{background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:14px 18px;margin:14px 0}}
+.digest h3{{margin:12px 0 2px;font-size:14px}}.digest li{{margin:7px 0}}</style>
+{digest_html}{day_html}""")
 
 
 @app.post("/api/ideas/fetch")

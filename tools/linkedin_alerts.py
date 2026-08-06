@@ -2,10 +2,12 @@
 """linkedin_alerts.py — read LinkedIn Job Alert digests from Gmail (IMAP, same app-password
 channel as mailsearch.py) and extract the recommended jobs into a pending-worklist JSON.
 
-READ-ONLY: no DB writes here. The flow is
-    1. this script  → scratch_priors/linkedin_alerts_pending.json   (id/title/company/url)
-    2. enrichment   → guest-page fetch fills JD text (done by Claude agents w/ WebFetch —
-                      LinkedIn blocks plain-python fetches, so it is NOT done here)
+READ-ONLY: no DB writes here. The flow (nightly via tools/linkedin_nightly.sh, launchd
+08:20 — DESIGN.md §5c) is
+    1. this script + tools/linkedin_search.py (guest search sweep)
+                    → scratch_priors/linkedin_alerts_pending.json   (MERGED worklist)
+    2. tools/linkedin_enrich.py → guest jobPosting fetch fills JD text (plain httpx with
+                      a browser UA — see tools/linkedin_guest.py; paced + circuit-broken)
     3. tools/linkedin_ingest.py → manual.add_role(job_id="li:<id>") + rescore
 
 Usage:
@@ -149,11 +151,22 @@ def main() -> None:
     for j in fresh:
         print(f"  {j['id']}  {j['title'][:44]:46} | {j['company'][:20]:20} | {j['email_date']}")
 
-    cfgmod.resolve_path(PENDING).write_text(
-        json.dumps(fresh, indent=1, ensure_ascii=False), encoding="utf-8")
+    # MERGE into pending, don't overwrite: not-yet-enriched leftovers are already in `seen`,
+    # so overwriting with `fresh` alone would silently drop them from the worklist.
+    pending_path = cfgmod.resolve_path(PENDING)
+    try:
+        prev = json.loads(pending_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        prev = []
+    fresh_ids = {j["id"] for j in fresh}
+    keep = [j for j in prev
+            if str(j.get("id")) not in in_db and str(j.get("id")) not in fresh_ids]
+    merged = keep + fresh
+    pending_path.write_text(
+        json.dumps(merged, indent=1, ensure_ascii=False), encoding="utf-8")
     seen |= set(found)
     seen_path.write_text(json.dumps(sorted(seen)), encoding="utf-8")
-    print(f"pending -> {PENDING}")
+    print(f"pending -> {PENDING} ({len(merged)} total: {len(keep)} carried + {len(fresh)} new)")
 
 
 if __name__ == "__main__":
