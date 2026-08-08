@@ -50,6 +50,14 @@ def classify(posting: Posting, filters_cfg: dict) -> FilterResult:
     dept = (posting.department or "").lower()
     title_dept = f"{title} | {dept}"
 
+    # --- current employer: never surface her own company (or its sibling brands). Substring,
+    # not word-boundary, match — LinkedIn writes entity names like "TikTok USDS Joint Venture"
+    # and "ByteDance Ltd.", and a blocklist that misses one of those is worse than useless. ---
+    company = posting.company.lower()
+    for term in filters_cfg.get("company_exclude", []):
+        if term.lower() in company:
+            return FilterResult(False, f"company:{term}")
+
     # --- seniority (title only; departments say things like "Engineering Leadership") ---
     # "Member of Technical Staff" is an IC title (Cockroach Labs et al.) — its "staff"
     # is not a level. Neutralize the phrase before applying the seniority excludes.

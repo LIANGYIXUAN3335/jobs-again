@@ -91,6 +91,36 @@ async function topRole(company) {
   return { found: true, role: await r.json() };
 }
 
+async function pinned() {
+  // The role the owner clicked ↗ on in JobScan moments ago. Only consulted after the URL
+  // lookup fails: LinkedIn-sourced roles hand off to an employer ATS whose URL shares no id
+  // with our li:<id>, so intent is the only join left. The server expires it (45 min).
+  const r = await apiFetch(`/api/pinned`);
+  if (r.status === 404) return { found: false };
+  if (!r.ok) throw new Error(`pinned ${r.status}`);
+  return { found: true, role: await r.json() };
+}
+
+async function pins() {
+  // ALL live pins. The caller matches them against the page it is on — the server can't, it
+  // has never seen the page. Falls back to the single-pin endpoint so a new extension still
+  // works against a JobScan server that predates /api/pins.
+  const r = await apiFetch(`/api/pins`);
+  if (r.ok) return { found: true, roles: (await r.json()).pins || [] };
+  if (r.status !== 404) throw new Error(`pins ${r.status}`);
+  const one = await pinned();
+  return { found: true, roles: one.found ? [one.role] : [] };
+}
+
+async function unpin(jobId) {
+  // Called by the frame that actually rendered a panel off a pin — it has claimed THAT role,
+  // so only that row is released; the other tabs' pins must survive. Best-effort: a failed
+  // unpin only means the TTL expires it later, which is the behaviour we had all along.
+  const q = jobId ? `?job_id=${encodeURIComponent(jobId)}` : "";
+  const r = await apiFetch(`/api/pin${q}`, { method: "DELETE" });
+  return { cleared: r.ok };
+}
+
 async function profileOnly() {
   const r = await apiFetch(`/api/profile`);
   if (!r.ok) throw new Error(`profile ${r.status}`);
@@ -127,6 +157,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (msg.type === "lookup") sendResponse(await lookup(msg.url));
       else if (msg.type === "profile") sendResponse({ ok: true, ...(await profileOnly()) });
       else if (msg.type === "topRole") sendResponse(await topRole(msg.company));
+      else if (msg.type === "pinned") sendResponse(await pinned());
+      else if (msg.type === "pins") sendResponse(await pins());
+      else if (msg.type === "unpin") sendResponse({ ok: true, ...(await unpin(msg.jobId)) });
       else if (msg.type === "resume") sendResponse({ ok: true, ...(await resumeBase64(msg.jobId)) });
       else if (msg.type === "answer") sendResponse({ ok: true, ...(await answer(msg.jobId, msg.questions)) });
       else if (msg.type === "emailCode") sendResponse({ ok: true, ...(await emailCode()) });

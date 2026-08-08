@@ -40,7 +40,12 @@ CREATE TABLE IF NOT EXISTS items(
   url        TEXT NOT NULL,
   meta       TEXT NOT NULL DEFAULT '',
   score      INTEGER NOT NULL DEFAULT 0,
-  first_seen TEXT NOT NULL       -- LA date, YYYY-MM-DD
+  first_seen TEXT NOT NULL,      -- LA date, YYYY-MM-DD
+  -- streak columns: meta/score/first_seen stay frozen at the first sighting so a day
+  -- bucket keeps reading as "what was new that day"; these three accumulate instead.
+  days_seen  INTEGER NOT NULL DEFAULT 1,   -- distinct days this key showed up
+  last_seen  TEXT NOT NULL DEFAULT '',     -- LA date of the most recent sighting
+  peak_score INTEGER NOT NULL DEFAULT 0    -- best score seen across all sightings
 );
 CREATE INDEX IF NOT EXISTS idx_items_day ON items(first_seen);
 CREATE TABLE IF NOT EXISTS fetch_log(
@@ -68,7 +73,21 @@ def connect_ideas(cfg: dict) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add the streak columns to a pre-existing items table and backfill them, treating
+    every historical row as a single sighting (we never recorded repeats before)."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(items)")}
+    if "days_seen" in cols:
+        return
+    conn.execute("ALTER TABLE items ADD COLUMN days_seen INTEGER NOT NULL DEFAULT 1")
+    conn.execute("ALTER TABLE items ADD COLUMN last_seen TEXT NOT NULL DEFAULT ''")
+    conn.execute("ALTER TABLE items ADD COLUMN peak_score INTEGER NOT NULL DEFAULT 0")
+    conn.execute("UPDATE items SET last_seen = first_seen, peak_score = score")
+    conn.commit()
 
 
 def _today() -> str:
@@ -172,10 +191,13 @@ SOURCES = [src_show_hn, src_gh_trending, src_product_hunt, src_hn_front]
 # ---------------- fetch + store ----------------
 
 def fetch_all(conn: sqlite3.Connection) -> dict:
-    """Pull every source, insert never-seen items stamped with today. Idempotent within
-    a day; an item seen on an earlier day is never re-inserted (dedup across sources too:
-    an HN story on both front page and Show HN keeps its first source)."""
-    today, n_new, errors = _today(), 0, []
+    """Pull every source, insert never-seen items stamped with today. An item seen on an
+    earlier day is not re-inserted — it bumps days_seen/last_seen/peak_score instead, so a
+    repo that keeps trending accumulates a visible streak (the cheap stand-in for a star
+    slope: sustained > one-day spike). Idempotent within a day, since a second sighting
+    today already has last_seen == today; that also keeps the cross-source dedup — an HN
+    story on both front page and Show HN still keeps its first source."""
+    today, n_new, n_repeat, errors = _today(), 0, 0, []
     for fn in SOURCES:
         try:
             fetched = fn()
@@ -183,15 +205,24 @@ def fetch_all(conn: sqlite3.Connection) -> dict:
             errors.append(f"{fn.__name__}: {type(e).__name__}: {e}")
             continue
         for it in fetched:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO items(key, source, title, url, meta, score, first_seen) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (it["key"], it["source"], it["title"], it["url"], it["meta"], it["score"], today))
-            n_new += cur.rowcount
+            row = conn.execute("SELECT last_seen FROM items WHERE key = ?", (it["key"],)).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO items(key, source, title, url, meta, score, first_seen,"
+                    " days_seen, last_seen, peak_score) VALUES(?,?,?,?,?,?,?,1,?,?)",
+                    (it["key"], it["source"], it["title"], it["url"], it["meta"], it["score"],
+                     today, today, it["score"]))
+                n_new += 1
+            elif row["last_seen"] != today:
+                conn.execute(
+                    "UPDATE items SET days_seen = days_seen + 1, last_seen = ?,"
+                    " peak_score = MAX(peak_score, ?) WHERE key = ?",
+                    (today, it["score"], it["key"]))
+                n_repeat += 1
     conn.execute("INSERT INTO fetch_log(run_at, n_new, errors) VALUES(?,?,?)",
                  (datetime.datetime.now(LA).isoformat(timespec="seconds"), n_new, "; ".join(errors)))
     conn.commit()
-    return {"n_new": n_new, "errors": errors}
+    return {"n_new": n_new, "n_repeat": n_repeat, "errors": errors}
 
 
 def recent_days(conn: sqlite3.Connection, days: int = 7) -> list[dict]:
@@ -233,7 +264,8 @@ def main():
     cfg = load_config()
     conn = connect_ideas(cfg)
     res = fetch_all(conn)
-    print(f"[ideas] {_today()}: {res['n_new']} new items -> {ideas_db_path(cfg)}")
+    print(f"[ideas] {_today()}: {res['n_new']} new items, {res['n_repeat']} still trending"
+          f" -> {ideas_db_path(cfg)}")
     for e in res["errors"]:
         print(f"[ideas] source failed: {e}")
     conn.close()

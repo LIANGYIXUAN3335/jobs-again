@@ -173,6 +173,32 @@ _FAMILY_SALESY = re.compile(
     r"\b(?:sales|solutions?|support|success|field|customer|partner|gtm|revenue)[- ]engineer|"
     r"\bdeveloper[- ](?:advocate|relations|marketing|evangelist)|\bbusiness[- ]developer",
     re.I)
+# Engineering, but not HER engineering. The taxonomy was binary (eng / non_eng), so every
+# hardware, EE, mechanical, manufacturing and safety title landed in 'eng' and got the full
+# coverage arithmetic — and that arithmetic INVERTS on them: the skill vocabulary only knows
+# software, so a battery JD's real asks (cell chemistry, thermal, DFMEA) are invisible, the
+# handful of generic words it does contain ("testing", "python") all match, and coverage
+# saturates. Measured 2026-07-31: Anduril's Battery Engineer scored 93 and its Harness
+# Engineer 90, while its real Senior Software Engineer, Stateful Systems scored 82. Absence
+# of vocabulary was reading as "nothing was asked for that she lacks".
+# Checked AFTER _FAMILY_ENG_CORE so "Senior Software Engineer, Semiconductor Systems" and
+# "Platform Engineer" stay eng — a software role in a hardware domain is still a software role.
+_FAMILY_HW_ENG = re.compile(
+    r"\b(?:battery|harness|thermal|mechanical|electrical|chemical|civil|structural|industrial|"
+    r"manufactur\w*|facilities|environmental\s+health|health\s+and\s+safety|ehs|"
+    r"signal\s+integrity|power\s+integrity|rf|antenna|optical|optics|photonics|"
+    r"hardware|pcb|asic|silicon|semiconductor|packaging|"
+    r"functional\s+safety|vehicle\s+safety|systems\s+safety|"
+    r"process\s+engineer|failure\s+analysis|materials|mechatronic\w*|powertrain|propulsion|"
+    r"digital\s+design)\b", re.I)
+# …unless the title itself says software. Two false rescues found while calibrating and
+# deliberately excluded from this guard: 'data' would rescue "Data Center … EHS Engineer" via
+# the building, and 'infrastructure' would rescue "Mass Production Infrastructure Manufacture
+# Engineer" — in both the software-ish word is a modifier, not the job.
+_FAMILY_SW_MARKER = re.compile(
+    r"\b(?:software|swe|sde|backend|back-end|frontend|front-end|full[- ]?stack|devops|sre|"
+    r"site\s+reliability|machine\s+learning|\bml\b|cloud|api|web|mobile|android|ios|"
+    r"application\s+developer|developer\s+experience|data(?!\s*cent))\b", re.I)
 _FAMILY_ENG_WORD = re.compile(
     r"\bengineer(?:ing)?\b|\bdeveloper\b|\bprogrammer\b|\btechnologist\b", re.I)
 _FAMILY_NON_ENG = re.compile(
@@ -205,6 +231,12 @@ def role_family(title: str | None, cfg: dict | None = None) -> str:
     if _FAMILY_ENG_CORE.search(t):
         return "eng"
     if _FAMILY_SALESY.search(t):
+        return "non_eng"
+    # Non-software engineering disciplines. Reported as non_eng on purpose: every consumer of
+    # this function (the 40-point cap, verdict=drop, scoring's drop_non_eng_titles, optimize,
+    # gap_report) already does the right thing with that value, and a third family would have
+    # to be taught to each of them separately.
+    if _FAMILY_HW_ENG.search(t) and not _FAMILY_SW_MARKER.search(t):
         return "non_eng"
     if _FAMILY_ENG_WORD.search(t):
         return "eng"

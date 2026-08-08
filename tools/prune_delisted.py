@@ -69,4 +69,17 @@ def main(dry: bool):
 
 
 if __name__ == "__main__":
-    main("--dry" in sys.argv)
+    # Deliberately strict: this deletes rows, and the old `main("--dry" in sys.argv)` meant
+    # ANY unrecognised flag ran the real thing — `--help` deleted 293 roles on 2026-07-30.
+    # Unknown args now abort, and the destructive path needs an explicit --apply.
+    args = set(sys.argv[1:])
+    known = {"--dry", "--apply", "-h", "--help"}
+    if args - known:
+        sys.exit(f"unknown option(s): {' '.join(sorted(args - known))}\n"
+                 "usage: prune_delisted.py [--dry | --apply]")
+    if not args or args & {"-h", "--help"}:
+        sys.exit(__doc__)
+    if "--dry" in args:
+        main(True)
+    elif "--apply" in args:
+        main(False)

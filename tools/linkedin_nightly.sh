@@ -43,4 +43,11 @@ if $PY tools/linkedin_ingest.py scratch_priors/linkedin_enriched; then
 else
     echo "!! ingest step failed — enriched files kept for retry"
 fi
+
+# Tailor whatever just landed, instead of waiting for the next 09:45 run. Ingest adds roles
+# (and new companies) to the review queue; without this they sit there résumé-less until the
+# following morning, which is exactly the "好多都没有 resume" the owner hit on 2026-07-30.
+# auto_tailor.sh holds its own lock, so overlapping with the scheduled run is a no-op.
+bash tools/auto_tailor.sh || echo "!! auto_tailor step failed (continuing)"
+
 echo "=== linkedin nightly done $(date '+%F %T') ==="

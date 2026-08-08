@@ -21,7 +21,8 @@ from pathlib import Path
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
 
-from app import config as cfgmod, manual, store  # noqa: E402
+from app import config as cfgmod, filters, manual, store  # noqa: E402
+from app.sources.base import Posting  # noqa: E402
 
 
 def main(enriched_dir: str) -> None:
@@ -47,6 +48,17 @@ def main(enriched_dir: str) -> None:
             skipped.append((jid, "missing title/company")); continue
         if manual.looks_blocked(jd) or len(jd) < 300:
             skipped.append((jid, f"jd too thin ({len(jd)} chars)")); continue
+        # Run the SAME hard filters the ATS scanners run. This path bypassed them entirely,
+        # which is how a TikTok posting (current employer) plus ML/frontend/new-grad roles
+        # the config explicitly excludes all reached the review queue — ~88 LinkedIn roles
+        # land here every night, so an unfiltered channel quietly dominates the queue.
+        res = filters.classify(
+            Posting(ats="linkedin", company=company, slug="", raw_id=jid, title=title,
+                    location=j.get("location") or "", jd_text=jd,
+                    apply_url="", department=""),
+            cfg.get("filters") or {})
+        if not res.keep:
+            skipped.append((jid, f"filtered {res.reason} ({company[:20]})")); continue
         if j.get("salary"):
             jd += f"\n\nSalary: {j['salary']}"
         manual.add_role(

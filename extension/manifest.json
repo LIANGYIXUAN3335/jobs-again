@@ -3,7 +3,10 @@
   "name": "JobScan Apply Helper",
   "version": "0.1.0",
   "description": "Pre-fills Greenhouse/Lever/Ashby/Workday application forms with your profile and the tailored résumé from your local JobScan. Stops before submit.",
-  "permissions": ["activeTab", "scripting"],
+  "permissions": [
+    "activeTab",
+    "scripting"
+  ],
   "host_permissions": [
     "http://127.0.0.1:8787/*",
     "http://localhost:8787/*",
@@ -28,10 +31,38 @@
     "*://www.hashicorp.com/careers/*",
     "*://retool.com/careers/*",
     "*://www.deel.com/careers/*",
-    "*://jobs.deel.com/*"
+    "*://jobs.deel.com/*",
+    "*://bloomberg.avature.net/*",
+    "*://ats.rippling.com/*",
+    "*://*.lever.co/*",
+    "*://*.ashbyhq.com/*",
+    "*://*.workable.com/*",
+    "*://*.jobvite.com/*",
+    "*://*.icims.com/*",
+    "*://*.bamboohr.com/*",
+    "*://*.smartrecruiters.com/*",
+    "*://*.paylocity.com/*",
+    "*://*.dover.com/*",
+    "*://*.rippling.com/*",
+    "*://*.avature.net/*",
+    "*://*.recruitee.com/*",
+    "*://*.teamtailor.com/*",
+    "*://*.breezy.hr/*",
+    "*://*.pinpointhq.com/*",
+    "*://*.gem.com/*",
+    "*://*.eightfold.ai/*",
+    "*://*.oraclecloud.com/*",
+    "*://*.taleo.net/*",
+    "*://*.successfactors.com/*",
+    "*://*.workdayjobs.com/*"
   ],
-  "background": { "service_worker": "background.js" },
-  "action": { "default_popup": "popup.html", "default_title": "JobScan Apply Helper" },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "JobScan Apply Helper"
+  },
   "content_scripts": [
     {
       "matches": [
@@ -55,9 +86,34 @@
         "*://www.hashicorp.com/careers/*",
         "*://retool.com/careers/*",
         "*://www.deel.com/careers/*",
-        "*://jobs.deel.com/*"
+        "*://jobs.deel.com/*",
+        "*://bloomberg.avature.net/*",
+        "*://ats.rippling.com/*",
+        "*://*.lever.co/*",
+        "*://*.ashbyhq.com/*",
+        "*://*.workable.com/*",
+        "*://*.jobvite.com/*",
+        "*://*.icims.com/*",
+        "*://*.bamboohr.com/*",
+        "*://*.smartrecruiters.com/*",
+        "*://*.paylocity.com/*",
+        "*://*.dover.com/*",
+        "*://*.rippling.com/*",
+        "*://*.avature.net/*",
+        "*://*.recruitee.com/*",
+        "*://*.teamtailor.com/*",
+        "*://*.breezy.hr/*",
+        "*://*.pinpointhq.com/*",
+        "*://*.gem.com/*",
+        "*://*.eightfold.ai/*",
+        "*://*.oraclecloud.com/*",
+        "*://*.taleo.net/*",
+        "*://*.successfactors.com/*",
+        "*://*.workdayjobs.com/*"
       ],
-      "js": ["content.js"],
+      "js": [
+        "content.js"
+      ],
       "run_at": "document_idle",
       "all_frames": true
     }

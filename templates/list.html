@@ -23,6 +23,7 @@
     <a class="dim" href="/?status=all" title="everything, with hide-reasons">all {{ total_roles }}</a>
     {# Module 2 — feeders & follow-through tools #}
     <a href="/browse" style="margin-left:auto" title="careers pages the scanner can't reach — capture from there">🌐 browse</a>
+    <a href="/companies" title="每家公司走到哪一步 · 球在谁那边（按邮件线程聚合，对应 Gmail 的 Interviews/ 标签）">🏢 公司进度</a>
     <a href="/outcomes" title="what the inbox says happened to your applications">📮 outcomes</a>
     <a href="/followups" title="applications that have gone quiet">⏳ quiet</a>
     <a class="dim" href="/replies" title="inbox reply drafts (needs thread context — parked)">📥 replies</a>
@@ -78,15 +79,29 @@
   </select>
   <input name="min_score" type="number" min="0" max="100" step="5" value="{{ params.min_score }}" placeholder="min score">
   <select name="sort">
-    {% for v, label in [('score','sort: score + fresh'), ('base_score','sort: score only'), ('first_seen','sort: newest'), ('company','sort: company')] %}
+    {% for v, label in [('diversity','sort: one per company (score+fresh)'), ('score','sort: score + fresh'), ('base_score','sort: score only'), ('first_seen','sort: newest'), ('company','sort: company A-Z')] %}
       <option value="{{ v }}" {{ 'selected' if params.sort==v }}>{{ label }}</option>
     {% endfor %}
   </select>
   <button>filter</button>
+  <input type="hidden" name="rot" value="{{ params.rot }}">
   <span class="dim">{{ rows|length }} shown · keys: j/k move · Enter JD · a applied · s skip · x rejected · i interviewing · n new</span>
 </form>
 
-{% if cap_info %}
+{% if budget %}
+<div class="cap-note" title="{% for co, c in budget.blocked_companies.items() %}{{ co }}: {{ c.reason }}{% if c.reason == 'stock' %} — 配额用满 {{ c.used }}/{{ c.limit }}{% else %} — {{ c.reason_text|default(c.reason) }} 至 {{ c.until }}{% endif %}&#10;{% endfor %}">
+  🎯 {{ budget.companies }} 家公司 · 每家 1 个岗位 ·
+  <b>第 {{ budget.round_of }}/{{ budget.rounds }} 轮</b>（前 {{ budget.total }} 家打头）
+  · 合格池 {{ budget.eligible }}
+  {% if budget.retired %}· <b>{{ budget.retired|length }}</b> 家已投满退休（{{ budget.retired[:4]|join(', ') }}{% if budget.retired|length > 4 %}…{% endif %}）{% endif %}
+  <a class="rotbtn" href="?{% for k, v in params.items() %}{% if k != 'rot' and v %}{{ k }}={{ v|urlencode }}&amp;{% endif %}{% endfor %}rot={{ budget.next_rot }}">🔄 换一批</a>
+  <div class="dim" style="margin-top:3px">
+    首屏类型分布：{% for name, n in budget.buckets.items() %}{{ name }} {{ n }}{% if not loop.last %} · {% endif %}{% endfor %}
+    — 「换一批」同时换<b>哪些公司打头</b>和<b>每家显示哪个岗位</b>；点 {{ budget.rounds }} 次每家都当过一次首屏。
+    刷新不会变。想让某家换下一个岗位，把当前这个标 <b>applied</b> 或 <b>skip</b>。
+  </div>
+</div>
+{% elif cap_info %}
 <div class="cap-note" title="{% for co, c in cap_info.items() %}{{ co }}: showing {{ c.shown }}, {{ c.held }} held since {{ c.since }}&#10;{% endfor %}">
   📦 per-company cap: showing top 15 each ·
   {{ cap_info|length }} compan{{ 'y' if cap_info|length == 1 else 'ies' }} capped,
@@ -95,17 +110,28 @@
 {% endif %}
 <table id="roles">
 <thead><tr>
+  <th class="quick" title="mark without crossing the row — the two decisions that need no extra input"></th>
   <th>company</th><th>title</th><th>location</th><th class="num">score</th>
-  <th>s·c·d·w</th><th>verdict</th><th>signals</th><th>seen</th><th>status</th><th>notes</th>
+  <th>signals</th><th>seen</th><th>status</th><th>notes</th>
 </tr></thead>
 <tbody>
 {% for r in rows %}
 <tr data-job-id="{{ r.job_id }}">
+  {# Reading happens on the left, so acting used to mean a full-width pointer trip to the
+     actions column — and a mis-aimed click marks the WRONG row, which is unrecoverable
+     (the row leaves review immediately). These two need no extra input, so they can live
+     here; everything that needs a choice (variant, rejected, interviewing, tailor) stays
+     in the actions column. app.js delegates on [data-act] and resolves the row, so both
+     copies drive the same handler and the ✓ still reads the variant select in that row. #}
+  <td class="quick">
+    <button data-act="applied" class="mark-applied" title="mark applied (key: a) — records the résumé variant selected in this row">✓</button>
+    <button data-act="skip" title="skip (s)">–</button>
+  </td>
   <td class="co">{{ r.company }}</td>
   <td class="title">
     <span class="title-link" title="show JD">{{ r.title }}</span>
     {% if r.seniority == 'senior' %}<span class="chip sr" title="senior-titled role">sr</span>{% endif %}
-    {% if r.badge_ref %}<span class="chip warn" title="A DIFFERENT posting (job {{ r.badge_ref.job_id }}{% if r.badge_ref.date %}, {{ r.badge_ref.date }}{% endif %}) with the same company + same title — you marked that one “{{ r.badge_ref.status }}”. THIS is a separate/re-listed job ID, so it stays in review.">⚠ same title · {{ r.badge_ref.status }} before</span>{% endif %}
+    {% if r.badge_ref %}<span class="chip warn" title="A DIFFERENT posting (job {{ r.badge_ref.job_id }}{% if r.badge_ref.date %}, {{ r.badge_ref.date }}{% endif %}) with the same company + same title — you marked that one “{{ r.badge_ref.status }}”. THIS is a separate/re-listed job ID, so it stays in review.">⚠ same title · {{ r.badge_ref.status }}{% if r.badge_ref.date %} {{ r.badge_ref.date[5:] }}{% else %} before{% endif %}</span>{% endif %}
     {% if r.hidden_company %}<span class="chip hide" title="company is in the hidden list">co-hidden</span>{% endif %}
     {% if r.cooldown %}<span class="chip warn" title="application cooldown — {{ r.cooldown.reason }}. Scanner skips this company and it's hidden from review until then.">⏳ cooldown to {{ r.cooldown.until }}</span>{% endif %}
     {% if r.tailor_status == 'ready' %}<a class="chip tailor ready{% if r.resume_score is not none %} rs-{{ 'strong' if r.resume_score >= 85 else ('ok' if r.resume_score >= 75 else 'low') }}{% endif %}" href="/api/roles/{{ r.job_id }}/resume.pdf" target="_blank" title="download tailored PDF · résumé↔JD fit score {{ r.resume_score if r.resume_score is not none else '?' }}/100 (85+ strong, 75-84 ok, &lt;75 weak) — separate from the job score on the left">📄 resume{% if r.resume_score is not none %} <b>{{ r.resume_score }}</b>{% endif %}</a>
@@ -113,11 +139,7 @@
     <a class="apply" href="{{ r.apply_url }}" target="_blank" rel="noopener" title="open application page">↗</a>
   </td>
   <td class="loc">{% if r.is_remote %}<span class="chip remote">remote</span>{% endif %}<span title="{{ r.location or '' }}">{{ (r.location or '')|truncate(34, True) }}</span></td>
-  <td class="num score"><b>{{ '%.0f'|format(r.weighted_score or 0) }}</b>{% if r.fresh_bonus %}<span class="chip fresh" title="freshness boost +{{ '%.0f'|format(r.fresh_bonus) }} — {{ 'posted' if r.fresh.posted_known else 'first seen' }} {{ r.fresh.date }} ({{ r.fresh.age_days }}d ago). Ranking only: the {{ '%.0f'|format(r.weighted_score or 0) }} on the left is the job's own score and does not change as it ages.">+{{ '%.0f'|format(r.fresh_bonus) }}</span>{% endif %}{% if r.diversify %}<span class="chip diversify" title="🎲 diversify +{{ '%.0f'|format(r.diversify.bonus) }} — first-ever application to {{ r.company }} (company avg score {{ r.diversify.company_mean }}, zero applications so far). One wildcard per company, at most a handful at a time; the subsidy disappears the moment any application goes out. Ranking only — the score on the left is the job's own and is unchanged.">🎲+{{ '%.0f'|format(r.diversify.bonus) }}</span>{% endif %}</td>
-  <td class="chips" title="stability {{ r.s_stability }} · culture {{ r.s_culture }} · depth {{ r.s_depth }} · wlb {{ r.s_wlb }}">
-    {{ r.s_stability }}·{{ r.s_culture }}·{{ r.s_depth }}·{{ r.s_wlb }}
-  </td>
-  <td><span class="verdict v-{{ r.verdict }}">{{ r.verdict }}</span></td>
+  <td class="num score" title="stability {{ r.s_stability }} · culture {{ r.s_culture }} · depth {{ r.s_depth }} · wlb {{ r.s_wlb }} — verdict {{ r.verdict }}"><span class="vdot v-{{ r.verdict }}" title="{{ r.verdict }}"></span><b>{{ '%.0f'|format(r.weighted_score or 0) }}</b>{% if r.fresh_bonus %}<span class="chip fresh" title="freshness boost +{{ '%.0f'|format(r.fresh_bonus) }} — {{ 'posted' if r.fresh.posted_known else 'first seen' }} {{ r.fresh.date }} ({{ r.fresh.age_days }}d ago). Ranking only: the {{ '%.0f'|format(r.weighted_score or 0) }} on the left is the job's own score and does not change as it ages.">+{{ '%.0f'|format(r.fresh_bonus) }}</span>{% endif %}{% if r.diversify %}<span class="chip diversify" title="🎲 diversify +{{ '%.0f'|format(r.diversify.bonus) }} — first-ever application to {{ r.company }} (company avg score {{ r.diversify.company_mean }}, zero applications so far). One wildcard per company, at most a handful at a time; the subsidy disappears the moment any application goes out. Ranking only — the score on the left is the job's own and is unchanged.">🎲+{{ '%.0f'|format(r.diversify.bonus) }}</span>{% endif %}</td>
   <td class="signals">
     {% if r.why %}<div class="why" title="{{ r.why }}">{{ r.why|truncate(60, True) }}</div>{% endif %}
     {% if r.caution %}<div class="caution" title="{{ r.caution }}">{{ r.caution|truncate(60, True) }}</div>{% endif %}
@@ -141,7 +163,7 @@
   <td class="notes-cell" title="click to edit notes">{{ r.notes or '+' }}</td>
 </tr>
 {% else %}
-<tr><td colspan="10" class="empty">nothing here — adjust filters, or run <code>python -m app.scan</code></td></tr>
+<tr><td colspan="9" class="empty">nothing here — adjust filters, or run <code>python -m app.scan</code></td></tr>
 {% endfor %}
 </tbody>
 </table>

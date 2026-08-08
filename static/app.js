@@ -18,7 +18,7 @@ const rows = () => [...document.querySelectorAll("tr[data-job-id]")];
 const rowOf = (el) => el.closest("tr[data-job-id]");
 
 /* ---------- status actions ---------- */
-async function setStatus(tr, status) {
+async function setStatus(tr, status, scrollAfter = true) {
   if (!tr) return;
   const variant = status === "applied" ? (tr.querySelector(".variant")?.value || "base") : null;
   await api(`/api/roles/${encodeURIComponent(tr.dataset.jobId)}/status`, "POST",
@@ -31,7 +31,11 @@ async function setStatus(tr, status) {
     setTimeout(() => {
       if (jd && jd.classList.contains("jd-row")) jd.remove();
       tr.remove();
-      focusStep(0);
+      // Re-anchor the keyboard cursor onto whatever row slid up into this slot — but ONLY
+      // if a cursor exists. focusStep() treats focusIdx < 0 as "start at row 0", so calling
+      // it unconditionally made every MOUSE click scroll the page back to the top: a mouse
+      // user never presses j/k, so focusIdx is always -1.
+      if (focusIdx >= 0) focusStep(0, scrollAfter);
     }, 250);
   }
 }
@@ -100,13 +104,16 @@ function editNotes(cell) {
 
 /* ---------- keyboard ---------- */
 let focusIdx = -1;
-function focusStep(delta) {
+function focusStep(delta, scroll = true) {
   const rs = rows();
   if (!rs.length) { focusIdx = -1; return; }
   focusIdx = focusIdx < 0 ? 0 : Math.max(0, Math.min(rs.length - 1, focusIdx + delta));
   rs.forEach((r) => r.classList.remove("focused"));
   rs[focusIdx].classList.add("focused");
-  rs[focusIdx].scrollIntoView({ block: "nearest" });
+  // Rows run 250-360px tall, so scrolling the replacement row into view after a MOUSE click
+  // yanks the page a few hundred px out from under the pointer. Keyboard nav still scrolls —
+  // there the cursor is the only thing telling you where you are.
+  if (scroll) rs[focusIdx].scrollIntoView({ block: "nearest" });
 }
 
 document.addEventListener("keydown", (e) => {
@@ -124,8 +131,15 @@ document.addEventListener("keydown", (e) => {
 document.addEventListener("click", (e) => {
   const btn = e.target.closest("button[data-act]");
   if (btn) {
+    // Mouse and keyboard share ONE cursor: clicking a row's button moves the cursor there,
+    // so the re-anchor after the row disappears lands on its replacement — already under the
+    // pointer, so scrollIntoView({block:"nearest"}) has nothing to scroll. Without this the
+    // cursor would still be wherever j/k last left it and the page would jump back to it.
     if (btn.dataset.act === "queue") queueTailoring(rowOf(btn));
-    else setStatus(rowOf(btn), btn.dataset.act);
+    else {
+      focusIdx = rows().indexOf(rowOf(btn));
+      setStatus(rowOf(btn), btn.dataset.act, false);   // false → don't scroll; the pointer is here
+    }
     return;
   }
   if (e.target.closest("#ingest-btn")) {
@@ -137,6 +151,26 @@ document.addEventListener("click", (e) => {
       if (r.ingested) location.reload();
     }).catch(() => { b.disabled = false; b.textContent = "ingest résumés"; });
     return;
+  }
+  // ↗ opens the application page. Record WHICH role first: for LinkedIn-sourced roles the
+  // apply_url is the LinkedIn page, and clicking Apply there hands you off to the employer's
+  // own ATS whose URL carries no id we store — so the extension's URL lookup can never join
+  // back to li:<id>. The pin is that join, and it expires (store.PIN_TTL_MIN) so it can't
+  // attach a stale résumé later. Fire-and-forget: the link must open even if JobScan is down.
+  const apply = e.target.closest("a.apply");
+  if (apply) {
+    const tr = rowOf(apply);
+    // raw fetch, not api(): api() alerts on failure, and a pin that didn't stick must never
+    // interrupt the click — the worst case is the extension falls back to what it does today.
+    if (tr) {
+      fetch("/api/pin", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ job_id: tr.dataset.jobId }),
+        keepalive: true,          // the tab may navigate away before this settles
+      }).catch(() => {});
+    }
+    return;                       // let the browser follow the href normally
   }
   if (e.target.closest(".title-link")) { toggleJD(rowOf(e.target)); return; }
   const notes = e.target.closest(".notes-cell");
@@ -152,7 +186,10 @@ document.addEventListener("change", (e) => {
   if (e.target.matches("select.more")) {
     const v = e.target.value;
     e.target.value = "";
-    if (v) setStatus(rowOf(e.target), v);
+    if (v) {                                   // also a pointer path — same no-scroll rule
+      focusIdx = rows().indexOf(rowOf(e.target));
+      setStatus(rowOf(e.target), v, false);
+    }
   } else if (e.target.matches("#filters select")) {
     e.target.form.submit();
   }

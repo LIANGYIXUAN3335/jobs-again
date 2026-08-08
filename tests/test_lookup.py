@@ -132,3 +132,148 @@ def test_resume_pdf_route_is_actually_registered():
     r = TestClient(app).get("/api/roles/no:such:role/resume.pdf")
     assert r.status_code == 404
     assert "unknown job_id" in r.text
+
+
+# ---- apply pin -------------------------------------------------------------
+# A LinkedIn role's apply_url is the LinkedIn page; clicking Apply there hands you off to the
+# employer's own ATS, whose URL carries no id we store. Nothing in url_candidates can bridge
+# that, so the pin (set by the ↗ click) is the only join back to li:<id>.
+
+def test_linkedin_url_resolves_to_li_role(cfg):
+    jobs = store.connect_jobs(cfg)
+    store.upsert_roles(jobs, [role_row("li:4136621785", company="Netflix", title="SWE 5")])
+    view = store.connect_view(cfg)
+    cands = url_candidates("https://www.linkedin.com/jobs/view/4136621785/")
+    assert "4136621785" in cands
+    assert store.lookup_role_by_ids(view, cands)["job_id"] == "li:4136621785"
+
+
+def test_employer_ats_url_cannot_reach_the_li_role(cfg):
+    """The gap the pin exists to close — documented so a future refactor can't 'simplify' it away."""
+    jobs = store.connect_jobs(cfg)
+    row = role_row("li:4136621785", company="Netflix")
+    row["apply_url"] = "https://www.linkedin.com/jobs/view/4136621785/"
+    store.upsert_roles(jobs, [row])
+    view = store.connect_view(cfg)
+    landing = "https://jobs.netflix.com/jobs/790300019012"
+    assert store.lookup_role_by_ids(view, url_candidates(landing)) is None
+    assert store.lookup_role_by_apply_url(view, [landing]) is None
+
+
+def test_apply_pin_roundtrip_and_ttl(cfg, monkeypatch):
+    jobs = store.connect_jobs(cfg)
+    store.upsert_roles(jobs, [role_row("li:4136621785", company="Netflix")])
+    view = store.connect_view(cfg)
+
+    assert store.get_apply_pin(view) is None
+    store.set_apply_pin(view, "li:4136621785")
+    assert store.get_apply_pin(view) == "li:4136621785"
+
+    # a pin older than the TTL must not resurface — it would attach a stale résumé
+    view.execute(
+        "UPDATE apply_pins SET pinned_at='2020-01-01T00:00:00+00:00' WHERE job_id=?",
+        ("li:4136621785",),
+    )
+    view.commit()
+    assert store.get_apply_pin(view) is None
+
+    # re-pinning the SAME role refreshes it in place rather than stacking duplicates
+    store.set_apply_pin(view, "li:4136621785")
+    assert view.execute("SELECT COUNT(*) FROM apply_pins").fetchone()[0] == 1
+    store.clear_apply_pin(view)
+    assert store.get_apply_pin(view) is None
+
+
+def test_pins_from_several_tabs_all_survive(cfg):
+    """The Temporal-on-a-Precisely-form bug (2026-07-31). The pin used to be one global slot,
+    so clicking ↗ down a list of tabs left only the last role — and the extension then labelled
+    whatever form came next with it. Every ↗ is a separate statement of intent; keep them all,
+    carrying the company so the caller can pick the one that fits the page it is on."""
+    jobs = store.connect_jobs(cfg)
+    store.upsert_roles(jobs, [
+        role_row("li:4437046992", company="Precisely"),
+        role_row("gh:temporaltechnologies:5183565007", company="Temporal"),
+    ])
+    view = store.connect_view(cfg)
+
+    store.set_apply_pin(view, "gh:temporaltechnologies:5183565007")
+    store.set_apply_pin(view, "li:4437046992")
+
+    pins = store.get_apply_pins(view)
+    assert [p["job_id"] for p in pins] == [
+        "li:4437046992", "gh:temporaltechnologies:5183565007"]      # newest first
+    # the company travels with the pin — matching it to a page must not need a join back
+    assert {p["company_norm"] for p in pins} == {"precisely", "temporal"}
+
+    # releasing the one you actually applied to leaves the other tab's pin alone
+    store.clear_apply_pin(view, "li:4437046992")
+    assert [p["job_id"] for p in store.get_apply_pins(view)] == [
+        "gh:temporaltechnologies:5183565007"]
+
+
+def test_stale_pins_are_pruned_on_write(cfg):
+    """A pin past the TTL must never reach the caller, even if the reader forgets to check."""
+    jobs = store.connect_jobs(cfg)
+    store.upsert_roles(jobs, [role_row("li:1", company="Precisely"),
+                              role_row("li:2", company="Temporal")])
+    view = store.connect_view(cfg)
+
+    store.set_apply_pin(view, "li:1")
+    view.execute("UPDATE apply_pins SET pinned_at='2020-01-01T00:00:00+00:00'")
+    view.commit()
+    store.set_apply_pin(view, "li:2")            # any write prunes
+
+    assert [p["job_id"] for p in store.get_apply_pins(view)] == ["li:2"]
+    assert view.execute("SELECT COUNT(*) FROM apply_pins").fetchone()[0] == 1
+
+
+def test_pin_endpoints(cfg, monkeypatch):
+    """Exercise the real routes, but against the throwaway DBs — app.web binds `cfg` at import
+    time, so without this monkeypatch the test would pin a role in the REAL user_state.db."""
+    from fastapi.testclient import TestClient
+    from app import web as webmod
+
+    monkeypatch.setattr(webmod, "cfg", cfg)
+    jobs = store.connect_jobs(cfg)
+    store.upsert_roles(jobs, [role_row("li:4136621785", company="Netflix", title="SWE 5")])
+    client = TestClient(webmod.app)
+
+    assert client.get("/api/pinned").status_code == 404          # nothing pinned yet
+    assert client.post("/api/pin", json={"job_id": "nope:1"}).status_code == 404
+
+    assert client.post("/api/pin", json={"job_id": "li:4136621785"}).status_code == 200
+    body = client.get("/api/pinned").json()
+    assert body["job_id"] == "li:4136621785"
+    assert body["from_pin"] is True          # the panel must be able to say "not URL-matched"
+    assert body["company"] == "Netflix"
+
+    client.delete("/api/pin")
+    assert client.get("/api/pinned").status_code == 404
+
+
+def test_pins_endpoint_returns_every_live_pin(cfg, monkeypatch):
+    """/api/pins hands the extension the whole live set, because only the extension can see
+    the page and decide which one belongs to it. A server-side pick is what put a Temporal
+    role on a Precisely form. Deleting one pin must not disturb the rest."""
+    from fastapi.testclient import TestClient
+    from app import web as webmod
+
+    monkeypatch.setattr(webmod, "cfg", cfg)
+    jobs = store.connect_jobs(cfg)
+    store.upsert_roles(jobs, [
+        role_row("li:4437046992", company="Precisely", title="Associate SWE"),
+        role_row("gh:temporaltechnologies:5183565007", company="Temporal", title="SWE II"),
+    ])
+    client = TestClient(webmod.app)
+
+    assert client.get("/api/pins").json()["pins"] == []
+    client.post("/api/pin", json={"job_id": "gh:temporaltechnologies:5183565007"})
+    client.post("/api/pin", json={"job_id": "li:4437046992"})
+
+    pins = client.get("/api/pins").json()["pins"]
+    assert [p["company"] for p in pins] == ["Precisely", "Temporal"]     # newest first
+    assert all(p["from_pin"] is True for p in pins)
+
+    # the frame that claimed Precisely releases only Precisely
+    assert client.delete("/api/pin", params={"job_id": "li:4437046992"}).status_code == 200
+    assert [p["company"] for p in client.get("/api/pins").json()["pins"]] == ["Temporal"]
