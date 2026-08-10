@@ -78,7 +78,7 @@ def test_ingest_links_unambiguous_and_advances_stage(cfg, tmp_path):
     conn.commit()
     res = iv.ingest(cfg, conn)
     assert res == {"interviews": 2, "linked": 1, "ambiguous": 0, "standalone": 1,
-                   "with_transcript": 0}
+                   "with_transcript": 0, "skipped": []}
     row = conn.execute("SELECT * FROM interviews WHERE marker_id='2026-07-14-amazon'").fetchone()
     assert row["job_id"] == "manual:amazon:sde"
     st = conn.execute("SELECT status, stage FROM role_state WHERE job_id='manual:amazon:sde'").fetchone()
