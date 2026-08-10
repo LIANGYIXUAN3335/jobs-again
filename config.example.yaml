@@ -1,0 +1,197 @@
+db_path: data/jobscan.db
+user_db_path: data/user_state.db
+company_notes: company_notes.yaml
+
+ui:
+  page_size: 80
+  default_status: new
+
+http:
+  host: 127.0.0.1
+  port: 8787
+  reload: false
+
+weights:
+  tech: 0.35
+  product: 0.25
+  company: 0.2
+  logistics: 0.2
+
+verdict_thresholds:
+  strong: 70
+  consider: 60
+
+signature_match: warn
+cooldowns: {}
+application_budget:
+  daily_target: 8
+  daily_max: 20
+  weekly_target: 40
+  weekly_max: 80
+  reset_weekday: monday
+per_company_cap:
+  default_max_active: 3
+  window_days: 60
+
+linkedin:
+  enabled: false
+  alerts_mailbox: ""
+  guest_search_enabled: false
+  max_daily_fetches: 20
+  min_delay_seconds: 5
+  jitter_seconds: 4
+  pending_ttl_days: 21
+  keywords: []
+
+auto_tailor:
+  enabled: false
+  limit_per_run: 5
+  min_score: 70
+
+inbox:
+  enabled: false
+  model: claude-haiku-4-5
+  days: 14
+  limit: 50
+  auto_send: false
+  star_needs_reply: false
+  trusted_domains: []
+
+calendar:
+  enabled: false
+  timezone: America/Los_Angeles
+  workday_start: "09:00"
+  workday_end: "17:00"
+  min_notice_hours: 24
+  slot_minutes: 30
+  max_slots: 3
+  calendars: []
+  busy_buffer_minutes: 15
+  meeting_location: ""
+  notes: ""
+
+eeo_decline: true
+salary:
+  fallback: 180000
+  currency: USD
+eeo:
+  gender: decline
+  race: decline
+  veteran: decline
+  disability: decline
+  pronouns: ""
+  sponsorship: "customize-me"
+
+companies:
+  - name: ExampleCo
+    ats: greenhouse
+    slug: example
+    enabled: false
+
+filters:
+  locations_allow:
+    - United States
+    - Remote
+  locations_deny: []
+  seniority_include:
+    - software engineer
+    - backend
+    - full stack
+  seniority_exclude:
+    - staff
+    - principal
+    - director
+  title_exclude: []
+  title_include: []
+  remote_ok: true
+  sponsorship_required: false
+  drop_contract: false
+
+scoring:
+  tech_keywords: {}
+  product_keywords: {}
+  company_keywords: {}
+  logistics_keywords: {}
+  negative_keywords: {}
+  freshness:
+    bonus: 10
+    full_days: 2
+    zero_days: 14
+  strong_signals: []
+  weak_signals: []
+  penalties: {}
+  boosts: {}
+  notes: ""
+
+resume_scoring:
+  enabled: true
+  family_eng_allow: []
+  hard_skills: {}
+  soft_skills: {}
+  role_weights: {}
+  minimum_evidence: 1
+  gap_limit: 12
+  notes: ""
+
+gap_triage: {}
+followup:
+  enabled: true
+  days_after_apply: 7
+  max_per_day: 5
+  channel: email
+  tone: concise
+funnel:
+  enabled: true
+  cold_after_days: 45
+  reject_after_signal: true
+
+ai:
+  enabled: false
+  provider: anthropic
+  model: claude-opus-4-1
+  effort: high
+  max_tokens: 4000
+  timeout_seconds: 90
+  secrets_path: secrets.yaml
+
+mailcode:
+  enabled: false
+  email: ""
+  imap_host: imap.gmail.com
+  smtp_host: smtp.gmail.com
+
+applied_companies: []
+
+resume_angles:
+  default: resumes/resume_base.yaml
+
+output_dirs:
+  prompts: output/prompts
+  resumes: output/resumes
+
+profile:
+  name: "Your Name"
+  first_name: "Your"
+  last_name: "Name"
+  email: "you@example.com"
+  phone: "+1 000-000-0000"
+  location: "City, ST"
+  country: "United States"
+  linkedin: "https://www.linkedin.com/in/your-profile"
+  github: "https://github.com/your-handle"
+  website: ""
+  work_authorization: "customize-me"
+  needs_sponsorship: "customize-me"
+  timezone: America/Los_Angeles
+  salary_expectation: ""
+  gender: decline
+  race: decline
+  veteran: decline
+  disability: decline
+  pronouns: ""
+  preferred_name: ""
+  notes: ""
+
+interviews:
+  stages: []
+

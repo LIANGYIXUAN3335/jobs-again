@@ -29,3 +29,20 @@ scratch_priors/linkedin_enriched_archive/
 # LOCAL SECRETS — never commit (Anthropic API key for AI autofill)
 secrets.yaml
 secrets/
+
+# Defence in depth (added 2026-08-10, security audit). The rules above are
+# path-specific; these catch the same kinds of file if one is ever written
+# somewhere new. The *.example.yaml templates stay tracked on purpose.
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+**/token*.json
+**/*credential*.json
+**/*client_secret*.json
+*.pem
+*.p12
+
+# untracked scratch working files (only *.json / *.md were covered before)
+scratch_priors/_*
