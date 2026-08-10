@@ -4,10 +4,21 @@ still listed, so a role whose last_seen date is older than its company's NEWEST 
 was delisted by the company. No network needed.
 
 Scope guards:
-  - scanner-sourced roles only (cap:/manual: have no scan coverage — verify those online);
+  - BOARD-scanned roles only. cap:/manual: have no scan coverage, and neither does li: —
+    a LinkedIn role's last_seen is refreshed by a keyword SEARCH, not by an enumeration of
+    an employer's board, so "did not come back in today's search" says nothing about whether
+    the posting is still up. Including li: here was wrong and expensive: on 2026-08-10 it
+    accounted for 344 of the 872 rows this tool wanted to delete (248 of the 425 inside the
+    review queue). A live HTTP probe of a 40-role sample flagged 11 rows of which only 2 were
+    actually dead (18% precision); 6 of the 9 survivors it wanted to delete were li: rows
+    still serving a live posting. Those belong to check_dead_links.py, which fetches them.
   - a company must have been rescanned since the role's last_seen (companies whose whole
     board went stale — commented out of config, fetch errors — prove nothing);
   - role_state.status must be new/absent: applied/interviewing/skip rows keep their history.
+
+Even so the signal is soft: a board scan that is keyword-filtered or paginated drops live
+roles out of a day's results, and this tool cannot tell that from a delisting. Read the
+--dry list before applying; it is a suggestion, not a verdict.
 
 Backs up everything it deletes (roles row + role_state row) to data/purged_delisted_backup.json
 (appends per run, keyed by run timestamp).
@@ -28,16 +39,24 @@ def main(dry: bool):
     cfg = cfgmod.load_config()
     conn = store.connect_view(cfg)      # attaches jobs + user_state
 
+    # Sources whose last_seen is NOT refreshed by enumerating an employer's board, so a
+    # lagging last_seen carries no delisting signal for them. li: belongs here for the same
+    # reason cap:/manual: do — see the module docstring.
+    NOT_BOARD = " AND ".join(f"{{col}} NOT LIKE '{p}:%'" for p in ("cap", "manual", "li"))
+
+    # The per-company baseline has to come from the SAME population being judged: mixing a
+    # li: row's search-driven last_seen into the max makes every board-scanned role at that
+    # company look one scan stale.
     comax = {r["company_norm"]: r["m"] for r in conn.execute(
         "SELECT company_norm, max(substr(last_seen,1,10)) m FROM jobs.roles"
-        " WHERE job_id NOT LIKE 'cap:%' AND job_id NOT LIKE 'manual:%'"
+        f" WHERE {NOT_BOARD.format(col='job_id')}"
         " GROUP BY company_norm")}
 
     rows = conn.execute(
         "SELECT r.*, s.status AS own_status, s.notes AS s_notes,"
         "       s.tailored_resume_path, s.prompt_path, s.tailor_status"
         " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
-        " WHERE r.job_id NOT LIKE 'cap:%' AND r.job_id NOT LIKE 'manual:%'").fetchall()
+        f" WHERE {NOT_BOARD.format(col='r.job_id')}").fetchall()
 
     gone = []
     for r in rows:

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "JobScan Apply Helper",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Pre-fills Greenhouse/Lever/Ashby/Workday application forms with your profile and the tailored résumé from your local JobScan. Stops before submit.",
   "permissions": [
     "activeTab",

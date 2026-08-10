@@ -12,6 +12,29 @@ def test_url_candidates_extracts_ids():
     assert url_candidates("https://example.com/careers") == []
 
 
+def test_url_candidates_reads_digit_leading_workday_req_ids():
+    """Autodesk stamps the fiscal year on the FRONT of its req id (26WD99399), which the
+    letters-first Workday pattern cannot see at all. web.log 2026-08-09: 78 consecutive
+    /api/lookup 404s on one such apply page whose role WAS in the queue with a tailored PDF,
+    so the panel never opened and the form got filled by hand.
+
+    The trailing -1 is Workday's repost counter and is never part of the stored job_id
+    (wd:autodesk:wd1:Ext:26WD99399), so it must not be captured.
+    """
+    got = url_candidates(
+        "https://autodesk.wd1.myworkdayjobs.com/en-US/Ext/job/Montreal%2C-QC%2C-CAN/"
+        "Senior-Software-Developer---Platform---Emerging-Technologies_26WD99399-1/apply/a")
+    assert "26WD99399" in got
+    assert "26WD99399-1" not in got
+    # the letters-first shapes must keep working
+    assert "R-284379" in url_candidates(
+        "https://mastercard.wd1.myworkdayjobs.com/en-US/CorporateCareers/job/x/"
+        "Software-Engineer-II_R-284379/apply/autofillWithResume")
+    assert "R170631" in url_candidates(
+        "https://adobe.wd5.myworkdayjobs.com/en-US/external_experienced/job/San-Jose/"
+        "Software-Development-Engineer_R170631/apply/autofillWithResume")
+
+
 def test_lookup_matches_by_raw_id_and_prefers_tailored(cfg):
     jobs = store.connect_jobs(cfg)
     store.upsert_roles(jobs, [
