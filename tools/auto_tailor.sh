@@ -35,7 +35,9 @@ fi
 #    read prompts, write YAMLs, run the venv python (ingest+score). If a tool ever gets
 #    blocked, widen this list or switch to --dangerously-skip-permissions.
 echo "tailoring $COUNT roles via headless Claude Code (subscription)…" >>"$LOG"
-env -u ANTHROPIC_API_KEY "$CLAUDE" -p "$(cat tools/autotailor_prompt.md)" \
+# --model opus (owner 2026-08-06): tailoring quality beats cost now that only about-to-apply
+# résumés get generated; the rest of the content-gen stack stays on sonnet.
+env -u ANTHROPIC_API_KEY "$CLAUDE" -p "$(cat tools/autotailor_prompt.md)" --model opus \
     --allowedTools "Read" "Write" "Edit" "Bash(.venv/bin/python:*)" >>"$LOG" 2>&1 \
     || echo "claude run exited non-zero" >>"$LOG"
 echo "===== $(date) auto_tailor done =====" >>"$LOG"

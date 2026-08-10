@@ -53,9 +53,10 @@ def main() -> None:
         sys.exit(1)
 
     base = tailoring.load_base(cfg)
-    # validate first so the agent gets a clear structural error instead of a scorer crash
+    # validate first (incl. the credibility hard rules — tool-zoo bullets, skill-group cap,
+    # soft-skill ban, bullet caps) so the agent gets a clear error instead of a scorer crash
     try:
-        tailoring.validate_tailored(tailored)
+        tailoring.validate_tailored(tailored, base)
     except tailoring.TailorError as e:
         print(json.dumps({"error": f"invalid tailored yaml: {e}", "overall": 0}))
         sys.exit(0)

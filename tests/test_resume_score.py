@@ -52,11 +52,13 @@ def test_node_the_runtime_not_the_machine():
 
 
 def test_vocabulary_the_base_resume_now_covers():
-    """The 2026-07-24 wording pass. These are the terms the JDs use for work she had already
-    done; if a future edit drops them from resumes/resume_base.yaml, this fails."""
+    """The 2026-07-24 wording pass, amended by the 2026-08-06 credibility pass: concept terms
+    must survive in the BULLETS (that's where they're defensible); "self-directed" was a
+    soft-skill keyword living only in the skills list, which the credibility rules ban — it is
+    deliberately no longer covered."""
     from app import config as cfgmod, tailoring
     base_text = tailoring._base_text(tailoring.load_base(cfgmod.load_config()))
-    for canon in ["ownership", "self-directed", "fault tolerance", "high availability",
+    for canon in ["ownership", "fault tolerance", "high availability",
                   "concurrency", "event-driven", "high throughput", "bulk ingestion"]:
         assert has(base_text, canon), f"base résumé no longer covers {canon!r}"
 
@@ -136,7 +138,11 @@ def test_rich_backend_jd_still_scores_strong():
           "low latency, monitoring, CI/CD, code review, mentorship, cross-functional collaboration.")
     sc = _score(jd, "Senior Backend Engineer")
     assert sc.family == "eng"
-    assert sc.overall >= 85, sc.summary_line()
+    # 2026-08-06 credibility pass: the base no longer lists code review / mentorship (soft
+    # skills are banned as keywords) or gRPC / low latency (no bullet evidence), so this JD
+    # tops out at APPLY, not STRONG — that lost coverage is deliberate honesty, not a bug.
+    assert sc.overall >= 80, sc.summary_line()
+    assert sc.verdict in ("apply", "strong"), sc.summary_line()
 
 
 def test_empty_jd_scores_the_prior_not_perfection():
