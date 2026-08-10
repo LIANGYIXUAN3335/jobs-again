@@ -1,0 +1,39 @@
+identity:
+  name: "Your Name"
+  email: "you@example.com"
+  phone: "+1 000-000-0000"
+  location: "City, ST"
+  linkedin: "https://www.linkedin.com/in/your-profile"
+  github: "https://github.com/your-handle"
+
+summary: "One or two lines describing your target role and strongest evidence."
+
+education:
+  - school: "Your University"
+    degree: "Your Degree"
+    dates: "YYYY - YYYY"
+    details: []
+
+experience:
+  - company: "Company"
+    title: "Role"
+    dates: "MMM YYYY - MMM YYYY"
+    location: "City, ST"
+    bullets:
+      - "Use factual, reusable base bullets here. Tailoring may reword but should not invent facts."
+
+projects:
+  - name: "Project"
+    bullets:
+      - "What you built, with concrete technologies and impact."
+
+skills_master:
+  Languages:
+    - Python
+  Frameworks:
+    - FastAPI
+  Data:
+    - PostgreSQL
+  Tools:
+    - Git
+
