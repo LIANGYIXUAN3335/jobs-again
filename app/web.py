@@ -20,7 +20,6 @@ from . import ai as aimod
 from . import company_board as boardmod
 from . import config as cfgmod
 from . import followup as followupmod
-from . import funnel as funnelmod
 from . import gcal as gcalmod
 from . import heartbeats as hbmod
 from . import ideas as ideasmod
@@ -974,62 +973,6 @@ def api_record_signal(job_id: str, body: SignalIn, conn=Depends(view_conn)):
     except ValueError as e:
         raise HTTPException(400, str(e))
     return {"ok": True, "state": state}
-
-
-@app.get("/api/funnel")
-def api_funnel(by: str = "score,match,company,ats", conn=Depends(view_conn)):
-    dims = [d.strip() for d in by.split(",") if d.strip() in funnelmod._DIMENSIONS]
-    rep = funnelmod.report(cfg, conn, dims or ["score"])
-    rep.pop("apps", None)                       # the per-application rows are big and unused here
-    return rep
-
-
-@app.get("/funnel", response_class=HTMLResponse)
-def funnel_page(conn=Depends(view_conn)):
-    dims = ["score", "match", "culture", "company", "ats"]
-    rep = funnelmod.report(cfg, conn, dims)
-    o, s, tune = rep["overall"], rep["signal"], rep["tuning"]
-    if not o["applied"]:
-        return _page("Funnel", '<h1>📊 Funnel</h1><p class="tip">No applications recorded yet.</p>')
-
-    def rate(r):
-        if r["response_rate"] is None:
-            return '<span class="muted">—</span>'
-        txt = f'{r["response_rate"]:.0f}%'
-        return txt if r["enough"] else f'{txt} <span class="muted small">?</span>'
-
-    tables = ""
-    for d in dims:
-        rows = "".join(
-            f'<tr><td>{r["bucket"]}</td><td class="n">{r["applied"]}</td>'
-            f'<td class="n">{r["mature"]}</td><td class="n">{r["responded"]}</td>'
-            f'<td class="n">{r["interviewed"]}</td><td class="n">{r["offered"]}</td>'
-            f'<td class="n">{r["quiet"]}</td><td class="n">{rate(r)}</td></tr>'
-            for r in rep["by"][d][:20])
-        tables += (f'<h2>by {d}</h2><table><tr><th>{d}</th><th class="n">applied</th>'
-                   f'<th class="n">judgeable</th><th class="n">replied</th><th class="n">intv</th>'
-                   f'<th class="n">offer</th><th class="n">quiet</th><th class="n">reply rate</th>'
-                   f'</tr>{rows}</table>')
-
-    if s["verdict"] == "not enough data":
-        signal = (f'<p class="tip warn"><b>Does the role score predict a reply?</b> '
-                  f'Not answerable yet — {s["n"]} judgeable applications, need about {s["need"]}. '
-                  f'Record outcomes on <a href="/outcomes">/outcomes</a> and this fills itself in.</p>')
-    else:
-        signal = (f'<p class="tip"><b>Does the role score predict a reply?</b> {s["verdict"]} — '
-                  f'bottom half {s["low_half_rate"]:.0f}% vs top half {s["high_half_rate"]:.0f}% '
-                  f'(split at {s["cutoff"]:.0f}, n={s["n"]}).</p>')
-
-    return _page("Funnel", f"""<h1>📊 Funnel</h1>
-      <p>{o['applied']} applications · {o['companies']} companies ·
-         <b>{o['mature']}</b> old enough to judge (≥{o['window']}d),
-         {o['pending']} still too fresh</p>
-      <p>replied <b>{o['responded']}</b> · interview+ <b>{o['interviewed']}</b> ·
-         offer <b>{o['offered']}</b> · rejected {o['rejected']} · quiet {o['quiet']}</p>
-      {signal}{tables}
-      <p class="small muted">Applications younger than {o['window']} days are excluded from every
-      rate — counting yesterday's silence as a rejection would drag every number to zero.
-      "?" marks a bucket with fewer than {tune['min_n']} judgeable applications.</p>""")
 
 
 @app.get("/api/outcomes")

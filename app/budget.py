@@ -189,7 +189,8 @@ def depth_plan(by_co: dict[str, list[dict]], stock: dict[str, dict],
                cfg: dict) -> dict[str, int]:
     """{company_norm: how many of its reqs to queue back-to-back today}. Empty when OFF.
 
-    EVIDENCE (funnel_report.py over 840 applications / 246 companies, 2026-07-18 → 08-09,
+    EVIDENCE (one-off conversion analysis, 840 applications / 246 companies, 2026-07-18 → 08-09;
+    the reporting tool was removed 2026-08-12 at the owner's request — numbers kept for the record,
     replicated independently 2026-08-10 against both DBs read-only):
 
         applied to exactly 1 req there   112 companies    0 replies

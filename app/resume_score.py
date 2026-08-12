@@ -285,6 +285,104 @@ def jd_keyword_plan(jd_text: str, base_text: str) -> tuple[list[str], list[str]]
     return sorted(jd_skills & base_skills), sorted(jd_skills - base_skills)
 
 
+# ---------- summary quality: self-praise vs. operational evidence ----------
+# Found the hard way (2026-08-11): 30 tailored résumés shipped a summary ending in
+# "— a strong fit for <the JD's exact title>. Self-directed, ramps fast on new codebases."
+# 18 of them went out as PDFs (Apple ×5, Google ×5, Microsoft ×4, LinkedIn ×2, Mastercard ×2).
+#
+# Why the existing scorer never caught it: `achievements` only inspects experience BULLETS, and
+# `parseability` only asks whether summary is non-empty. So the one paragraph guaranteed to be
+# read by a human was the single unscored field in the document.
+#
+# Two things are wrong with that sentence, and they are opposite failures:
+#   1. It states the CONCLUSION the reader is supposed to reach. "A strong fit for X" is the
+#      hiring manager's judgment to make; asserting it yourself gets discounted on sight, and
+#      pasting the JD's literal title into the prose advertises that this was mail-merged.
+#   2. It spends the most expensive six seconds on the page saying nothing checkable.
+#
+# So this is scored as a subtraction (puffery) plus an addition (evidence you operated
+# something real): scale, failure modes, reliability verbs, and numbers. The intent is not
+# "ban adjectives" — it is that every clause in the summary should be something a reference
+# check could confirm.
+_PUFF = [
+    r"\ba (?:strong|great|excellent|perfect|natural|ideal) fit\b",
+    r"\bwell[- ]suited\b", r"\bwell[- ]positioned\b", r"\bideal candidate\b",
+    r"\bproven track record\b", r"\bpassionate about\b", r"\bself[- ]directed\b",
+    r"\bramps? fast\b", r"\bfast learner\b", r"\bquick learner\b",
+    r"\bteam player\b", r"\bgo[- ]getter\b", r"\bresults[- ]driven\b",
+    r"\bhighly (?:motivated|skilled|experienced)\b", r"\bexceptional\b",
+    r"\bworld[- ]class\b", r"\btop[- ]tier\b", r"\brock ?star\b", r"\bguru\b", r"\bninja\b",
+    r"\bthrives? in\b", r"\bdeep passion\b", r"\bstrong desire\b",
+]
+# Evidence that the writer has actually RUN something in production. Deliberately concrete:
+# these are the nouns you only use if you were on the hook when it broke.
+_EVIDENCE = [
+    r"\d",                                                   # any number at all
+    r"\b(?:p50|p90|p95|p99|percentile|tail latency)\b",
+    r"\b(?:qps|rps|tps|throughput|concurrent|scale|scaling)\b",
+    r"\b(?:on[- ]call|incident|outage|postmortem|live[- ]site|sev\d?)\b",
+    r"\b(?:failure|fault|degradation|regression|rollback|retry|timeout|circuit break)\w*\b",
+    r"\b(?:uptime|availability|sla|slo|error budget)\b",
+    r"\b(?:migrat|deprecat|decommission|cutover)\w*\b",
+    r"\b(?:reduc|cut|drop|elimina|prevent|contain)\w*\b",     # verbs that imply a measured delta
+]
+_PUFF_RE = [re.compile(p, re.I) for p in _PUFF]
+_EVIDENCE_RE = [re.compile(p, re.I) for p in _EVIDENCE]
+
+
+def summary_quality(summary: str | None, *, title: str | None = None) -> tuple[int, list[str]]:
+    """Score a résumé summary 0-100 on 'checkable claims, not self-assessment'.
+
+    Returns (score, flags). Flags are human-readable and are meant to be handed straight to the
+    auto-tailor loop as fix instructions — a number alone can't tell the model WHICH clause to cut.
+    """
+    text = (summary or "").strip()
+    if not text:
+        # Neutral, NOT zero. This scorer runs on two different things: the tailored output (which
+        # always has a summary) and the base résumé via prescreen (which deliberately has none —
+        # the base is a fact store, summaries are written per-application). Scoring absence as 0
+        # punished the base for a field it is not supposed to carry. Nothing is lost by staying
+        # neutral here: `parseability` already counts summary as one of its four required sections,
+        # so a tailored résumé that ships without one is still penalized — just not twice.
+        return 100, []
+
+    flags: list[str] = []
+    hits = [r.pattern for r in _PUFF_RE if r.search(text)]
+    # Each distinct puff phrase costs 18; three of them zeroes the puff budget outright.
+    puff_penalty = min(60, 18 * len(hits))
+    if hits:
+        found = ", ".join(f'"{r.search(text).group(0)}"' for r in _PUFF_RE if r.search(text))
+        flags.append(f"self-praise — cut {found}; state what you built/operated instead")
+
+    # Pasting the JD's literal title into the prose is the mail-merge tell, and it is worth
+    # flagging separately from generic puffery because the fix is different (delete, don't rewrite).
+    if title:
+        # Both sides must be normalized identically — punctuation becomes a space AND runs of
+        # whitespace collapse. Normalizing only the title silently disabled this check, because
+        # "Sr. Software Engineer" leaves a double space in the résumé text where the "." was.
+        def _norm(s: str) -> str:
+            return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", s.lower())).strip()
+        t = _norm(title)
+        if len(t) > 12 and t in _norm(text):
+            puff_penalty = min(75, puff_penalty + 15)
+            flags.append(f'echoes the JD title verbatim ("{title}") — reads as mail-merged; delete it')
+
+    ev = sum(1 for r in _EVIDENCE_RE if r.search(text))
+    evidence_credit = min(30, 10 * ev)          # 3+ distinct kinds of evidence = full credit
+
+    # The evidence prompt is deliberately NOT raised on every thin summary. Measured against the
+    # real corpus (2026-08-11), an `ev < 2` trigger fired on 1722 of 3397 — half the library,
+    # including perfectly serviceable summaries — which is alarm fatigue, and a check that cries
+    # wolf on half the corpus gets ignored exactly when it's right. It now fires only when the
+    # summary offers NOTHING checkable, or when puffery was cut and something must fill the hole
+    # (there the advice is actionable rather than a vague "be more concrete").
+    if ev == 0 or (hits and ev < 2):
+        flags.append("no operational evidence — name a system you ran, its scale, "
+                     "and a failure mode you reduced")
+
+    return max(0, min(100, 70 - puff_penalty + evidence_credit)), flags
+
+
 @dataclass
 class ResumeScore:
     overall: int
@@ -293,6 +391,8 @@ class ResumeScore:
     title_alignment: int
     achievements: int
     parseability: int
+    summary_quality: int = 100         # see summary_quality(); 100 = nothing to fix
+    summary_flags: list[str] = field(default_factory=list)
     matched_hard: list[str] = field(default_factory=list)
     missing_hard: list[str] = field(default_factory=list)
     matched_soft: list[str] = field(default_factory=list)
@@ -303,9 +403,13 @@ class ResumeScore:
 
     def summary_line(self) -> str:
         fam = "  ⛔ WRONG ROLE FAMILY" if self.family == "non_eng" else ""
+        # Surfaced even though its weight is small: a puffy summary is a cheap, high-value fix,
+        # and it is the part of the résumé a human actually reads.
+        puff = f"  ⚠️ SUMMARY {self.summary_quality}: {self.summary_flags[0]}" if self.summary_flags else ""
         return (f"match {self.overall}/100 ({self.verdict.upper()}) · "
                 f"skills {self.skills_coverage} · title {self.title_alignment} · "
-                f"metrics {self.achievements} · parse {self.parseability}{fam}")
+                f"metrics {self.achievements} · parse {self.parseability} · "
+                f"summary {self.summary_quality}{fam}{puff}")
 
 
 def score_resume(jd_text: str, merged: dict, cfg: dict, base_text: str | None = None,
@@ -368,8 +472,15 @@ def score_resume(jd_text: str, merged: dict, cfg: dict, base_text: str | None = 
     have = sum(bool(merged.get(k)) for k in ("summary", "skills", "experience", "education"))
     parseability = round(100 * have / 4)
 
+    # summary quality: the one field a human is guaranteed to read was the one field nothing
+    # scored. Its 0.05 weight comes out of parseability, which is a constant 100 for our own
+    # template and therefore carries no signal — so a clean summary nets ZERO change vs. the old
+    # formula, and only a puffed one loses points (≤5). Bounded on purpose: this is meant to
+    # steer the tailor loop via `summary_flags`, not to silently reclassify the existing DB.
+    sq, sq_flags = summary_quality(merged.get("summary"), title=title)
+
     overall = round(0.60 * skills_coverage + 0.15 * title_alignment
-                    + 0.15 * achievements + 0.10 * parseability)
+                    + 0.15 * achievements + 0.05 * parseability + 0.05 * sq)
     # Wrong role family is categorical, not gradual: no coverage arithmetic may rescue a
     # journalism/sales/consulting posting into the apply queue. Capped below tailor_min (50)
     # so these also stop being auto-tailored, and verdict-forced to drop.
@@ -389,6 +500,7 @@ def score_resume(jd_text: str, merged: dict, cfg: dict, base_text: str | None = 
         overall=overall, verdict=verdict,
         skills_coverage=skills_coverage, title_alignment=title_alignment,
         achievements=achievements, parseability=parseability,
+        summary_quality=sq, summary_flags=sq_flags,
         matched_hard=matched_hard, missing_hard=missing_hard,
         matched_soft=matched_soft, missing_soft=missing_soft,
         coverable=coverable, true_gaps=true_gaps, family=fam,

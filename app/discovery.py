@@ -15,7 +15,7 @@ companies and the daily number leaps; that is not the pipeline improving. So a r
 to `backfill` when its first_seen lands on the day its company entered the corpus, and to
 `flow` otherwise. Only `flow` is worth trending.
 
-Honesty rules, same spirit as app/funnel.py:
+Honesty rules:
   - A day with no scan run is printed as "no scan", never as a zero. Nobody posting and nobody
     looking produce the same number and must not look the same.
   - Today is marked partial. It is compared against nothing until it is over.
