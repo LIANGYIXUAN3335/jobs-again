@@ -222,6 +222,11 @@ def triage(cfg: dict, max_llm: int = 12, days: int | None = None, limit: int = 6
     heads = mail.search_recent(cfg, days=days, limit=limit)
     examples = _sent_examples(cfg)
     replied = _replied_mids(cfg, days=max(days, 45))    # threads she's already answered
+    # 她已经在 Gmail 里亲手回过的：对应 pending 自动划掉（代写砍掉后没人去 /replies 点 dismiss，
+    # 不清会让"N 封等你回"的通知永远虚高）。
+    for it in store.queue_list(conn, status="pending"):
+        if (it["msg_id"] or "").strip() in replied:
+            store.queue_mark(conn, it["msg_id"], "dismissed")
     # Conversations she already dismissed or sent a reply for — don't re-draft their follow-ups.
     closed = {_convo_key(r["from_addr"], r["subject"]) for r in store.queue_closed_rows(conn)}
     # Prefer broad availability windows (whole day / morning / afternoon) — easier for a
@@ -268,6 +273,10 @@ def triage(cfg: dict, max_llm: int = 12, days: int | None = None, limit: int = 6
         if not r or not r.get("needs_reply"):
             continue
 
+        # 2026-08-03 拍板：AI 不再代写回信（draft_replies: false）。"这封要回"的识别、
+        # 加星、通知照旧；draft 存空、永不 arm。她在 Gmail 里用 Wispr Flow 自己写。
+        if not inbox_cfg.get("draft_replies", False):
+            r["draft"] = ""
         # An email carrying injection-shaped text never auto-sends, whatever the model thought
         # of it. The prompt-level rule above can be argued with; this can't — it's the code
         # path to send_due() being closed. It still gets drafted and queued for her to read.
@@ -275,7 +284,8 @@ def triage(cfg: dict, max_llm: int = 12, days: int | None = None, limit: int = 6
         low_risk = (r.get("category") == "scheduling" and r.get("confidence") == "high"
                     and repliable and slots and not flags
                     and "[[AVAILABILITY]]" not in (r.get("draft") or ""))
-        auto = (mode == "all" and repliable and not flags) or (mode == "gated" and low_risk)
+        auto = (inbox_cfg.get("draft_replies", False)
+                and ((mode == "all" and repliable and not flags) or (mode == "gated" and low_risk)))
         status = "armed" if auto else "pending"
         if flags:
             held += 1
@@ -302,6 +312,8 @@ def triage(cfg: dict, max_llm: int = 12, days: int | None = None, limit: int = 6
 
 def send_due(cfg: dict) -> list[dict]:
     """Send any ARMED replies whose undo window has elapsed. Returns what was sent."""
+    if not (cfg.get("inbox") or {}).get("draft_replies", False):
+        return []            # 代写已砍（2026-08-03）：不会再有 armed，历史遗留的也不发
     conn = store.connect_user(cfg)
     undo = int((cfg.get("inbox") or {}).get("undo_minutes", 30))
     now = datetime.datetime.now(store.LA)

@@ -577,9 +577,10 @@ def plan(cfg: dict, threads: list[dict], tiers=("auto",)) -> dict:
         ov = {}
     # 传人工拍板进去：手动结案的公司，Gmail 标签也要进 3-已挂 —— 一行一标签同一事实。
     rows = {_label_name(r["company"]): r for r in company_board.build(threads, ov)}
-    # A company with no board row has no dated mail to judge; treat it as live rather than
-    # silently burying it in 已挂.
-    return {co: (_bucket_of(rows.get(co, {})), ts) for co, ts in by_co.items()}
+    # 没有看板行的公司分两种：被"真人回音门槛"滤掉的（纯投递回执，ABB/ABTB 那批）和被
+    # 手动隐藏的——都不配占 1-进行中，收进 2-已冷（2026-08-03 user：没推进到真人回复的
+    # 不算"进行中"）。
+    return {co: (_bucket_of(rows[co]) if co in rows else "cold", ts) for co, ts in by_co.items()}
 
 
 def reconcile(cfg: dict, threads: list[dict], root: str = "Interviews", tiers=("auto",),

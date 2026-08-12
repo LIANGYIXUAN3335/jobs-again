@@ -19,10 +19,12 @@
     {# 2026-08-03 瘦身：skip/rej/all 筛选与 /browse 从导航摘掉（路由还在，直接输网址可达）。
        关心的是走到哪一步：投了什么、面了什么、复盘了什么。 #}
     {# Module 2 — feeders & follow-through tools #}
-    <a href="/companies" style="margin-left:auto" title="每家公司走到哪一步 · 球在谁那边（按邮件线程聚合，对应 Gmail 的 Interviews/ 标签）">🏢 公司进度</a>
+    {# 2026-08-03：公司进度日常改看 Gmail 标签（Interviews/1-进行中）；这页降级为"纠错台"，
+       手动 ✓已处理/📅已排期/✕结案/🙈隐藏 按钮在这里，改完 Gmail 标签跟着走。
+       /replies 从导航移除：AI 代写已砍（她用 Wispr Flow 自己写），路由保留看历史。 #}
+    <a class="dim" href="/companies" style="margin-left:auto" title="纠错台：✓已处理/📅已排期/✕结案/🙈隐藏 按钮在这（日常看 Gmail 的 Interviews/ 标签）">🏢 纠错</a>
     <a href="/outcomes" title="what the inbox says happened to your applications">📮 outcomes</a>
     <a href="/followups" title="applications that have gone quiet">⏳ quiet</a>
-    <a class="dim" href="/replies" title="inbox reply drafts (needs thread context — parked)">📥 replies</a>
     {# Module 3 — analytics & extras #}
     <a href="/funnel" title="applied → reply → interview → offer, by score band">📊 funnel</a>
     <a href="/health" title="定时任务体检表：谁按时跑了、谁失联、谁上次失败">🩺 体检</a>

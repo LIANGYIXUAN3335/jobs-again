@@ -46,11 +46,11 @@ def main():
     if summary["armed"]:
         bits.append(f"{summary['armed']} auto-reply queued (30-min undo)")
     if pending:
-        bits.append(f"{pending} awaiting your OK")
+        bits.append(f"{pending} 封等你回（已加星）")
     if sent:
         bits.append(f"{len(sent)} sent")
     if bits:
-        notify("JobScan · inbox", " · ".join(bits) + " — open JobScan → Replies")
+        notify("JobScan · inbox", " · ".join(bits) + " — 去 Gmail 找加星邮件，用你自己的话回")
 
 
 if __name__ == "__main__":
