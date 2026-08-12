@@ -76,7 +76,14 @@ CREATE TABLE IF NOT EXISTS role_state (
   tailor_status TEXT DEFAULT 'none', prompt_path TEXT, tailored_resume_path TEXT,
   -- outcome half: what happened after the application went in (see STAGES / OUTCOMES)
   stage TEXT, outcome TEXT, outcome_note TEXT DEFAULT '',
-  first_response_at TEXT, last_contact_at TEXT
+  first_response_at TEXT, last_contact_at TEXT,
+  -- Set on a LinkedIn shadow row (li:<id>) when the same physical posting also exists as a
+  -- real ATS row (gh:/lv:/ab:/…): the value is that canonical job_id. LinkedIn discovery and
+  -- the board scanner routinely both find the same job; the extension marks the ATS row
+  -- applied (it resolves by the employer page's URL) while the UI shows the li: row — so the
+  -- owner saw "applied didn't stick" (2026-08-01). Status changes cascade across the link,
+  -- and funnel/budget count a linked pair as ONE application.
+  duplicate_of TEXT
 );
 -- One row per follow-up nudge actually drafted, so the "has this gone quiet" maths and the
 -- two-per-application ceiling survive a restart. Draft-only: sent_at is stamped by hand.
@@ -143,6 +150,20 @@ CREATE TABLE IF NOT EXISTS apply_pins (
   company_norm TEXT,
   pinned_at TEXT NOT NULL
 );
+
+-- 公司进度页（/companies）的人工改写。机器从邮件读出的只是提议；这里存人的拍板：
+-- closed = 手动结案（归入"已挂"，比如 CipherData 是我拒的他们，邮件里读不出来）
+-- hidden = 从看板消失（误认的公司、不想再看的）
+-- booked = 已约上面试（约面藏在邮件正文/日历里、标题正则读不出来时，人来标）
+-- acked  = 已处理（在邮件之外回过了：平台里回的、电话里说的。等价于"当天发过一封信"，
+--          之后再来新邮件，欠账自然复活）
+-- 一家一行，撤销即删行。
+CREATE TABLE IF NOT EXISTS company_overrides (
+  company TEXT PRIMARY KEY,
+  action TEXT NOT NULL CHECK(action IN ('closed','hidden','booked','acked')),
+  note TEXT DEFAULT '',
+  set_at TEXT NOT NULL
+);
 """
 
 
@@ -151,6 +172,27 @@ _QUEUE_COLS = [
     "category", "asks_availability", "repliable", "draft", "references_hdr",
     "in_reply_to", "status", "found_at", "sent_at",
 ]
+
+
+def company_overrides(conn) -> dict[str, dict]:
+    """{公司名: {action, note, set_at}} — /companies 看板的人工改写。"""
+    return {r["company"]: dict(r) for r in conn.execute("SELECT * FROM company_overrides")}
+
+
+def set_company_override(conn, company: str, action: str | None, note: str = "") -> None:
+    """action=None 即撤销（删行）。"""
+    if not company:
+        return
+    if action is None:
+        conn.execute("DELETE FROM company_overrides WHERE company=?", (company,))
+    else:
+        conn.execute(
+            "INSERT INTO company_overrides(company, action, note, set_at) VALUES(?,?,?,?)"
+            " ON CONFLICT(company) DO UPDATE SET action=excluded.action,"
+            "   note=excluded.note, set_at=excluded.set_at",
+            (company, action, note,
+             datetime.datetime.now(LA).isoformat(timespec="seconds")))
+    conn.commit()
 
 
 def batch_get(conn, company_norm: str) -> dict | None:
@@ -250,6 +292,7 @@ _USER_MIGRATIONS = [
     ("role_state", "last_contact_at", "TEXT"),
     ("interviews", "transcript_url", "TEXT"),
     ("interviews", "review_path", "TEXT"),
+    ("role_state", "duplicate_of", "TEXT"),
 ]
 _JOBS_MIGRATIONS = [
     ("roles", "posted_at", "TEXT"),
@@ -266,6 +309,17 @@ def _migrate(conn: sqlite3.Connection, migrations: list[tuple[str, str, str]]) -
 
 def _migrate_user(conn: sqlite3.Connection) -> None:
     _migrate(conn, _USER_MIGRATIONS)
+    # company_overrides 的 CHECK 约束后来加了 'acked'。CHECK 烤在建表语句里，ALTER 改不了，
+    # 检测到旧约束就搬家重建（保留已有行）。
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table'"
+                       " AND name='company_overrides'").fetchone()
+    if row and "'acked'" not in (row["sql"] or ""):
+        conn.execute("ALTER TABLE company_overrides RENAME TO _company_overrides_old")
+        conn.executescript(USER_SCHEMA)
+        conn.execute("INSERT OR IGNORE INTO company_overrides"
+                     " SELECT * FROM _company_overrides_old")
+        conn.execute("DROP TABLE _company_overrides_old")
+        conn.commit()
     # apply_pin (single row, id=1) → apply_pins (one row per role). Not an additive column, so
     # _migrate can't express it. Nothing is carried over and nothing is lost that matters: a
     # pin is intent that expires in 45 minutes, and the replacement is written by the next ↗.
@@ -355,6 +409,7 @@ _STATE_COLS = [
     "job_id", "status", "status_updated_at", "applied_date", "applied_with_resume",
     "notes", "tailor_status", "prompt_path", "tailored_resume_path",
     "stage", "outcome", "outcome_note", "first_response_at", "last_contact_at",
+    "duplicate_of",     # missing here would silently NULL it on every upsert_state
 ]
 
 
@@ -380,18 +435,142 @@ def upsert_state(conn, job_id: str, **fields) -> dict:
     return data
 
 
-def set_status(conn, job_id: str, status: str, resume_variant: str | None = None) -> dict:
+def find_twin(conn, job_id: str) -> str | None:
+    """The other row of the same physical posting, or None.
+
+    A LinkedIn shadow row (li:) and a scanned ATS row are twins when they share company_norm
+    and title_norm EXACTLY and the match is unambiguous (exactly one candidate — a company
+    posting the same title in three locations gives three candidates and no safe answer).
+    Containment matching is deliberately NOT used here: "Software Engineer" ⊂ "Senior
+    Software Engineer" would cascade an application onto a job that was never applied to."""
+    me = conn.execute(
+        "SELECT job_id, company_norm, title_norm FROM jobs.roles WHERE job_id=?",
+        (job_id,)).fetchone()
+    if not me or not me["company_norm"] or not me["title_norm"]:
+        return None
+    i_am_shadow = job_id.startswith("li:")
+    # Compare title_norm with spaces stripped: the LinkedIn ingest and the board scanner
+    # normalised differently at different times ("fullstackengineer" vs "fullstack engineer"
+    # — the REAL Atticus pair), so byte-equality silently missed most true twins. Stripping
+    # spaces is still whole-string equality — it cannot introduce the containment matches
+    # this function refuses.
+    cands = conn.execute(
+        "SELECT job_id FROM jobs.roles WHERE company_norm=?"
+        " AND REPLACE(title_norm, ' ', '') = ?"
+        " AND job_id != ? AND (job_id LIKE 'li:%') = ?",
+        (me["company_norm"], me["title_norm"].replace(" ", ""),
+         job_id, 0 if i_am_shadow else 1),
+    ).fetchall()
+    return cands[0]["job_id"] if len(cands) == 1 else None
+
+
+def _record_link(conn, a: str, b: str) -> None:
+    """Store the link on the SHADOW side only (duplicate_of always points li: → canonical),
+    so 'is this row an alias' is one NULL-check everywhere counting applications."""
+    shadow, canonical = (a, b) if a.startswith("li:") else (b, a)
+    if not shadow.startswith("li:") or canonical.startswith("li:"):
+        return                                  # li:↔li: or ats↔ats — not a shadow/canonical pair
+    cur = conn.execute("SELECT duplicate_of FROM role_state WHERE job_id=?",
+                       (shadow,)).fetchone()
+    if not cur or cur["duplicate_of"] != canonical:
+        upsert_state(conn, shadow, duplicate_of=canonical)
+
+
+# Statuses that describe a real-world event on the ONE physical posting, so they must hold on
+# both rows of a linked pair. 'new'/'skip' are review bookkeeping and never cascade.
+_CASCADE_STATUSES = {"applied", "interviewing", "rejected"}
+
+
+def set_status(conn, job_id: str, status: str, resume_variant: str | None = None,
+               _cascading: bool = False) -> dict:
     if status not in STATUSES:
         raise ValueError(f"invalid status {status!r}")
     fields: dict = {"status": status}
     if status == "applied":
         fields["applied_date"] = la_today()
         fields["applied_with_resume"] = resume_variant or "base"
-    return upsert_state(conn, job_id, **fields)
+    out = upsert_state(conn, job_id, **fields)
+    # Cascade real-world statuses to the twin row of the same physical posting. Computed on
+    # the fly when no link is stored yet — the twin may have been scanned in only this
+    # morning — and self-heals the link for every later consumer. _cascading guards the
+    # recursion (partner's own cascade would bounce straight back).
+    if not _cascading and status in _CASCADE_STATUSES:
+        try:
+            partner = None
+            row = conn.execute("SELECT duplicate_of FROM role_state WHERE job_id=?",
+                               (job_id,)).fetchone()
+            if row and row["duplicate_of"]:
+                partner = row["duplicate_of"]
+            if not partner:
+                partner = conn.execute(
+                    "SELECT job_id FROM role_state WHERE duplicate_of=?",
+                    (job_id,)).fetchone()
+                partner = partner["job_id"] if partner else None
+            if not partner:
+                partner = find_twin(conn, job_id)
+            if partner:
+                _record_link(conn, job_id, partner)
+                cur = (conn.execute("SELECT status FROM role_state WHERE job_id=?",
+                                    (partner,)).fetchone() or {"status": "new"})["status"]
+                if cur != status:
+                    set_status(conn, partner, status, resume_variant, _cascading=True)
+        except sqlite3.OperationalError:
+            pass        # user DB opened without jobs attached — skip linking, never block the mark
+    return out
 
 
 def set_notes(conn, job_id: str, notes: str) -> dict:
     return upsert_state(conn, job_id, notes=notes)
+
+
+def reconcile_duplicates(conn) -> dict:
+    """One pass over every li: shadow row: link unambiguous twins, mirror real-world statuses,
+    and copy tailor artefacts to whichever side lacks them. Idempotent — safe to run any time.
+
+    Mirroring copies the SOURCE row's applied_date/applied_with_resume instead of stamping
+    today: the backfill is recording history, not making news. Statuses only flow onto rows
+    still at 'new'/'skip' — when both sides carry real statuses (e.g. applied vs interviewing),
+    both are human statements and neither is overwritten.
+
+    Tailor pointers go BOTH directions: the extension resolves the ATS row on the employer's
+    page and needs has_tailored_pdf there; the UI list often shows the li: row."""
+    stats = {"linked": 0, "status_mirrored": 0, "tailor_copied": 0}
+    shadows = conn.execute("SELECT job_id FROM jobs.roles WHERE job_id LIKE 'li:%'").fetchall()
+    for s in shadows:
+        canonical = find_twin(conn, s["job_id"])
+        if not canonical:
+            continue
+        before = conn.execute("SELECT duplicate_of FROM role_state WHERE job_id=?",
+                              (s["job_id"],)).fetchone()
+        if not before or before["duplicate_of"] != canonical:
+            stats["linked"] += 1
+        _record_link(conn, s["job_id"], canonical)
+
+        rows = {}
+        for jid in (s["job_id"], canonical):
+            r = conn.execute("SELECT * FROM role_state WHERE job_id=?", (jid,)).fetchone()
+            rows[jid] = dict(r) if r else {"job_id": jid, "status": "new",
+                                           "applied_date": None, "applied_with_resume": None,
+                                           "tailored_resume_path": None, "prompt_path": None,
+                                           "tailor_status": "none"}
+        a, b = rows[s["job_id"]], rows[canonical]
+
+        for src, dst in ((a, b), (b, a)):
+            if (src.get("status") in _CASCADE_STATUSES
+                    and (dst.get("status") or "new") in ("new", "skip")):
+                upsert_state(conn, dst["job_id"], status=src["status"],
+                             applied_date=src.get("applied_date"),
+                             applied_with_resume=src.get("applied_with_resume"))
+                dst["status"] = src["status"]
+                stats["status_mirrored"] += 1
+            if src.get("tailored_resume_path") and not dst.get("tailored_resume_path"):
+                upsert_state(conn, dst["job_id"],
+                             tailor_status=src.get("tailor_status") or "ready",
+                             prompt_path=src.get("prompt_path"),
+                             tailored_resume_path=src.get("tailored_resume_path"))
+                dst["tailored_resume_path"] = src.get("tailored_resume_path")
+                stats["tailor_copied"] += 1
+    return stats
 
 
 # ---------- apply pins (see apply_pins in USER_SCHEMA) ----------
@@ -677,7 +856,7 @@ def fetch_view(
     rows = [dict(r) for r in conn.execute(
         "SELECT r.*, s.status AS own_status, s.notes, s.applied_date,"
         "       s.applied_with_resume, s.tailor_status, s.tailored_resume_path,"
-        "       s.status_updated_at"
+        "       s.status_updated_at, s.duplicate_of"
         " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
     )]
     applied_cos = {r["name_norm"]: r["display_name"] for r in

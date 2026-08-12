@@ -32,6 +32,14 @@ def _scan_once(cfg: dict, seen: dict[str, float], force: bool = False) -> int:
                 print(msg)
             except tailoring.TailorError as exc:
                 print(f"✗ {yf.name}: {exc}")
+            except Exception as exc:
+                # 2026-08-01 教训：第 941/2684 个文件抛了意外错误，整批停摆，后面
+                # 1743 份全没做。单个文件的任何错误都只能损失它自己。
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                print(f"✗ {yf.name}: 意外错误 {type(exc).__name__}: {exc} — 跳过，继续下一份")
     finally:
         conn.close()
     return n

@@ -2150,7 +2150,11 @@
     // This page's URL did NOT identify the role — it came from the ↗ you clicked in JobScan.
     // Say so loudly: everything below (résumé, salary, AI answers) is for THAT role, and if you
     // wandered to a different posting in between, this is the moment to notice.
-    const pinNote = role.no_role_match
+    const pinNote = role.pin_override
+      // The owner clicked a rejected-pin button and personally confirmed this page is that
+      // job's form — say so, and keep saying the URL never proved it.
+      ? `<div class="chip pin" title="You manually confirmed this page is this role's application form. The résumé and answers below belong to it. Close the panel if you picked wrong.">📌 manually chosen by you — URL did not confirm this role</div>`
+      : role.no_role_match
       // Worst case for silence: we know the company but NOT which posting, so nothing below is
       // role-specific. Say it in the loudest chip we have, because the failure this guards
       // against (filling a form believing the panel matched it) looks identical to success.
@@ -2165,8 +2169,9 @@
       : "";
     // Pins that were live but belong to a different employer. Naming them turns a confusing
     // non-event ("why is there no résumé?") into a readable one ("those are for other tabs").
-    const rejectedNote = (role.pins_rejected || []).length
-      ? `<div class="chip company-warn" title="${(role.pins_rejected || []).join("\n")}">📌 ${role.pins_rejected.length} other pinned role(s) ignored — they belong to a different company than this page</div>`
+    const rejectedNames = (role.pins_rejected || []).map((p) => `${p.company} — ${p.title}`);
+    const rejectedNote = rejectedNames.length
+      ? `<div class="chip company-warn" title="${rejectedNames.join("\n")}">📌 ${rejectedNames.length} other pinned role(s) ignored — they belong to a different company than this page</div>`
       : "";
     // "no tailored résumé" means the upload below is the BASE résumé, not one written for this
     // JD. Spell that out — "text only" read as a formatting note, not as "wrong file".
@@ -2174,6 +2179,34 @@
       ? '<span class="chip ready">tailored résumé ready</span>'
       : `<span class="chip none" title="No tailored PDF exists for this role, so nothing role-specific will be attached. Tailor it in JobScan first if this application matters.">⚠ no tailored résumé for this role — base/profile fields only</span>`;
     $(".status").innerHTML = pinNote + rejectedNote + appliedWarn + resumeChip;
+    // One-click override for each rejected pin, when this panel has no résumé of its own.
+    // The guard's DEFAULT stands (never silently attach across a company mismatch); the
+    // override is an explicit human statement — a click on a button that names the role —
+    // which is exactly the confidence level the old manual download-and-upload expressed,
+    // minus the manual downloading and uploading.
+    if (!role.has_tailored_pdf && (role.pins_rejected || []).length) {
+      for (const pr of role.pins_rejected.slice(0, 3)) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "chip pin";
+        b.style.cssText = "display:block;width:100%;text-align:left;cursor:pointer;" +
+          "margin-bottom:6px;border:1px dashed #1e3a8a;";
+        b.textContent = `📌 use “${pr.company} — ${pr.title}” here` +
+          (pr.has_tailored_pdf ? " (attaches its résumé)" : "");
+        b.title = "JobScan did not find this company's name on this page, so it refused to " +
+          "auto-attach the role's résumé. Click ONLY if you are sure this page is that " +
+          "job's application form.";
+        b.onclick = () => {
+          claimPin(pr);
+          const cur = document.getElementById("jobscan-panel");
+          if (cur) cur.remove();                    // panel() builds a fresh host each call
+          const chosen = { ...pr, pin_override: true };
+          panel(chosen);
+          sparkleStart(chosen);                     // ✨ chips need the real job_id too
+        };
+        $(".status").appendChild(b);
+      }
+    }
     const log = (m, cls) => { const d = document.createElement("div"); if (cls) d.className = cls; d.textContent = m; $(".log").appendChild(d); };
 
     $(".x").onclick = () => { abortFill = true; host.remove(); };   // closing the panel also stops a fill
@@ -2353,6 +2386,10 @@
   //      once at load. Poll briefly + watch the DOM + watch for SPA URL changes, and
   //      show the panel as soon as an application form appears for a matching role. ----
   let shownFor = null;   // URL the panel is currently shown for
+  let noMatchFor = null; // URL the last role-resolution FAILED for — lets the capture pill
+                         // appear on scanner-ATS hosts too, exactly and only when this page's
+                         // posting is unknown to JobScan (unknown company on greenhouse/lever
+                         // was a dead zone: no panel AND no pill — the Precisely trap)
   let busy = false;      // avoid overlapping lookups while the DOM churns
 
   // ---- the server now keeps one pin PER ROLE (apply_pins), so a newer ↗ no longer evicts an
@@ -2360,24 +2397,228 @@
   //      role off a pin copies it into sessionStorage (inherently per-tab, survives reload +
   //      SPA nav) and releases just that row, so later re-resolves in this tab are free and
   //      the live pin set stays small and honest about what is still un-applied.
-  const PIN_KEY = "jobscan:claimed-pin";
+  // v2: entries carry claimedAt. The v1 entry had NO expiry, so a claimed pin lived as long as
+  // its tab — and Chrome session-restore preserves sessionStorage, so a Temporal role claimed
+  // on 2026-07-31 was STILL labelling the same Precisely tab on 08-01. v1 entries are purged on
+  // sight and never read; v2 entries die after the same 45 minutes the server gives a pin.
+  const PIN_KEY = "jobscan:claimed-pin:v2";
+  const CLAIM_TTL_MS = 45 * 60 * 1000;
   function claimedPin() {
     try {
+      sessionStorage.removeItem("jobscan:claimed-pin");   // purge immortal pre-v2 entries
       const raw = sessionStorage.getItem(PIN_KEY);
       if (!raw) return null;
       const saved = JSON.parse(raw);
       // Same tab navigated to a different employer: a pin claimed for company A must not
       // follow you to company B. A real URL match always outranks this anyway.
-      return saved && saved.origin === location.origin ? saved.role : null;
+      if (!saved || saved.origin !== location.origin) return null;
+      if (!saved.claimedAt || Date.now() - saved.claimedAt > CLAIM_TTL_MS) {
+        sessionStorage.removeItem(PIN_KEY);               // no application session lasts 45 min
+        return null;
+      }
+      return saved.role;
     } catch (e) { return null; }        // sandboxed frames throw on sessionStorage access
   }
   function claimPin(role) {
     try {
-      sessionStorage.setItem(PIN_KEY, JSON.stringify({ origin: location.origin, role }));
+      sessionStorage.setItem(PIN_KEY,
+        JSON.stringify({ origin: location.origin, role, claimedAt: Date.now() }));
     } catch (e) { /* no storage in this frame — worst case we ask the server again */ }
     // Release only THIS role's pin — the other tabs' pins are other roles you still intend to
     // apply to. Fire-and-forget; the TTL is still the backstop.
     send({ type: "unpin", jobId: role && role.job_id });
+  }
+
+  // ---- ✨ per-field AI drafts for OPTIONAL open questions (2026-08-01) --------------------
+  // Required open questions are auto-drafted by the big Fill pass (owner's rule: every
+  // required question gets an answer). OPTIONAL ones get a small ✨ chip at the field's
+  // bottom-right instead — click → ONE tailored draft lands in that field, yellow-outlined
+  // until the owner edits it. Chips live in a fixed-position overlay: nothing is inserted
+  // into the form's own DOM, because Workday's React reconciler strips foreign nodes.
+  // Keep in sync with the inline known-fields regex in wdOpenQuestions.
+  const KNOWN_PROFILE_RE = /first name|last name|middle|preferred name|^name\b|full name|e-?mail|phone|address|city|state|province|zip|postal|country|linkedin|github|website|\burl\b|salary|compensation|pay|desired|date|school|univers|degree|field of study|company name|job title|employer|supervisor|reference/i;
+  let sparkleRole = null;
+  let sparkleHost = null;
+  let sparkleTimer = null;
+  const sparkleChips = new Map();   // field element -> chip element
+
+  function sparkleLabel(el) {
+    if (el.id) {
+      const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      if (l && l.innerText.trim()) return clean(l.innerText);
+    }
+    const aria = el.getAttribute("aria-label");
+    if (aria && aria.trim()) return clean(aria);
+    let n = el.closest("div,fieldset,li,td") || el.parentElement;
+    for (let hop = 0; n && hop < 4; hop++, n = n.parentElement) {
+      const t = clean(n.innerText || "").split("\n")[0];
+      if (t && t.length >= 8 && t.length <= 300) return t;
+    }
+    return "";
+  }
+
+  function sparkleEligible(el) {
+    if (!(el.tagName === "TEXTAREA"
+          || (el.tagName === "INPUT" && (el.type === "text" || !el.getAttribute("type"))))) return false;
+    if (el.disabled || el.readOnly) return false;
+    // Combobox/typeahead text inputs (Workday selects, "How did you hear about us?") LOOK like
+    // free-text but must get an OPTION, not prose — drafting into one corrupts the field.
+    if (isDropdownish(el)) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width < 120 || r.height < 24) return false;          // hidden or too small to be a question
+    if (el.dataset.jobscanAiDraft === "1") return true;        // our un-edited draft → keep the ↻ chip
+    if ((el.value || "").trim()) return false;                 // already answered → stay out of the way
+    // No required-vs-optional gate (2026-08-01, Adyen live diagnosis): real forms mark MOST
+    // open questions required, so an optional-only chip almost never appeared — the owner
+    // read that as "broken", and she was right. An EMPTY required box just means Fill hasn't
+    // run yet; the chip never fights Fill because Fill skips non-empty fields.
+    const label = sparkleLabel(el);
+    if (!label || label.length < 8) return false;
+    if (SENSITIVE.test(label)) return false;                   // demographics/comp — never AI
+    // Profile-field words only disqualify SHORT labels ("City", "Desired salary"). On prose
+    // they false-positive brutally: Adyen's accessibility question was blocked as a "profile
+    // field" because "candidate" contains "date" — same substring pit as the C++ keyword bug.
+    // A 40+ char label is a question, not a field name.
+    if (label.length < 40 && KNOWN_PROFILE_RE.test(label)) return false;
+    // free-form inputs must look like a question; any sizeable textarea qualifies
+    if (el.tagName !== "TEXTAREA"
+        && !/\?|describe|explain|tell us|why|how|what|share|elaborate|experience (with|using)|anything else|additional|comments|note/i.test(label)) return false;
+    return true;
+  }
+
+  function sparklePlace(el, chip) {
+    const r = el.getBoundingClientRect();
+    if (!r.width || r.bottom < 0 || r.top > innerHeight) { chip.style.display = "none"; return; }
+    chip.style.display = "block";
+    // BELOW the field, right-aligned (Simplify-style, and what the owner asked for) — sitting
+    // ON the corner covered the textarea's native resize grip. Fall back to inside-the-corner
+    // only when the field's bottom edge is off-screen.
+    chip.style.left = Math.round(r.right - chip.offsetWidth) + "px";
+    chip.style.top = Math.round(
+      r.bottom + 28 <= innerHeight ? r.bottom + 4 : r.bottom - chip.offsetHeight - 6) + "px";
+  }
+
+  function sparkleReposition() {
+    for (const [el, chip] of sparkleChips) sparklePlace(el, chip);
+  }
+
+  function sparkleChipFor(el) {
+    // SPA navigations can silently detach the host — chips appended to a detached node render
+    // nowhere and the feature looks "dead" with no error. Recreate whenever it's not in the DOM.
+    if (!sparkleHost || !document.documentElement.contains(sparkleHost)) {
+      sparkleHost = document.createElement("div");
+      sparkleHost.id = "jobscan-sparkles";
+      sparkleHost.style.cssText = "position:fixed;left:0;top:0;z-index:2147483646;";
+      document.documentElement.appendChild(sparkleHost);
+    }
+    const c = document.createElement("button");
+    const drafted = el.dataset.jobscanAiDraft === "1";
+    c.type = "button";
+    c.textContent = drafted ? "↻" : "✨";
+    c.title = drafted
+      ? "AI draft in the field — READ & EDIT before submitting. Click to re-draft."
+      : "optional question — draft a tailored answer with AI (JobScan)";
+    c.style.cssText = "position:fixed;display:none;width:24px;height:24px;padding:0;" +
+      "border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#111;cursor:pointer;" +
+      "font-size:13px;line-height:22px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.18);";
+    c.onclick = (ev) => { ev.preventDefault(); ev.stopPropagation(); sparkleDraft(el, c); };
+    sparkleHost.appendChild(c);
+    return c;
+  }
+
+  async function sparkleDraft(el, chip) {
+    const label = sparkleLabel(el);
+    if (!label) return;
+    // Greenhouse's paste-toggle cover-letter box is labelled just "Enter manually" — useless
+    // as a question. Send a real one so the model knows what it is writing.
+    const question = /enter manually|cover letter/i.test(label)
+      ? `Cover letter: why are you a great fit for the ${sparkleRole.title} role at ${sparkleRole.company}?`
+      : label;
+    chip.textContent = "…"; chip.disabled = true;
+    try {
+      const res = await send({ type: "answer", jobId: sparkleRole.job_id, questions: [question] });
+      if (isContextDead(res)) {
+        // Reloading the unpacked extension orphans the content script already injected in
+        // this tab — same handling as every other call site: the ONE fix is refreshing.
+        chip.textContent = "⚠";
+        chip.title = "JobScan was reloaded — refresh this page (⌘R), then click ✨ again.";
+        return;
+      }
+      const a = res && res.ok !== false && res.answers && res.answers[question];
+      if (!a) {
+        chip.textContent = "⚠";
+        chip.title = "AI declined or failed — " + ((res && res.error) || "no answer (may be a never-answer topic)");
+        return;
+      }
+      el.focus(); setNativeValue(el, a); el.blur();
+      // Yellow outline until SHE edits: an unreviewed AI draft must not look like a filled field.
+      el.dataset.jobscanAiDraft = "1";
+      el.style.outline = "2px solid #eab308"; el.style.outlineOffset = "1px";
+      el.addEventListener("input", function once() {
+        el.style.outline = ""; el.style.outlineOffset = "";
+        delete el.dataset.jobscanAiDraft;              // edited = yours now; chip leaves next tick
+        el.removeEventListener("input", once);
+      });
+      chip.textContent = "↻";
+      chip.title = "AI draft in the field — READ & EDIT before submitting. Click to re-draft.";
+    } catch (e) {
+      chip.textContent = "⚠"; chip.title = "AI draft failed: " + e;
+    } finally {
+      chip.disabled = false;
+      if (chip.textContent === "…") chip.textContent = "✨";
+    }
+  }
+
+  let sparkleLastCount = -1;   // console-log only on change — "silent nothing" must be readable
+
+  function sparkleTick() {
+    if (!sparkleRole || !document.getElementById("jobscan-panel")) { sparkleStop(); return; }
+    const seen = new Set();
+    for (const el of document.querySelectorAll("textarea, input[type=text], input:not([type])")) {
+      if (!sparkleEligible(el)) continue;
+      seen.add(el);
+      if (!sparkleChips.has(el)) sparkleChips.set(el, sparkleChipFor(el));
+    }
+    for (const [el, chip] of [...sparkleChips]) {
+      if (!seen.has(el) || !document.contains(el)) { chip.remove(); sparkleChips.delete(el); continue; }
+      sparklePlace(el, chip);
+    }
+    if (sparkleChips.size !== sparkleLastCount) {
+      sparkleLastCount = sparkleChips.size;
+      console.info("[JobScan] ✨", sparkleChips.size,
+                   "optional open question(s) have a draft button on this page",
+                   "(Fill still auto-drafts required ones on its own; combobox/profile/sensitive fields never get a chip)");
+    }
+  }
+
+  function sparkleStart(role) {
+    if (!role || !role.ai_enabled || role.field_button === false
+        || !role.job_id || role.no_role_match) {
+      // Say WHY in the console — an invisible feature that silently declines to start is
+      // indistinguishable from a broken one (exactly the report that led to this line).
+      console.info("[JobScan] ✨ draft buttons off for this page:",
+                   !role ? "no role" : !role.ai_enabled ? "ai disabled (no API key?)"
+                   : role.field_button === false ? "ai.field_button=false in config"
+                   : role.no_role_match ? "page not matched to a role — profile fill only"
+                   : "role has no job_id");
+      return;
+    }
+    sparkleRole = role;
+    if (!sparkleTimer) {
+      sparkleTimer = setInterval(sparkleTick, 1500);
+      addEventListener("scroll", sparkleReposition, { passive: true, capture: true });
+      addEventListener("resize", sparkleReposition, { passive: true });
+    }
+    sparkleTick();
+  }
+
+  function sparkleStop() {
+    if (sparkleTimer) { clearInterval(sparkleTimer); sparkleTimer = null; }
+    removeEventListener("scroll", sparkleReposition, { capture: true });
+    removeEventListener("resize", sparkleReposition);
+    for (const [, chip] of sparkleChips) chip.remove();
+    sparkleChips.clear();
+    sparkleRole = null;
   }
 
   async function tryShow() {
@@ -2390,8 +2631,16 @@
         : (IS_SR
           ? (deepAll("input#first-name-input, input#email-input, sr-question-field-radio, sr-question-field-select")[0]
              || (/\/screening/i.test(location.pathname) ? deepAll("input[role=combobox]")[0] : null))  // shadow DOM; page 2 = /screening
-          : document.querySelector('input[type=file], #first_name, [name*="resume" i],'
-              + ' #attachfile-resume-fileupload, [id^="attachfile-"]')));
+          : (document.querySelector('input[type=file], #first_name, [name*="resume" i],'
+              + ' #attachfile-resume-fileupload, [id^="attachfile-"]')
+             // Generic SPA forms (jobs.gem.com was the miss, 2026-08-01): no visible file
+             // input, no known ids — but an email field PLUS a textarea or several text
+             // inputs is the signature of a real application form, and never of a lone
+             // newsletter box (those are a single email input with nothing else).
+             || (document.querySelector('input[type=email]')
+                 && (document.querySelector('textarea')
+                     || document.querySelectorAll('input[type=text]').length >= 3)
+                 ? document.querySelector('input[type=email]') : null))));
     if (!hasForm) return;                                    // not on the application form yet
     if (shownFor === location.href && document.getElementById("jobscan-panel")) return;
     busy = true;
@@ -2432,7 +2681,13 @@
       const pinFitsPage = (r) => {
         const co = (r && r.company || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
         if (!co || co.length < 3) return false;
-        const hay = (location.hostname + location.pathname + " " + (document.title || "") +
+        // location.search + referrer matter on embedded ATS forms: inside
+        // job-boards.greenhouse.io/embed/job_app?for=<employer>&token=… the employer's name
+        // appears ONLY in the query string and in the embedding page's URL (the referrer) —
+        // the visible body is just form fields — so excluding them made the RIGHT pin
+        // unrecognizable exactly where it was needed most.
+        const hay = (location.hostname + location.pathname + location.search + " " +
+                     document.referrer + " " + (document.title || "") +
                      " " + (document.body ? document.body.innerText.slice(0, 4000) : ""))
                     .toLowerCase().replace(/[^a-z0-9]+/g, "");
         return hay.includes(co);
@@ -2471,6 +2726,7 @@
       // Still nothing: stay silent, as before. Showing a panel here would mean inventing a
       // role for a page we can't identify, which is the opposite of what C is for.
       if (!role) {
+        noMatchFor = location.href;      // pill may now offer capture even on scanner-ATS hosts
         if (pinsRejected.length) {
           console.info("[JobScan] no panel — none of the", pinsRejected.length,
                        "live pins appear on this page:",
@@ -2480,11 +2736,17 @@
         }
         return;
       }
-      role = { ...role, pins_rejected: pinsRejected.map((r) => `${r.company} — ${r.title}`) };
+      noMatchFor = null;
+      // Keep the FULL payloads: each rejected pin is a complete /api/pins entry (résumé flag,
+      // profile, job_id), so the panel can offer it as a one-click manual override — the fix
+      // for "the résumé exists in JobScan but the panel won't attach it" on employer pages
+      // that never mention the company name the guard looks for.
+      role = { ...role, pins_rejected: pinsRejected };
       const old = document.getElementById("jobscan-panel");
       if (old) old.remove();
       shownFor = location.href;
       panel(role);
+      sparkleStart(role);             // ✨ chips on optional open questions (needs a real role)
       if (freshPin) claimPin(role);   // only now — a frame that merely probed must not eat it
     } finally { busy = false; }
   }
@@ -2624,7 +2886,11 @@
   const SCANNER_ATS = IS_SR || IS_WORKDAY || IS_ASHBY
     || /greenhouse|lever|ashbyhq|myworkday|smartrecruiters|rippling|avature/i.test(location.hostname);
   function pillTick() {
-    if (SCANNER_ATS) return;
+    // Scanner-covered ATS hosts used to be unconditionally pill-free ("capture would just
+    // duplicate scanned roles") — but companies NOT in config live on these hosts too, and
+    // for them that rule left NOTHING on screen: no panel (role unknown) and no pill. Offer
+    // capture exactly when this page's role resolution failed; a matched page stays pill-free.
+    if (SCANNER_ATS && noMatchFor !== location.href) return;
     const panelUp = !!document.getElementById("jobscan-panel");
     const pill = document.getElementById("jobscan-capture");
     if (panelUp && pill) pill.remove();            // the apply form owns the UI

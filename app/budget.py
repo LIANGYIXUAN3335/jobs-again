@@ -108,6 +108,8 @@ def stock_status(rows: list[dict], cfg: dict, today: str | None = None) -> dict[
         name.setdefault(cn, r["company"])
         if (r.get("own_status") or "new") not in counts_as:
             continue
+        if r.get("duplicate_of"):
+            continue    # li: shadow of a linked pair — the canonical ATS row already spends the slot
         # No applied_date means we can't age it out; count it (fail closed, never refund a
         # slot just because the date is missing).
         if since and (r.get("applied_date") or "9999") < since:
@@ -159,7 +161,8 @@ def pace_status(rows: list[dict], cfg: dict, today: str) -> dict[str, dict]:
         limit = int(rule.get("max", 3))
         since = _days_ago(today, window)
         recent = [r for r in rows
-                  if r["company_norm"] == cn and (r.get("applied_date") or "") >= since]
+                  if r["company_norm"] == cn and (r.get("applied_date") or "") >= since
+                  and not r.get("duplicate_of")]   # linked pair = one application, not two
         if len(recent) >= limit:
             oldest = min(r["applied_date"] for r in recent)
             until = (datetime.date.fromisoformat(oldest)

@@ -16,19 +16,16 @@
     <a href="/?status=applied" class="{{ 'on' if params.status=='applied' }}">applied <b>{{ counts.applied }}</b></a>
     <a href="/?status=interviewing" class="{{ 'on' if params.status=='interviewing' }}">interviewing <b>{{ counts.interviewing }}</b></a>
     <a href="/interviews" title="每场面试的问题与 action items，索引自 面试复盘/">🎤 复盘</a>
-    <span class="navsep">·</span>
-    {# closed states — demoted: reachable, not first-class #}
-    <a class="dim" href="/?status=skip" title="roles you passed on">skip {{ counts.skip }}</a>
-    <a class="dim" href="/?status=rejected" title="closed with a rejection">rej {{ counts.rejected }}</a>
-    <a class="dim" href="/?status=all" title="everything, with hide-reasons">all {{ total_roles }}</a>
+    {# 2026-08-03 瘦身：skip/rej/all 筛选与 /browse 从导航摘掉（路由还在，直接输网址可达）。
+       关心的是走到哪一步：投了什么、面了什么、复盘了什么。 #}
     {# Module 2 — feeders & follow-through tools #}
-    <a href="/browse" style="margin-left:auto" title="careers pages the scanner can't reach — capture from there">🌐 browse</a>
-    <a href="/companies" title="每家公司走到哪一步 · 球在谁那边（按邮件线程聚合，对应 Gmail 的 Interviews/ 标签）">🏢 公司进度</a>
+    <a href="/companies" style="margin-left:auto" title="每家公司走到哪一步 · 球在谁那边（按邮件线程聚合，对应 Gmail 的 Interviews/ 标签）">🏢 公司进度</a>
     <a href="/outcomes" title="what the inbox says happened to your applications">📮 outcomes</a>
     <a href="/followups" title="applications that have gone quiet">⏳ quiet</a>
     <a class="dim" href="/replies" title="inbox reply drafts (needs thread context — parked)">📥 replies</a>
     {# Module 3 — analytics & extras #}
     <a href="/funnel" title="applied → reply → interview → offer, by score band">📊 funnel</a>
+    <a href="/health" title="定时任务体检表：谁按时跑了、谁失联、谁上次失败">🩺 体检</a>
     <a class="dim" href="/ideas" title="daily idea radar: Show HN · GH Trending · Product Hunt">💡</a>
   </nav>
   <div class="runinfo">
@@ -131,6 +128,7 @@
   <td class="title">
     <span class="title-link" title="show JD">{{ r.title }}</span>
     {% if r.seniority == 'senior' %}<span class="chip sr" title="senior-titled role">sr</span>{% endif %}
+    {% if r.duplicate_of %}<span class="chip sr" title="LinkedIn shadow of the same physical posting — linked to {{ r.duplicate_of }}. Statuses cascade across the pair and funnel/budget count it as ONE application.">🔗 linked</span>{% endif %}
     {% if r.badge_ref %}<span class="chip warn" title="A DIFFERENT posting (job {{ r.badge_ref.job_id }}{% if r.badge_ref.date %}, {{ r.badge_ref.date }}{% endif %}) with the same company + same title — you marked that one “{{ r.badge_ref.status }}”. THIS is a separate/re-listed job ID, so it stays in review.">⚠ same title · {{ r.badge_ref.status }}{% if r.badge_ref.date %} {{ r.badge_ref.date[5:] }}{% else %} before{% endif %}</span>{% endif %}
     {% if r.hidden_company %}<span class="chip hide" title="company is in the hidden list">co-hidden</span>{% endif %}
     {% if r.cooldown %}<span class="chip warn" title="application cooldown — {{ r.cooldown.reason }}. Scanner skips this company and it's hidden from review until then.">⏳ cooldown to {{ r.cooldown.until }}</span>{% endif %}
