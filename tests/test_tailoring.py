@@ -433,3 +433,41 @@ def test_facts_ground_answers_in_the_tailored_resume(cfg, tmp_path):
     # no tailored YAML → facts still build (grounding is best-effort, never a hard dependency)
     role2 = {"job_id": "gh:none:1", "company": "NoSuchCo", "title": "SWE"}
     assert "Name:" in aimod._facts(cfg, role2)
+
+
+# --- suggest_angle: the substring bugs -------------------------------------------------------
+#
+# 2026-08-10 fixed `rag` matching inside leverage/coverage/paragraph. Nobody re-checked the
+# pay_terms list, which runs FIRST and needs only one hit, so it silently won every tie.
+
+def _angle(title, jd):
+    from app import tailoring as t
+    return t.suggest_angle({}, {"title": title, "jd_text": jd, "company": ""})
+
+
+def test_green_card_clause_does_not_make_a_role_about_payments():
+    """The trigger that started it: an AI-infra JD whose own text says RAG came out `payments`
+    because "Green Card holder" contains "card". 79 of 91 real JDs mentioning a green card had
+    `card` as their ONLY payments term."""
+    jd = ("Build infrastructure around LLMs and AI agents: orchestration, RAG, memory, tool use. "
+          "Candidates must already be a US Citizen or Green Card holder; no visa sponsorship.")
+    assert _angle("Senior Core Engineer - AI Agent Infrastructure", jd) == "ai-platform"
+
+
+def test_permanent_resident_clause_is_also_stripped():
+    jd = ("Design agentic workflows with large language models and prompt engineering. "
+          "Must be a permanent resident card holder.")
+    assert _angle("Staff Engineer", jd) == "ai-platform"
+
+
+def test_payments_still_wins_when_the_role_really_is_payments():
+    """The fix must not disarm the angle for its actual purpose."""
+    jd = "Own the card issuing and payment ledger services. Green Card holders only."
+    assert _angle("Backend Engineer, Payments", jd) == "payments"
+
+
+def test_pay_terms_no_longer_match_inside_a_bigger_word():
+    """discard/wildcard/transactional/moneyball are not payments signals."""
+    jd = ("Discard stale records and support wildcard queries in a transactional store. "
+          "Build backend services in Go.")
+    assert _angle("Backend Engineer", jd) == "backend-distributed"

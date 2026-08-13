@@ -10,8 +10,8 @@ import zoneinfo
 from . import config as cfgmod
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
-TOKEN_PATH = "secrets/token_gcal.json"      # gitignored — created by tools/gcal_auth.py
-CLIENT_PATH = "secrets/gcal_client.json"    # gitignored — the OAuth client the user downloads
+TOKEN_PATH = "/path/to/.config/jobscan-secrets/token_gcal.json"      # gitignored — created by tools/gcal_auth.py
+CLIENT_PATH = "/path/to/.config/jobscan-secrets/gcal_client.json"    # gitignored — the OAuth client the user downloads
 
 
 def _service(cfg: dict):
