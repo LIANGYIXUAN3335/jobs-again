@@ -12,9 +12,11 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
+from .. import robots
+
 ATS_CODES = {"greenhouse": "gh", "lever": "lv", "ashby": "ab",
              "workday": "wd", "smartrecruiters": "sr", "rippling": "rp",
-             "avature": "av"}
+             "avature": "av", "gem": "gm"}
 
 USER_AGENT = "jobscan/0.1 (personal job-search tool; low volume)"
 
@@ -144,6 +146,9 @@ def make_client(http_cfg: dict) -> httpx.Client:
 
 
 def polite_get(client: httpx.Client, url: str, retries: int = 2) -> httpx.Response:
+    # robots.txt is checked once per origin per run (see app/robots.py). In the
+    # default "report" mode this only logs; "enforce" raises RobotsDenied.
+    robots.gate(client, url)
     last_exc: Exception | None = None
     for attempt in range(retries + 1):
         try:

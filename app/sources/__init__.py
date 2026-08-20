@@ -1,4 +1,4 @@
-from . import ashby, avature, greenhouse, lever, rippling, smartrecruiters, workday
+from . import ashby, avature, gem, greenhouse, lever, rippling, smartrecruiters, workday
 
 FETCHERS = {
     "greenhouse": greenhouse.fetch,
@@ -8,4 +8,5 @@ FETCHERS = {
     "smartrecruiters": smartrecruiters.fetch,
     "rippling": rippling.fetch,
     "avature": avature.fetch,
+    "gem": gem.fetch,
 }

@@ -8,6 +8,7 @@ import time
 
 import httpx
 
+from .. import robots
 from .base import Posting, posted_day_relative, strip_html
 
 PAGE = 20
@@ -17,6 +18,7 @@ def _post(client: httpx.Client, url: str, body: dict, retries: int) -> dict:
     last: Exception | None = None
     for attempt in range(retries + 1):
         try:
+            robots.gate(client, url)
             r = client.post(url, json=body, headers={"Accept": "application/json"})
             r.raise_for_status()
             return r.json()
@@ -57,6 +59,7 @@ def fetch(client: httpx.Client, company: str, slug: str, retries: int = 2) -> li
 
         def _jd(u: str = detail_url) -> str:
             time.sleep(0.4)
+            robots.gate(client, u)
             r = client.get(u, headers={"Accept": "application/json"})
             r.raise_for_status()
             info = r.json().get("jobPostingInfo") or {}

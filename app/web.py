@@ -1180,6 +1180,101 @@ def interviews_file(f: str):
                         f"{p.read_text(encoding='utf-8').replace('&', '&amp;').replace('<', '&lt;')}</pre>")
 
 
+# ---- 复盘定性抽取（渲染时读 md，不落库）-------------------------------------
+# 为什么不在 ingest 里解析成一个字段：定性的写法还在演化（本轮定性 / 一句话总结 /
+# 一句话结论 / 内联加粗，见 42 个复盘文件的实际分布），落库就等于把当下的写法冻进
+# schema，以后改一次格式要跑一次迁移。渲染时读几十个小 md 对本地单人工具毫无成本。
+_GIST_H = re.compile(r"^>?\s*#{1,4}\s*(?:📌\s*)?(?:本轮定性|一句话总结|一句话结论|结论先行)")
+_GIST_H0 = re.compile(r"^>?\s*#{1,4}\s*\d+\.\s*(?:一句话结论|一句话总结)")
+_GIST_INLINE = re.compile(r"^>?\s*\*\*本轮定性[:：]\*\*\s*(?P<t>.+?)\s*$")
+def _plain(s: str) -> str:
+    """Strip leading blockquote/heading markers (repeatedly — `> ### x` needs two passes,
+    and ^-anchored subs only fire at position 0) plus inline emphasis."""
+    s = s.strip()
+    while True:
+        t = re.sub(r"^#{1,6}\s*", "", re.sub(r"^>+\s*", "", s))
+        if t == s:
+            break
+        s = t
+    return re.sub(r"[*_`]", "", s).strip()
+
+
+def _iv_index(base: Path) -> dict[str, str]:
+    """basename -> path RELATIVE TO base, for every recap md outside _archive.
+
+    Needed because `interviews.sources` stores bare filenames while the files actually live in
+    per-company subfolders (`Coach_Sessions/2026-08-16_….md`). Linking the bare name 404s.
+    """
+    out: dict[str, str] = {}
+    try:
+        for p in sorted(base.rglob("*.md")):
+            if "_archive" in p.parts:
+                continue
+            out.setdefault(p.name, str(p.relative_to(base)))
+    except OSError:
+        pass
+    return out
+
+
+def _central_files(cfg: dict) -> set[str]:
+    """The legacy card-source files. They are NOT a recap — linking 读复盘 at
+    `Interview Action Items.md` is how the button used to open a 3000-line action dump."""
+    iv = cfg.get("interviews") or {}
+    names = iv.get("files") or {"action": "Interview Action Items.md",
+                                "tech_q": "Technical_Interview_Questions.md",
+                                "ai_q": "AI_Agent_Interview_Questions.md"}
+    return set(names.values())
+
+
+def _recap_target(base: Path, index: dict[str, str], review_path: str,
+                  sources, central: set[str]) -> str:
+    """Best EXISTING relative path to this interview's recap, or '' if there isn't one."""
+    for c in [review_path] + [s for s in sources if s not in central]:
+        if not c:
+            continue
+        if (base / c).is_file():
+            return c
+        hit = index.get(Path(c).name)          # bare name -> real subfolder path
+        if hit:
+            return hit
+    return ""
+
+
+def _gist(base: Path, fnames) -> str:
+    """First substantive line of a recap's verdict block, as plain text ('' if none).
+
+    Reads only files under the 面试复盘 tree (same containment rule as /interviews/file).
+    """
+    for fn in fnames:
+        if not fn:
+            continue
+        try:
+            p = (base / fn).resolve()
+            if not str(p).startswith(str(base) + "/") or not p.is_file():
+                continue
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for i, line in enumerate(lines):
+            m = _GIST_INLINE.match(line)
+            if m:
+                return _plain(m.group("t"))[:240]
+            if not (_GIST_H.match(line) or _GIST_H0.match(line)):
+                continue
+            # walk forward to the first line with real content under that heading.
+            # A `> ### ...` line is CONTENT, not the next section — she writes the verdict
+            # itself as a blockquoted sub-heading (see Freshworks 复盘). Only a heading at
+            # column 0 ends the block.
+            for nxt in lines[i + 1:i + 12]:
+                if re.match(r"^#{1,4}\s", nxt):               # ran into the next section
+                    break
+                t = _plain(nxt)
+                if not t or t.startswith("---") or t.startswith("|"):
+                    continue
+                return t[:240]
+    return ""
+
+
 @app.get("/interviews", response_class=HTMLResponse)
 def interviews_page(conn=Depends(view_conn)):
     rows = store.interviews_overview(conn)
@@ -1193,7 +1288,9 @@ def interviews_page(conn=Depends(view_conn)):
         " ORDER BY s.applied_date DESC LIMIT 400")]
     opts = "".join(f'<option value="{c["job_id"]}">{c["company"]} — {c["title"][:60]}</option>'
                    for c in cands)
-    total_open = sum(r["n_actions"] - r["n_done"] for r in rows)
+    base = _iv_base(cfg)
+    index, central = _iv_index(base), _central_files(cfg)
+    n_q = sum(r["n_questions"] for r in rows)
 
     blocks = []
     for r in rows:
@@ -1201,36 +1298,49 @@ def interviews_page(conn=Depends(view_conn)):
         acts = [i for i in items if i["kind"] == "action"]
         qs = [i for i in items if i["kind"] in ("tech_q", "ai_q")]
         act_html = "".join(
-            f'<li class="{ "done" if i["done"] else "" }">{"✅" if i["done"] else "⬜"} '
-            f'{i["text"]}</li>' for i in acts)
+            f'<li class="{ "done" if i["done"] else "" }">{i["text"]}</li>' for i in acts)
         q_html = "".join(f'<li>{"🤖 " if i["kind"] == "ai_q" else ""}{i["text"]}</li>' for i in qs)
-        src = json.loads(r["sources"] or "{}")
-        links = " · ".join(f'<a href="/interviews/file?f={fn}" target="_blank">{fn.split(".")[0][:28]}</a>'
-                           for fn in src)
-        if r["review_path"]:
-            links = (f'<a href="/interviews/file?f={quote(r["review_path"])}" target="_blank">'
-                     f'📄 transcript</a> · ') + links
+        src = list(json.loads(r["sources"] or "{}"))
+        # 复盘正文是这一页的主角。只在文件真的存在时才给按钮 —— 死链比没有按钮更糟。
+        recap_fn = _recap_target(base, index, r["review_path"] or "", src, central)
+        gist = _gist(base, [recap_fn]) if recap_fn else ""
+        read = (f'<a class="read" href="/interviews/file?f={quote(recap_fn)}" target="_blank">'
+                f'📄 读复盘</a>' if recap_fn else '')
+        others = [index.get(Path(fn).name, fn) for fn in src]
+        extra = " · ".join(
+            f'<a href="/interviews/file?f={quote(fn)}" target="_blank">{fn.split("/")[-1][:24]}</a>'
+            for fn in dict.fromkeys(others) if fn != recap_fn and (base / fn).is_file())
         if r["transcript_url"]:
-            links = (f'<a href="{r["transcript_url"]}" target="_blank" rel="noopener">'
-                     f'🎙 Otter</a> · ') + links
+            extra = (f'<a href="{r["transcript_url"]}" target="_blank" rel="noopener">🎙 Otter</a>'
+                     + (" · " + extra if extra else ""))
         role_tag = (f'<span class="pill hi">{r["role_company"]} — {(r["role_title"] or "")[:40]}</span>'
                     if r["job_id"] else
                     f'<select class="lk" data-m="{r["marker_id"]}"><option value="">link to a role…</option>{opts}</select>')
         blocks.append(f"""
         <div class="iv">
           <div class="ivh"><b>{r['company']}</b> · {r['happened_on']} · {r['round_type'] or '—'}
-            {role_tag}
-            <span class="small muted">act {r['n_done']}/{r['n_actions']} · q {r['n_questions']} · {links}</span></div>
-          {f'<details><summary class="small">action items</summary><ul class="ivl">{act_html}</ul></details>' if acts else ''}
-          {f'<details><summary class="small">questions asked</summary><ul class="ivl">{q_html}</ul></details>' if qs else ''}
+            {role_tag} {read}
+            <span class="small muted">{extra}</span></div>
+          {f'<div class="gist">{gist}</div>' if gist else ''}
+          {f'<details open><summary class="small">他问了什么（{len(qs)}）</summary><ul class="ivl">{q_html}</ul></details>' if qs else ''}
+          {f'<details><summary class="small muted">当时记的 action items（{len(acts)}）</summary><ul class="ivl dim">{act_html}</ul></details>' if acts else ''}
         </div>""")
 
-    return _page("Interviews", f"""<h1>🎤 Interviews</h1>
-      <p class="tip">每场面试的问题与 action items，索引自 <code>面试复盘/</code>（markdown 是唯一事实源，
-      这里只读）。<b>{total_open} 个 action item 还开着。</b> 勾选状态在 md 里改，跑一次 ingest 就同步。</p>
+    return _page("Interviews", f"""<h1>🎤 面试复盘</h1>
+      <p class="tip">{len(rows)} 场面试 · {n_q} 道被问过的题已入库。索引自 <code>面试复盘/</code>
+      （markdown 是唯一事实源，这里只读）。<br>
+      这一页回答两个问题：<b>那场发生了什么</b>（定性 + 读复盘），和 <b>他们问过什么</b>（可复用的题库）。
+      跑一次 ingest 同步。</p>
       <p><button onclick="ing(this)">re-ingest from 面试复盘/</button></p>
-      <style>.iv{{border-bottom:1px solid #eef2f6;padding:10px 0}}.ivh{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}
+      <style>.iv{{border-bottom:1px solid #eef2f6;padding:12px 0}}.ivh{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}
       .ivl{{margin:6px 0 2px;padding-left:18px}}.ivl li{{margin:3px 0}}.ivl li.done{{color:#94a3b8}}
+      .ivl.dim li{{color:#94a3b8}}
+      /* 定性：这一页真正要被读到的一行 */
+      .gist{{margin:7px 0 4px;padding:7px 11px;border-left:3px solid #cbd5e1;background:#f8fafc;
+        border-radius:0 5px 5px 0;font-size:.93em;line-height:1.55;color:#334155}}
+      a.read{{font-size:12px;text-decoration:none;background:#eef2ff;color:#4338ca;
+        padding:2px 9px;border-radius:999px;white-space:nowrap}}
+      a.read:hover{{background:#e0e7ff}}
       select.lk{{font:12px -apple-system,sans-serif;max-width:260px}}</style>
       {''.join(blocks)}
       <script>

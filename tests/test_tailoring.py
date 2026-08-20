@@ -250,8 +250,10 @@ def test_provenance_rejects_a_number_that_is_merely_close(cfg):
 
 
 def test_provenance_rejects_imported_technologies_everywhere(cfg):
-    """Terraform / Azure / FastAPI / PyTorch were cut from the base for lack of bullet evidence
-    (resume_base.yaml:33-35). They must not come back in a bullet, the summary, or skills."""
+    """Terraform / Azure / FastAPI / C++ were cut from the base for lack of bullet evidence
+    (resume_base.yaml:33-35). They must not come back in a bullet, the summary, or skills.
+    PyTorch was re-added to the pool on 2026-08-16, so it is deliberately NOT in this list —
+    see test_provenance_allows_a_pool_only_technology below."""
     base = tailoring.load_base(cfg)
     assert tailoring.provenance_violations(
         _tailored({"TikTok": ["Provisioned the GMV Max services with Terraform."]}), base)
@@ -260,7 +262,17 @@ def test_provenance_rejects_imported_technologies_everywhere(cfg):
                   summary="Backend engineer who ships Go services on Azure and FastAPI."), base)
     assert tailoring.provenance_violations(
         _tailored({"TikTok": ["Owned GMV Max releases."]},
-                  skills=[{"label": "ML", "items": ["PyTorch"]}]), base)
+                  skills=[{"label": "ML", "items": ["C++"]}]), base)
+
+
+def test_provenance_allows_a_pool_only_technology(cfg):
+    """PyTorch lives in skills_master with no bullet behind it. Provenance is a base-membership
+    check, so listing it as a skill is legal — the one-story-per-bullet rule, not provenance, is
+    what keeps it out of a bullet it played no mechanical role in."""
+    base = tailoring.load_base(cfg)
+    assert tailoring.provenance_violations(
+        _tailored({"TikTok": ["Owned GMV Max releases."]},
+                  skills=[{"label": "Frameworks & Systems", "items": ["PyTorch"]}]), base) == []
 
 
 def test_provenance_does_not_fire_on_prose_or_the_target_employer(cfg):
