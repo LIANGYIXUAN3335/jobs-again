@@ -71,7 +71,7 @@ TRACKED_EXEMPT = {"secrets.example.yaml", "config.example.yaml",
 OWNER_ONLY = ["secrets.yaml", "secrets"]
 
 # ── 4. the exact dependency set ────────────────────────────────────────────
-ALLOWED_REQUIREMENTS = {"fastapi", "uvicorn", "jinja2", "httpx", "pyyaml", "pytest"}
+ALLOWED_REQUIREMENTS = {"fastapi", "uvicorn", "jinja2", "httpx", "pyyaml", "pytest", "playwright"}
 
 # ── 5. permission entries that auto-approve too much ───────────────────────
 BROAD_PERMISSION = re.compile(
