@@ -20,29 +20,39 @@ from . import config as cfgmod
 from . import resume_score, store, tailoring
 
 
-def _surface(tailored: dict, keywords: list[str]) -> int:
-    """Add true-but-missing skill keywords into the tailored skills. Returns how many added.
-    Written in résumé prose (resume_score.SURFACE_AS), not raw canonical tokens — the matcher
-    reads either form, but a human reads this list too."""
+def _surface(tailored: dict, keywords: list[str], base: dict) -> int:
+    """Add true-but-missing HARD skills into the tailored skills, each into the base group it
+    belongs to. Returns how many added.
+
+    Credibility rules (2026-08-06): soft skills are never surfaced (they live in bullet verbs,
+    and the ingest validator rejects them as list items); no "Additional Relevant Skills"
+    catch-all group (that label itself reads as stuffing); never exceed 4 groups — a keyword
+    with no natural home stays out, and the honest ceiling is the ceiling."""
+    max_groups = tailoring._MAX_SKILL_GROUPS
+    # canonical keyword -> (base group label, base item wording)
+    home: dict[str, tuple[str, str]] = {}
+    for label, items in (base.get("skills_master") or {}).items():
+        for it in items:
+            for k in keywords:
+                if k in resume_score._HARD_SKILLS and k not in home and (
+                        k.lower() in it.lower() or it.lower() in k.lower()):
+                    home[k] = (label, it)
     skills = tailored.setdefault("skills", [])
     have = {i.lower() for g in skills for i in g.get("items", [])}
-    fresh, seen = [], set(have)
-    for k in keywords:
-        label = resume_score.surface_label(k)
-        if label.lower() in seen:
+    added = 0
+    for k, (label, item) in home.items():
+        if item.lower() in have or k.lower() in have:
             continue
-        seen.add(label.lower())
-        fresh.append(label)
-    if not fresh:
-        return 0
-    # drop them into a clearly-labelled group so it reads as a skills list, not stuffing
-    for g in skills:
-        if g.get("label") == "Additional Relevant Skills":
-            g["items"].extend(fresh)
-            break
-    else:
-        skills.append({"label": "Additional Relevant Skills", "items": fresh})
-    return len(fresh)
+        group = next((g for g in skills if g.get("label") == label), None)
+        if group is None:
+            if len(skills) >= max_groups:
+                continue                      # no honest home left — stop, don't stuff
+            group = {"label": label, "items": []}
+            skills.append(group)
+        group["items"].append(item)
+        have.add(item.lower())
+        added += 1
+    return added
 
 
 def optimize(cfg: dict, conn, job_id: str, max_rounds: int = 6) -> dict:
@@ -65,11 +75,22 @@ def optimize(cfg: dict, conn, job_id: str, max_rounds: int = 6) -> dict:
             break                              # wrong role family — no keyword can fix that
         if sc.overall >= sc_gate(cfg):
             break
-        n = _surface(tailored, sc.coverable)   # only ever surfaces TRUE-for-her keywords
+        n = _surface(tailored, sc.coverable, base)   # only ever surfaces TRUE-for-her hard skills
         added_total += n
         if n == 0:
             break                              # nothing truthful left to add → human gate
-    ypath.write_text(yaml.safe_dump(tailored, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    # Write ONLY when _surface actually added something (2026-08-10). This used to rewrite
+    # unconditionally, which reset mtime on every file it touched — and staleness was decided
+    # by mtime, so one documented `python -m app.optimize --all` marked all 3,298 résumés
+    # fresh without regenerating a single bullet, silently voiding the credibility cutover.
+    # Staleness no longer trusts mtime at all (see tailoring.resume_is_stale), but a no-op
+    # rewrite is still a lie to every other mtime consumer — `app.ingest --watch`'s seen-map,
+    # rsync, backups. Gated on `added_total` rather than on a text compare because safe_dump
+    # normalises the agent's block scalars and quoting, so the serialised form differs from
+    # the file on disk even when nothing about the résumé changed.
+    if added_total:
+        ypath.write_text(yaml.safe_dump(tailored, sort_keys=False, allow_unicode=True),
+                         encoding="utf-8")
     res = tailoring.ingest_file(cfg, conn, ypath)   # re-render PDF + final score
     sc = res["score"]
     return {
