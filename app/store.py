@@ -77,6 +77,16 @@ CREATE TABLE IF NOT EXISTS role_state (
   -- outcome half: what happened after the application went in (see STAGES / OUTCOMES)
   stage TEXT, outcome TEXT, outcome_note TEXT DEFAULT '',
   first_response_at TEXT, last_contact_at TEXT,
+  -- How sure we are that THIS row is the application the reply was about. 'role' = the company
+  -- had exactly one open application (or the subject named this exact title), so the match is
+  -- unambiguous. 'company' = the company demonstrably replied, but she has N open reqs there and
+  -- the mail names none of them; the response is real, the row is the most likely of N.
+  -- Added 2026-08-10: outcomes.py used to commit ONLY the unambiguous case, so at Nvidia (39
+  -- applications), Mastercard (38), Anthropic (19) and Airbnb (12) it wrote nothing at all — the
+  -- write path failed precisely where she applies most, and the funnel reported a 1.1% response
+  -- rate that was an artefact of the plumbing. Recording the company-level fact with the
+  -- ambiguity ON THE ROW is the fix; silently picking one of 39 and calling it certain is not.
+  response_confidence TEXT,
   -- Set on a LinkedIn shadow row (li:<id>) when the same physical posting also exists as a
   -- real ATS row (gh:/lv:/ab:/…): the value is that canonical job_id. LinkedIn discovery and
   -- the board scanner routinely both find the same job; the extension marks the ATS row
@@ -104,6 +114,12 @@ CREATE TABLE IF NOT EXISTS interviews (
   sources TEXT,                        -- json {file: heading} — where the sections live
   transcript_url TEXT,                 -- Otter share link, from 面试复盘/README.md
   review_path TEXT,                    -- per-interview review/transcript md, relative to 复盘 dir
+  -- Where this row came from. NULL/'review-md' = a 复盘 section she wrote (the system of record).
+  -- 'mailbox' = inferred by tools/backfill_outcomes from a calendar invite or interview mail
+  -- because no 复盘 exists yet (2026-08-10: the mailbox showed 19 companies at interview stage
+  -- and this table held 4). An inferred row must stay visibly inferred; when she does write the
+  -- 复盘, interview_ingest upserts the same marker_id and takes it over.
+  source TEXT,
   created_at TEXT, updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS interview_items (
@@ -293,6 +309,8 @@ _USER_MIGRATIONS = [
     ("interviews", "transcript_url", "TEXT"),
     ("interviews", "review_path", "TEXT"),
     ("role_state", "duplicate_of", "TEXT"),
+    ("role_state", "response_confidence", "TEXT"),
+    ("interviews", "source", "TEXT"),
 ]
 _JOBS_MIGRATIONS = [
     ("roles", "posted_at", "TEXT"),
@@ -410,6 +428,7 @@ _STATE_COLS = [
     "notes", "tailor_status", "prompt_path", "tailored_resume_path",
     "stage", "outcome", "outcome_note", "first_response_at", "last_contact_at",
     "duplicate_of",     # missing here would silently NULL it on every upsert_state
+    "response_confidence",
 ]
 
 
@@ -650,19 +669,52 @@ def clear_apply_pin(conn, job_id: str | None = None) -> None:
     conn.commit()
 
 
+RESPONSE_CONFIDENCE = ["role", "company"]     # best first; see role_state.response_confidence
+
+
 def record_signal(conn, job_id: str, *, stage: str | None = None, outcome: str | None = None,
-                  note: str = "", when: str | None = None) -> dict:
+                  note: str = "", when: str | None = None,
+                  confidence: str = "role", inbound: bool = False) -> dict:
     """Record something that happened to an application after it went out.
 
     Monotonic on purpose: `stage` only advances (a scheduling email arriving after an onsite
     must not demote the row back to 'responded'), and `first_response_at` is written once —
     it is the funnel's key measurement and a later contact must not overwrite it. Notes are
     appended with their date, never replaced, so re-running a scan can't erase history.
+
+    `confidence` says how sure we are this is the RIGHT row (see the column comment): 'role'
+    when the company had one open application or the subject named this title, 'company' when
+    the company demonstrably replied but the requisition is unknown. It rides along with
+    `first_response_at` and, like `stage`, only ever improves — a later unambiguous signal
+    upgrades a 'company' guess to 'role', never the other way round.
+
+    `inbound=True` marks contact that did NOT come out of this application: a recruiter InMail
+    or referral invite that PREDATES it. Microsoft wrote on 07-17 and she applied on 07-24;
+    Anthropic invited her to the Fellow program on 07-17 and she then filed 19 applications
+    there. Counting either as a response would credit the machine for a conversation it did not
+    start, so inbound contact moves `last_contact_at` and appends a note — nothing else. It can
+    never write `first_response_at`, advance a stage, or close a row (owner call, 2026-08-10).
     """
     when = when or la_today()
     row = conn.execute("SELECT * FROM role_state WHERE job_id=?", (job_id,)).fetchone()
     cur = dict(row) if row else {}
     fields: dict = {"last_contact_at": when}
+
+    if inbound:
+        prev = (cur.get("outcome_note") or "").strip()
+        line = f"{when}: {note}"
+        if note and line not in prev.splitlines():
+            fields["outcome_note"] = f"{prev}\n{line}".strip()
+        return upsert_state(conn, job_id, **fields)
+
+    if confidence not in RESPONSE_CONFIDENCE:
+        raise ValueError(f"invalid confidence {confidence!r}")
+    # Only stamped when this signal is what actually creates first_response_at, or when it
+    # sharpens an existing guess. Rank by list position: 'role' (0) beats 'company' (1).
+    def _mark_confidence() -> None:
+        prev = cur.get("response_confidence")
+        if prev is None or RESPONSE_CONFIDENCE.index(confidence) < RESPONSE_CONFIDENCE.index(prev):
+            fields["response_confidence"] = confidence
 
     if stage:
         if stage not in STAGE_RANK:
@@ -671,6 +723,8 @@ def record_signal(conn, job_id: str, *, stage: str | None = None, outcome: str |
             fields["stage"] = stage
         if stage != "applied" and not cur.get("first_response_at"):
             fields["first_response_at"] = when      # write-once
+        if stage != "applied":
+            _mark_confidence()
         # A real reply means the row is no longer just "applied" in the review UI either.
         if stage in ("screen", "interview", "onsite") and cur.get("status") == "applied":
             fields["status"] = "interviewing"
@@ -682,11 +736,18 @@ def record_signal(conn, job_id: str, *, stage: str | None = None, outcome: str |
             fields["status"] = "rejected"
         if outcome in ("offer", "hired") and STAGE_RANK.get(cur.get("stage") or "", -1) < STAGE_RANK["offer"]:
             fields["stage"] = "offer"
-        if outcome != "in_progress" and not cur.get("first_response_at") and outcome != "no_response":
-            fields["first_response_at"] = when
+        if outcome not in ("in_progress", "no_response"):
+            if not cur.get("first_response_at"):
+                fields["first_response_at"] = when
+            _mark_confidence()
     if note:
         prev = (cur.get("outcome_note") or "").strip()
-        fields["outcome_note"] = f"{prev}\n{when}: {note}".strip()
+        line = f"{when}: {note}"
+        # Appended, never replaced — but not appended twice. The outcomes job runs at 11:00 and
+        # 16:00 and re-reads the same 14 days both times, so without this the same rejection
+        # stacks up one line per run and the note stops being readable (2026-08-10).
+        if line not in prev.splitlines():
+            fields["outcome_note"] = f"{prev}\n{line}".strip()
     return upsert_state(conn, job_id, **fields)
 
 
@@ -694,26 +755,31 @@ def record_signal(conn, job_id: str, *, stage: str | None = None, outcome: str |
 
 def interview_upsert(conn, *, marker_id: str, company: str, happened_on: str,
                      round_type: str, sources: str, job_id: str | None = None,
-                     transcript_url: str | None = None, review_path: str | None = None) -> None:
+                     transcript_url: str | None = None, review_path: str | None = None,
+                     source: str = "review-md") -> None:
     """Insert or refresh one interview. A job_id already set (auto-matched earlier or linked
     by hand in the UI) is never cleared by a re-ingest — only filled when currently NULL.
-    transcript_url / review_path: a value parsed from the files wins; None keeps what's there."""
+    transcript_url / review_path: a value parsed from the files wins; None keeps what's there.
+
+    `source` records who found this interview. A 复盘 always wins: re-ingesting the markdown
+    over a row the mailbox backfill guessed at promotes it to 'review-md' and overwrites the
+    inferred heading, which is the whole point of reusing the same marker_id."""
     now = la_now_iso()
     row = conn.execute("SELECT job_id FROM interviews WHERE marker_id=?", (marker_id,)).fetchone()
     if row:
         conn.execute(
             "UPDATE interviews SET company=?, happened_on=?, round_type=?, sources=?,"
             " job_id=COALESCE(job_id, ?), transcript_url=COALESCE(?, transcript_url),"
-            " review_path=COALESCE(?, review_path), updated_at=? WHERE marker_id=?",
+            " review_path=COALESCE(?, review_path), source=?, updated_at=? WHERE marker_id=?",
             (company, happened_on, round_type, sources, job_id,
-             transcript_url, review_path, now, marker_id))
+             transcript_url, review_path, source, now, marker_id))
     else:
         conn.execute(
             "INSERT INTO interviews (marker_id, job_id, company, happened_on, round_type,"
-            " sources, transcript_url, review_path, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " sources, transcript_url, review_path, source, created_at, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (marker_id, job_id, company, happened_on, round_type, sources,
-             transcript_url, review_path, now, now))
+             transcript_url, review_path, source, now, now))
     conn.commit()
 
 
