@@ -41,15 +41,29 @@ DEFAULTS = {
     "gap_days": 10,         # minimum spacing between the first nudge and the second
     "top": 25,              # she has hundreds of open applications; nudge the ones worth it
     "min_score": 0.0,       # optionally only chase roles above a weighted score
+    # 2026-08-10: the first real look at this list was 10 Nvidia + 9 Mastercard out of 25.
+    # `resolve_contact` resolves per COMPANY, not per role — so that list is ten separate
+    # emails to the same recruiter, which is the spam this module exists to avoid. Cap the
+    # roles surfaced per company; 0 disables the cap.
+    "per_company": 3,
 }
 
 # Addresses that are not a person: ATS relays, and the marketing mailboxes that share a company
 # domain. Sending a nudge to sample-50533ce0@example.com is not "finding a contact", it's noise with a
 # recipient — so these are rejected outright.
+#
+# 2026-08-10: the recruiting-side role mailboxes were missing from this list, and the first live
+# run proved it — the only "contact" it found for the ten quiet Nvidia roles was
+# sample-d502a631@example.com, an unattended referral bot. That is worse than finding nothing,
+# because None correctly routes her to the portal while a role mailbox looks like a win and
+# reaches no one. Every entry here is anchored to the WHOLE local part, so a real human on a
+# team alias (sample-09b4ccdf@example.com) still resolves.
 _NOT_A_PERSON = re.compile(
     r"no[-_.]?reply|do[-_.]?not[-_.]?reply|donotreply|notifications?@|automated@|mailer-daemon|"
     r"^(?:news|newsletter|info|marketing|updates?|press|events?|support|help|billing|sales|"
-    r"webinar|community|social|hello|contact)@|"
+    r"webinar|community|social|hello|contact|"
+    r"careers?|jobs?|recruit(?:ing|ment)|talent(?:[-_.]?acquisition)?|hr|people(?:[-_.]?ops)?|"
+    r"staffing|employee[-_.]?referrals?|referrals?|apply|applications?|resumes?)@|"
     r"@(?:greenhouse|lever|ashbyhq|myworkday|smartrecruiters|icims)\.", re.I)
 # A human writing about her application says so. Used only for the mailbox fallback, where there
 # is no other evidence the sender has anything to do with the job.
@@ -67,10 +81,15 @@ def quiet(cfg: dict, conn) -> list[dict]:
 
     Ranked by role score: at a few hundred open applications, chasing all of them is neither
     possible nor advisable, so this surfaces the ones actually worth a human's morning.
+
+    "No reply yet" is three tests, not one — `first_response_at`, `stage`, and `outcome` are
+    each capable of holding the fact on their own. A linked li:/ATS pair counts once, and no
+    company may take more than `per_company` slots (see DEFAULTS).
+
+    tools/followup_nudge.py is what actually puts this in front of her, twice a week.
     """
     tune = tuning(cfg)
     today = datetime.date.fromisoformat(store.la_today())
-    counts = store.followup_counts(conn)
     rows = [dict(r) for r in conn.execute(
         "SELECT r.job_id, r.company, r.title, r.apply_url, r.weighted_score, r.seniority,"
         "       s.applied_date, s.status, s.stage, s.outcome, s.first_response_at,"
@@ -78,11 +97,22 @@ def quiet(cfg: dict, conn) -> list[dict]:
         " FROM jobs.roles r JOIN role_state s ON s.job_id = r.job_id"
         " WHERE s.status = 'applied' AND s.applied_date IS NOT NULL"
         "   AND s.first_response_at IS NULL"
-        "   AND (s.outcome IS NULL OR s.outcome = 'in_progress')")]
+        "   AND (s.outcome IS NULL OR s.outcome = 'in_progress')"
+        # A linked pair (li: shadow + ATS canonical, see role_state.duplicate_of) is ONE
+        # physical application, exactly as funnel.load counts it. Without this the list
+        # showed Otter/Lightning AI twice each and she'd nudge the same job twice
+        # (2026-08-10). The shadow still counts if its canonical partner never went out.
+        "   AND (s.duplicate_of IS NULL OR s.duplicate_of NOT IN"
+        "        (SELECT job_id FROM role_state WHERE applied_date IS NOT NULL))")]
 
     out = []
     for r in rows:
         if (r["weighted_score"] or 0) < tune["min_score"]:
+            continue
+        # `first_response_at` is the primary answer-detector, but `stage` is the other half of
+        # the same fact and funnel.py already treats it as one. A row whose stage was advanced
+        # without going through record_signal (hand edit, migration) must not be chased.
+        if store.STAGE_RANK.get(r["stage"] or "applied", 0) >= store.STAGE_RANK["responded"]:
             continue
         try:
             applied = datetime.date.fromisoformat(r["applied_date"])
@@ -105,6 +135,16 @@ def quiet(cfg: dict, conn) -> list[dict]:
         out.append({**r, "days_quiet": days_quiet, "days_since_applied": (today - applied).days,
                     "followups_sent": len(sent)})
     out.sort(key=lambda d: (-(d["weighted_score"] or 0), -d["days_quiet"]))
+    if tune["per_company"]:
+        seen: dict[str, int] = {}
+        kept = []
+        for r in out:
+            k = cfgmod.norm_key(r["company"])
+            if seen.get(k, 0) >= tune["per_company"]:
+                continue
+            seen[k] = seen.get(k, 0) + 1
+            kept.append(r)
+        out = kept
     return out[:tune["top"]]
 
 
