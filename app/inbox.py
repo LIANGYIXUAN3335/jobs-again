@@ -63,7 +63,7 @@ def _convo_key(from_addr: str, subject: str) -> str:
 
 def _client(cfg):
     mc, addr, pw = mail._creds(cfg)
-    M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"))
+    M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"), timeout=30)
     M.login(addr, pw)
     return M, addr
 

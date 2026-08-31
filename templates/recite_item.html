@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ it.question_zh or it.item_id }} · 念稿练习</title>
+<style>
+:root{--fg:#1c1c1e;--dim:#6b7280;--line:#e5e7eb;--bg:#fafafa;--card:#fff;--accent:#0b6b5e;--warn:#a4560a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:16px 18px 80px}
+a{color:var(--accent)}
+.top{display:flex;gap:12px;align-items:baseline;border-bottom:1px solid var(--line);
+     padding-bottom:9px;margin-bottom:12px;flex-wrap:wrap}
+.top .back{font-size:13px;text-decoration:none;white-space:nowrap}
+.top h1{font-size:15px;margin:0;flex:1;font-weight:600;min-width:180px}
+.top .meta{color:var(--dim);font-size:12.5px;font-variant-numeric:tabular-nums}
+.top .nav a{font-size:12.5px;text-decoration:none;border:1px solid var(--line);background:#fff;
+     border-radius:7px;padding:3px 9px;margin-left:5px;white-space:nowrap}
+.q{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px}
+.q .qt{font-size:16px;font-weight:600}
+.q .qz{color:var(--dim);font-size:13.5px;margin-top:3px}
+.q .hint{color:var(--warn);font-size:13px;margin-top:5px}
+.cols{display:grid;grid-template-columns:1.25fr 1fr;gap:16px;align-items:start}
+@media (max-width:900px){.cols{grid-template-columns:1fr}}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:13px 15px;margin-bottom:12px}
+.panel h3{font-size:12.5px;color:var(--dim);margin:0 0 8px;font-weight:600;letter-spacing:.03em;
+     display:flex;align-items:center;gap:8px}
+.panel h3 .rt{margin-left:auto;font-weight:400;font-size:12px}
+ul.cues{margin:0;padding-left:18px}
+ul.cues li{margin-bottom:5px}
+ul.cues li.extra{color:var(--dim)}
+.note{background:#eef7ee;border:1px solid #cfe6d3;border-radius:8px;padding:8px 11px;font-size:13.5px;margin-top:9px}
+details{margin-top:9px;border-top:1px dashed var(--line);padding-top:8px}
+summary{cursor:pointer;font-size:13.5px;color:var(--accent)}
+.eng{font-size:15.5px;line-height:1.95;white-space:pre-wrap}
+.eng mark{background:#fff2b8;padding:0 2px;border-radius:3px}
+.eng.masked{filter:blur(5px);user-select:none}
+.sw{font-size:12.5px;color:var(--dim);display:flex;align-items:center;gap:5px;cursor:pointer;font-weight:400}
+button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--line);background:#fff;padding:7px 14px}
+button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+button:disabled{opacity:.45;cursor:not-allowed}
+.recbtns{display:flex;gap:10px;margin-top:6px}
+.recbtns button{flex:1;padding:16px 8px;font-size:16px;font-weight:600}
+#recbtn{background:#b3261e;border-color:#b3261e;color:#fff}
+#recbtn.on{background:#7f1d18;border-color:#7f1d18}
+#stopbtn{background:#fff}
+.clock{font-variant-numeric:tabular-nums;font-size:26px;margin:2px 0}
+.clock small{font-size:13px;color:var(--dim)}
+.bar{height:6px;background:#eee;border-radius:4px;overflow:hidden;margin-top:8px}
+.bar i{display:block;height:100%;background:var(--accent);width:0}
+.track{border:1px solid var(--line);border-radius:9px;padding:8px 10px;margin-bottom:8px;background:#fcfdfd}
+.track .lb{font-size:12.5px;color:var(--dim);margin-bottom:4px}
+.track audio{width:100%;height:34px;display:block}
+.ab{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:8px}
+.ab button{flex:1;min-width:88px;font-size:13.5px;padding:9px 6px}
+.ab button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.takes{font-size:13px}
+.takes .t{display:flex;gap:8px;align-items:center;border-top:1px solid #f1f3f5;padding:6px 0}
+.takes .t audio{height:30px;flex:1;min-width:0}
+.takes .t .ts{color:var(--dim);font-size:12px;white-space:nowrap}
+.dims{margin:9px 0}
+.dim-row{display:flex;justify-content:space-between;font-size:13.5px;padding:2px 0}
+.dots{letter-spacing:2px}
+.verdict{font-size:21px;font-weight:700}
+.verdict small{font-size:14px;color:var(--dim);font-weight:400}
+.flag{background:#fdeaea;border:1px solid #f3c4c4;color:#8c1d18;border-radius:8px;padding:8px 11px;font-size:13.5px;margin-bottom:8px}
+.fact{background:#fffbf0;border:1px solid #f0dcae;border-radius:8px;padding:8px 11px;font-size:13px;margin-bottom:8px}
+.fix{font-size:13.5px;background:#fff8e6;border-left:3px solid #f0b429;padding:6px 10px;border-radius:0 6px 6px 0}
+.miss{color:#8c1d18;font-size:13.5px}
+.tr{font-size:13.5px;white-space:pre-wrap;background:#f7f8f9;border-radius:8px;padding:10px}
+.crit{font-size:13.5px;background:#f7f8f9;border-radius:8px;padding:10px;white-space:pre-wrap}
+.small{font-size:12.5px;color:var(--dim)}
+.hide{display:none !important}
+textarea{width:100%;min-height:52px;font:inherit;padding:8px;border:1px solid var(--line);border-radius:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<div class="top">
+  <a class="back" href="/recite">← 总库</a>
+  <h1>{{ it.interview or it.company }}{% if sib_pos[1] %} · 第 {{ sib_pos[0] }}/{{ sib_pos[1] }} 条{% endif %}</h1>
+  <div class="meta">目标 {{ variant.sec }}s · box {{ st.box or 1 }} · 录过 {{ n_recorded }} 次</div>
+  <div class="nav">
+    {% if prev_item %}<a href="/recite/{{ prev_item.item_id }}" title="{{ prev_item.question }}">← 上一条</a>{% endif %}
+    {% if next_item %}<a href="/recite/{{ next_item.item_id }}" title="{{ next_item.question }}">下一条 →</a>{% endif %}
+  </div>
+</div>
+
+<div class="q">
+  <div class="qt">{{ variant.q or it.question }}</div>
+  {% if it.question_zh %}<div class="qz">{{ it.question_zh }}</div>{% endif %}
+  {% if variant.type != 'original' %}
+    <div class="hint">🔀 今天这条也可以换个说法练 —— {{ variant.type }}：{{ variant.hint }}</div>
+  {% endif %}
+</div>
+
+<div class="cols">
+
+<!-- ══ 左栏：全文一直在。零闸门 —— 想看就看，想盖就盖。 ══════════════════════ -->
+<div>
+
+  <div class="panel">
+    <h3>📖 念稿全文
+      <label class="sw rt"><input type="checkbox" id="mask"> 盖稿（闭卷练，计过关/箱位）</label>
+    </h3>
+    {% if it.script %}
+      <div class="eng" id="engtext">{{ it.script }}</div>
+      {% if it.canon_spans %}
+        <div class="small" style="margin-top:8px">这几处按原文，其余用你自己的话：
+          {% for s in it.canon_spans %}<mark>{{ s }}</mark>{% if not loop.last %} · {% endif %}{% endfor %}
+        </div>
+      {% endif %}
+    {% else %}
+      <div class="small">这条没有念稿 —— 听原声 + 看下面的点评，想清楚当时该怎么答，然后自己录一版。</div>
+    {% endif %}
+  </div>
+
+  {% if it.scored or it.extra %}
+  <div class="panel">
+    <h3>🗝 要点（说到这几点就够，用你自己的话）</h3>
+    <ul class="cues">
+      {% for c in it.scored %}<li>{{ c.text }}</li>{% endfor %}
+      {% for c in it.extra %}<li class="extra">{{ c.text }} <span class="small">（加分项，不计分）</span></li>{% endfor %}
+    </ul>
+    {% if it.delivery_notes %}
+      <div class="note">🎯 这一遍注意：{{ it.delivery_notes[(st.n_takes or 0) % it.delivery_notes|length] }}</div>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if it.script_zh_gloss %}
+  <div class="panel">
+    <h3>🈶 中文对照</h3>
+    <details open><summary>展开 / 收起</summary>
+      <div style="font-size:14px;margin-top:6px">{{ it.script_zh_gloss }}</div>
+    </details>
+  </div>
+  {% endif %}
+
+  {% if it.critique_zh or it.orig_text or it.debrief_line or it.followup_q %}
+  <div class="panel">
+    <h3>📝 当时的就地点评</h3>
+    {% if it.critique_zh %}<div class="crit">{{ it.critique_zh }}</div>{% endif %}
+    {% if it.debrief_line %}
+      <div class="fix" style="margin-top:9px">面试官会写下的：{{ it.debrief_line }}</div>
+    {% endif %}
+    {% if it.orig_text %}
+    <details>
+      <summary>🎧 我当时真的说的（原声转写{% if it.asr_dirty %}，⚠️ ASR 有坏词{% endif %}）</summary>
+      <div style="font-size:13.5px;margin-top:6px">{{ it.orig_text }}</div>
+    </details>
+    {% endif %}
+    {% if it.followup_q %}
+    <details>
+      <summary>↪ 他接着追问的</summary>
+      <div style="font-size:13.5px;margin-top:6px">{{ it.followup_q }}</div>
+    </details>
+    {% endif %}
+    {% if it.why_q %}
+    <details>
+      <summary>❓ 他随时可能插的一句</summary>
+      <div style="font-size:13.5px;margin-top:6px">{{ it.why_q }}</div>
+    </details>
+    {% endif %}
+  </div>
+  {% endif %}
+
+</div>
+
+<!-- ══ 右栏：三条音轨 + 录音 + 对比 ═══════════════════════════════════════ -->
+<div>
+
+  <div class="panel">
+    <h3>🎚 音轨</h3>
+    {% if it.has_orig %}
+    <div class="track">
+      <div class="lb">🎧 面试原声（我当时说的）</div>
+      <audio id="a_orig" controls preload="none" src="/recite/audio/{{ it.item_id }}/orig"></audio>
+    </div>
+    {% endif %}
+    <div class="track hide" id="mine-track">
+      <div class="lb">🎤 我刚才的录音</div>
+      <audio id="a_mine" controls preload="none"></audio>
+    </div>
+    {% if not it.has_orig %}
+    <div class="small">这条没有原声段 —— 直接录一版，再回听自己。</div>
+    {% endif %}
+  </div>
+
+  <div class="panel" style="text-align:center">
+    <div class="clock"><span id="clock">0:00</span> <small>目标 {{ variant.sec }}s</small></div>
+    <div class="bar"><i id="progress"></i></div>
+    <div class="recbtns">
+      <button id="recbtn">● 录 音</button>
+      <button id="stopbtn" disabled>■ 停 止</button>
+    </div>
+    <div class="small" style="margin-top:8px" id="recnote">首次点录音会弹麦克风授权，选「允许」。</div>
+  </div>
+
+  <div class="panel hide" id="cmp">
+    <h3>🆚 对比（点谁播谁，来回 A/B）</h3>
+    <div class="ab">
+      {% if it.has_orig %}<button data-src="/recite/audio/{{ it.item_id }}/orig">🎧 原声</button>{% endif %}
+      <button id="cmp-mine" data-src="">🎤 我的</button>
+    </div>
+    <audio id="a_cmp" controls preload="none" style="width:100%;height:34px"></audio>
+  </div>
+
+  <div class="panel hide" id="scorebox">
+    <h3>🤖 AI 评分（可选，不点也不影响练）</h3>
+    <textarea id="whyline" placeholder="（可选）一句话：这样做为什么是对的？写了 why_depth 才有分。"></textarea>
+    <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+      <button class="primary" id="scorebtn">让 AI 评一下</button>
+      <button id="rewrite">这稿要改</button>
+      <button id="thin">量级不足</button>
+    </div>
+    <div class="small" id="scorenote" style="margin-top:6px"></div>
+  </div>
+
+  <div class="panel hide" id="card">
+    <div class="verdict"><span id="verdict"></span> <small id="total"></small></div>
+    <div id="calibnote" class="small"></div>
+    <div id="gatenote" class="small" style="margin-top:6px"></div>
+    <div class="dims" id="dims"></div>
+    <div id="flags"></div>
+    <div id="facts"></div>
+    <div id="missed" class="miss"></div>
+    <div class="fix hide" id="fixnext" style="margin-top:10px"></div>
+    <div class="small" id="oneline" style="margin-top:6px"></div>
+    <details>
+      <summary>🗣 转写：我刚才说的</summary>
+      <div class="tr" id="transcript" style="margin-top:6px"></div>
+      <div class="small" id="asrnote" style="margin-top:6px"></div>
+      <div id="rline" class="small" style="margin-top:6px"></div>
+    </details>
+  </div>
+
+  {% if takes %}
+  <div class="panel">
+    <h3>🗂 历次录音</h3>
+    <div class="takes" id="takelist">
+      {% for t in takes %}
+      <div class="t">
+        <span class="ts">{{ t.ts[5:16]|replace('T',' ') }}</span>
+        <audio controls preload="none" src="/recite/audio/{{ it.item_id }}/take-{{ t.id }}"></audio>
+        <span class="ts">{% if t.total %}{{ '%.1f'|format(t.total) }}{% else %}未评{% endif %}</span>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+</div>
+</div>
+
+<script id="recite-data" type="application/json">
+{{ {
+  "item_id": it.item_id,
+  "target_sec": it.target_sec,
+  "variant": variant,
+  "first_exposure": first_exposure,
+  "calibrating": calibrating,
+  "has_orig": it.has_orig
+} | tojson }}
+</script>
+<script src="/static/recite.js"></script>
+</body>
+</html>

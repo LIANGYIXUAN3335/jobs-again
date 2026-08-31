@@ -580,3 +580,247 @@ def pick_option(cfg: dict, role: dict, question: str, options: list[str]) -> int
                    index=idx, answer=(options[idx] if idx >= 0 else None),
                    model=ai.get("model"))
     return idx
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 念稿练习 (recite) 的 AI 判官。2026-08-29 新增，与上面的申请自动填写完全独立：
+# 输入是**她自己**的录音转写，输出是一张评分卡，永远不会被打到任何表单上。
+#
+# 三条与上面共享的方法论：
+#   ① 能确定性算的别问模型 —— coverage 由代码算（判官只吐 missed_cues）、forbid 由正则判、
+#      verbatim_ratio 由 4-gram 算、时长由 ffprobe 算。判官只判它唯一有优势的那四维。
+#   ② 反空洞夸奖三层 —— prompt 硬规则 → _reject_review() 正则后置 → 5 分必须带 TRANSCRIPT
+#      逐字引证否则代码降到 3。同 _hard_reject 的思路：模型反复不听的规则要写成无模型断言。
+#   ③ 失败不阻断 —— 判官挂了返回一张空卡，take 照样入库、录音照样在盘上。
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RECITE_SYSTEM = """You are a senior FAANG interviewer debriefing ONE spoken answer from a \
+mock-interview drill. The candidate recorded herself answering from memory. You get the \
+TRANSCRIPT of what she actually said, the cue points she was aiming at, and — for reference \
+only — the TARGET SCRIPT she once wrote.
+
+Return ONLY a JSON object:
+{"scores": {"structure": 1-5, "concision": 1-5, "fluency": 1-5, "why_depth": 1-5},
+ "missed_cues": ["<verbatim text of each cue point whose IDEA never reached the listener>"],
+ "evidence": {"structure": "...", "concision": "...", "fluency": "...", "why_depth": "..."},
+ "issues": ["<concrete problem>", ...],
+ "fix_next": "<ONE executable instruction for the very next take>",
+ "one_line": "这一段会让面试官写下 ___，因为 ___"}
+
+SCORE ANCHORS — use these exact behaviours, do not invent your own scale.
+ structure  1: after the whole answer a listener still doesn't know what story this was, or the
+               conclusion never arrives. 3: the conclusion only shows up in the last 20 seconds,
+               everything before it is background. 5: the landing point is in the first two
+               sentences and everything after it is evidence for that point.
+ concision  1: most sentences run past 25 words, stacked clauses, restarts mid-sentence.
+               3: one or two clearly over-long sentences, the rest are listenable.
+               5: one idea per sentence, longest sentence under 16 words, not a single restart.
+ fluency    1: speaking rate is 25+ wpm outside the 130-160 band, or 4+ pauses over 2 seconds.
+               3: rate at the edge of the band, ~3 long pauses, audibly rushing or dragging.
+               5: 130-160 wpm, at most one pause over 2 seconds, even rhythm.
+            This is the ONLY place in the whole system that watches her speaking rate. Do not
+            widen this band and do not excuse a rushed take because "the other gates passed".
+            Rushing is her documented failure mode.
+ why_depth  1: reports only what she did, zero reasoning. 3: gives a reason but no trade-off
+               (says "better" without saying what it cost). 5: reason + an explicit trade-off +
+               she can name the option she ruled out.
+
+COVERAGE — you do NOT score this dimension. You only output `missed_cues`.
+  A cue point counts as COVERED if the IDEA reached the listener, in ANY wording.
+  Different words are NOT a deduction — they are evidence she owns the idea. If her phrasing
+  for a cue is BETTER than the target script's, say so in `evidence`.
+  Reproducing the TARGET SCRIPT's wording earns NOTHING extra.
+  A cue is MISSED only if a listener would not have received that idea at all.
+  Copy the cue's text VERBATIM into `missed_cues` — the code matches on it.
+
+DELIVERY NOTES — the cue list may be followed by delivery instructions (how to speak, not what
+  to say). Judge those under `structure` and mention them in `evidence.structure`. They are NOT
+  cue points and must never appear in `missed_cues`.
+
+Never justify a score by comparing to the TARGET SCRIPT. The script is one way to say it, not
+the standard. Judge the transcript as an interviewer who has never seen the script would.
+
+`read_aloud` is NOT a flag you emit. Whether she was looking at the script is already known
+deterministically. Do not infer it from the text.
+
+BANNED — the review is worthless if it flatters:
+- Never open with praise. No "great job", "nice work", "strong answer", "you did well",
+  "overall this is solid". No emoji.
+- `issues` must never be empty. If the answer is genuinely good, name the thing that would
+  still stop it from being a Strong Hire.
+- `fix_next` must be ONE thing she can do in the next 60 seconds, with a location in the answer
+  ("at the 40-second mark, go straight into…"). Not "be more concise", not "practice more",
+  not two instructions joined by "and also".
+- Any dimension you score 5 MUST quote the exact words from the TRANSCRIPT that earned it in
+  `evidence`. A 5 without a verbatim quote will be reduced to 3 by the caller.
+- `one_line` must follow the shape "这一段会让面试官写下 ___，因为 ___" and the second half must
+  contain a concrete noun or number from THIS take.
+
+Write `issues`, `fix_next` and `one_line` in Chinese (her working language); keep quoted English
+from the transcript in English.
+"""
+
+# 正则后置：模型反复不听的软约束写成无模型断言（同 _REJECT 的思路）。命中 → 这一维/这条
+# 输出被判无效，代码兜底。
+_PRAISE = re.compile(
+    r"great job|nice work|well done|excellent|strong answer|solid answer|good job|"
+    r"overall.{0,20}(good|solid|strong)|做得很好|很棒|非常好|表现不错|整体不错", re.I)
+_VAGUE_FIX = re.compile(
+    r"^(be |try |practice|keep |continue|more |少一点|多练|注意一下|再简洁|更简洁|更清晰)",
+    re.I)
+
+
+def _reject_review(d: dict) -> list[str]:
+    """判官输出的确定性质检。返回被改写的项，调用方记进 judge_raw 以便事后看判官漂移。"""
+    fixed = []
+    if _PRAISE.search(json.dumps(d, ensure_ascii=False)):
+        fixed.append("praise")
+    if not (d.get("issues") or []):
+        d["issues"] = ["判官没给出问题 —— 这条本身就是问题，人看一眼"]
+        fixed.append("empty_issues")
+    fx = str(d.get("fix_next") or "").strip()
+    if not fx or _VAGUE_FIX.match(fx) or " and also " in fx.lower() or "并且" in fx:
+        fixed.append("vague_fix")
+    # 5 分必须带 TRANSCRIPT 逐字引证，否则降到 3。
+    ev = d.get("evidence") or {}
+    for dim, v in list((d.get("scores") or {}).items()):
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        if v >= 5 and not re.search(r"[\"“'‘][^\"”'’]{8,}[\"”'’]", str(ev.get(dim) or "")):
+            d["scores"][dim] = 3
+            fixed.append(f"unquoted_5:{dim}")
+    return fixed
+
+
+def review_take(cfg: dict, ctx: dict) -> dict:
+    """给一次 take 打分。`ctx` 由 recite 层组装，见下面的取值。永不抛。
+
+    返回 {"scores", "missed_cues", "evidence", "issues", "fix_next", "one_line",
+          "raw", "fixed", "error"}。判官不可用时 scores 为空 dict —— 调用方仍会落库，
+          卡片显示「评分没跑出来，录音已存 [重试评分]」。
+    """
+    blank = {"scores": {}, "missed_cues": [], "evidence": {}, "issues": [],
+             "fix_next": "", "one_line": "", "raw": "", "fixed": [], "error": ""}
+    if not available(cfg):
+        blank["error"] = "ai disabled or no api key"
+        return blank
+    key = load_key(cfg)
+    ai = cfg.get("ai") or {}
+
+    cues = ctx.get("scored_cues") or []
+    cue_block = "\n".join(f"  - {c}" for c in cues) or "  (no cue points)"
+    notes = ctx.get("delivery_notes") or []
+    note_block = "\n".join(f"  - {n}" for n in notes)
+
+    parts = [
+        f"Question as asked this time:\n  {ctx.get('question', '')}",
+        f"\nCUE POINTS she was aiming at (the ONLY things `missed_cues` may contain):\n{cue_block}",
+    ]
+    if note_block:
+        parts.append(f"\nDELIVERY NOTES (judge under structure, never in missed_cues):\n{note_block}")
+    parts.append(f"\nTARGET SCRIPT (reference only — never the standard):\n\"\"\"\n"
+                 f"{(ctx.get('script') or '')[:4000]}\n\"\"\"")
+    parts.append(f"\nTRANSCRIPT of what she actually said:\n\"\"\"\n"
+                 f"{(ctx.get('transcript') or '')[:6000]}\n\"\"\"")
+    m = ctx.get("metrics") or {}
+    parts.append(
+        f"\nMeasured (deterministic, already computed — do not recompute):\n"
+        f"  duration {m.get('duration', 0):.0f}s against a {ctx.get('target_sec', 0)}s target\n"
+        f"  speaking rate {ctx.get('wpm', 0)} wpm · pauses over 2s: {m.get('pauses_over_2s', 0)}"
+        f" · longest pause {m.get('longest_pause_sec', 0)}s")
+
+    vt = ctx.get("variant_type") or "original"
+    if vt != "original":
+        parts.append(
+            f"\nVARIANT — this take was recorded under a variant constraint:\n"
+            f"  {ctx.get('variant_hint') or ctx.get('question') or ''}\n"
+            f"  Time allowed: {ctx.get('variant_sec')}s (the original target was "
+            f"{ctx.get('target_sec')}s).\n"
+            "  Judge `structure` and coverage AGAINST THE VARIANT, not against the original "
+            "question or the original target length. Answering the original question when a "
+            "different one was asked is a structure failure, not a coverage success. Dropping "
+            "whole beats to fit a shorter budget is the CORRECT strategy under a time "
+            "constraint — say which beats she chose to drop, and whether that was the right "
+            "call, but do not score it as a failure of concision.")
+
+    why = (ctx.get("why_line") or "").strip()
+    if why:
+        parts.append(
+            f"\nWHY LINE — before unlocking anything, she typed one line answering "
+            f"\"{ctx.get('why_q') or 'why was this the right call'}\":\n  \"\"\"{why}\"\"\"\n"
+            "  Score `why_depth` PRIMARILY on this line, plus any reasoning she volunteered in "
+            "the TRANSCRIPT. Do not hunt for it inside the spoken answer.")
+
+    # duration < 0.5 * target 的零代码补丁（MEM2-P0-2）：undertime 移出硬门之后唯一的真实
+    # 漏洞是「点名而不支撑」—— 30 秒里把四个要点各说一个词，coverage 机械地满分。
+    tgt = float(ctx.get("target_sec") or 0)
+    dur = float(m.get("duration") or 0)
+    if tgt and dur and dur < 0.5 * tgt:
+        parts.append(
+            f"\nThis take ran {dur:.0f}s against a {tgt:.0f}s target. Under half the target, a "
+            "cue that was merely NAMED does not count as covered; the idea must have been "
+            "SUPPORTED. Re-check missed_cues under that stricter reading.")
+
+    # `pace: "deliberate"` 的条目，慢是设计意图不是缺陷：这几条是靠停顿制造重量的短答
+    # （53 词 / 35 秒），是全样本里最好的澄清式回答。不告诉判官的话 fluency 的 130-160 带会
+    # 把它们系统性地判成 2–3 分 —— 一个把最佳短答判死的锚点，和退出硬门的那个 wpm 是同一个
+    # 错误。band 本身不放宽（它是全系统唯一的语速监控），只在这一类条目上说明设计意图。
+    if (ctx.get("pace") or "") == "deliberate":
+        parts.append(
+            "\nPACE — this script is deliberately slow: it is a short answer that carries its "
+            "weight through pauses, and the author fixed its target length by hand rather than "
+            "deriving it from the word count. For `fluency`, judge whether the pauses land "
+            "where the meaning breaks and whether the rhythm is even — do NOT deduct for a "
+            "speaking rate below the 130-160 band on this item alone.")
+
+    name = (ctx.get("speaker_name") or "").strip()
+    if name:
+        parts.append(f"\nIn this interview the interviewer called her {name}.")
+
+    import anthropic
+    client = anthropic.Anthropic(api_key=key)
+    user = "\n".join(parts)
+
+    def _ask(max_tokens: int, think: bool) -> str:
+        kw = {"thinking": {"type": "adaptive"}} if think else {}
+        resp = client.messages.create(
+            model=ai.get("model", "claude-opus-4-8"),
+            max_tokens=max_tokens,
+            output_config={"effort": ai.get("effort", "high")},
+            system=_RECITE_SYSTEM + _lessons(),
+            messages=[{"role": "user", "content": user}],
+            **kw,
+        )
+        return "".join(b.text for b in resp.content if b.type == "text")
+
+    # max_tokens 要装下 thinking + JSON。2000 在长条目上被 thinking 吃光过，返回了零个 text
+    # block —— 而那正好是判官"没给分但也没报错"的样子，最难查的一种失败。宽一点，并且
+    # 拿不到文本时退一次「不 thinking」再试，别让一条稿因为长而永远评不出分。
+    text = ""
+    try:
+        text = _ask(8000, True)
+        if not text.strip():
+            text = _ask(3000, False)
+        d = json.loads(_extract_json(text))
+    except Exception as e:
+        blank["error"] = f"{type(e).__name__}: {e}"[:300]
+        blank["raw"] = text[:2000]
+        return blank
+    if not (d.get("scores") or {}):
+        blank["error"] = "判官没返回 scores"
+        blank["raw"] = text[:2000]
+        return blank
+    d.setdefault("scores", {})
+    d.setdefault("missed_cues", [])
+    d.setdefault("evidence", {})
+    d.setdefault("issues", [])
+    fixed = _reject_review(d)
+    return {"scores": {k: v for k, v in (d.get("scores") or {}).items()},
+            "missed_cues": [str(x) for x in (d.get("missed_cues") or [])],
+            "evidence": d.get("evidence") or {},
+            "issues": [str(x) for x in (d.get("issues") or [])],
+            "fix_next": str(d.get("fix_next") or "").strip(),
+            "one_line": str(d.get("one_line") or "").strip(),
+            "raw": text[:8000], "fixed": fixed, "error": ""}
