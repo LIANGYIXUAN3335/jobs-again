@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import unicodedata
 from pathlib import Path
 from urllib.parse import quote
@@ -57,7 +58,15 @@ def url_candidates(url: str) -> list[str]:
                 r"/(?:details|apply)/(\d{6,}(?:-\d{2,5})?)",
                 # Workday req ids: .../Software-Engineer-II_R-279240, .../job/R-273932/...,
                 # .../Staff-Software-Engineer_REF078668W  → job_id ends ':R-279240'
-                r"[_/]([A-Z]{1,4}-?\d{3,}[A-Za-z0-9]*)"):
+                r"[_/]([A-Z]{1,4}-?\d{3,}[A-Za-z0-9]*)",
+                # …and the ones that lead with DIGITS, which the letters-first pattern above
+                # cannot see at all: Autodesk stamps the fiscal year on the front
+                # (…_26WD99399-1 → wd:autodesk:wd1:Ext:26WD99399). That blind spot cost 78
+                # straight lookup 404s on 2026-08-09 for a role that WAS in the queue — the
+                # panel never opened, so a scanned role with a tailored PDF got filled by
+                # hand. The trailing -1/-3 is Workday's repost counter, never part of the
+                # stored id, so stop before it.
+                r"[_/](\d{2,4}[A-Z]{1,4}\d{3,})"):
         c += re.findall(pat, url)
     c += _UUID.findall(url)
     seen, out = set(), []
@@ -152,8 +161,38 @@ templates = Jinja2Templates(directory=str(cfgmod.ROOT / "templates"))
 store.seed_applied_companies(cfg)  # one-way merge of config's applied_companies list
 
 
+_schema_ready: set[str] = set()   # user-DB paths whose schema + migrations have been applied
+
+
 def view_conn():
-    conn = store.connect_view(cfg)
+    """One fresh connection per request, usable from whichever worker thread gets it.
+
+    check_same_thread=False is not laziness. FastAPI submits a sync generator dependency's
+    setup, the endpoint body, and the `finally` teardown to the anyio worker pool as three
+    SEPARATE jobs, and the pool makes no promise they land on the same thread. sqlite3's
+    default same-thread guard then raises ProgrammingError partway through a request that was
+    otherwise fine. web.log recorded 11 of these on 2026-08-09, and one of them ate a real
+    application: POST /api/roles/ab:illumio:4d98de4e…/status → 500 at 18:59, so a form she
+    had already submitted was never marked applied and the role sat in the queue.
+
+    Safe because the sharing is sequential, not concurrent: the connection belongs to exactly
+    one request, only one of those three jobs runs at a time, and anyio's handoff orders the
+    memory between them. The guard was protecting nothing here and only breaking writes.
+
+    The schema bootstrap + migrations still go through store.connect_view, but once per DB
+    file instead of on every request — they are idempotent DDL, not per-request work. Keyed
+    by path rather than done at import because the tests monkeypatch `cfg` onto throwaway
+    DBs after this module is loaded, and those need bootstrapping too.
+    """
+    user_db = str(cfgmod.user_db_path(cfg))
+    if user_db not in _schema_ready:
+        store.connect_view(cfg).close()
+        _schema_ready.add(user_db)
+    conn = sqlite3.connect(user_db, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=60000")   # same as store._connect — see the note there
+    conn.execute("ATTACH DATABASE ? AS jobs", (str(cfgmod.db_path(cfg)),))
     try:
         yield conn
     finally:

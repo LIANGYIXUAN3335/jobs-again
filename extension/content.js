@@ -2621,8 +2621,27 @@
     sparkleRole = null;
   }
 
+  // ---- Backoff for pages that resolve to nothing. ----
+  // A miss is usually permanent: the id on this page isn't in the DB and no live pin's company
+  // appears on it. But the poll re-arms on every tab focus and every SPA nav, so an orphaned
+  // tab re-ran the FULL resolution — /api/lookup plus /api/pins — at 500 ms forever. One tab on
+  // 2026-08-09 (jobs.ashbyhq.com/Stealth FinTech/…, a LinkedIn role whose employer is listed as
+  // "Confidential", so no pin can ever fit the page) issued 35 lookup+pins pairs across four
+  // hours: 70 requests for an answer that could not change on its own, and 70 chances for the
+  // panel to flicker while she was working in the tab.
+  //
+  // Back off rather than give up. Two things genuinely DO change under us: an SPA can still be
+  // rendering (that is why we poll at all), and a pin can arrive after the tab is open — she
+  // opens a tab, then clicks ↗ in JobScan. So keep the first few retries instant and let the
+  // interval widen to a minute. The map is per-tab and per-URL, and any success clears it.
+  const MISS_BACKOFF_MS = [0, 0, 0, 1000, 2500, 6000, 20000, 60000];
+  const misses = new Map();          // url -> { n, next }
+  const missWait = (n) => MISS_BACKOFF_MS[Math.min(n, MISS_BACKOFF_MS.length - 1)];
+
   async function tryShow() {
     if (busy) return;
+    const miss = misses.get(location.href);
+    if (miss && Date.now() < miss.next) return;   // still inside this URL's backoff window
     // Workday renders its own widgets (no file input on most steps) — detect its form fields.
     const hasForm = IS_WORKDAY
       ? document.querySelector('[data-automation-id^="formField"], [data-automation-id="add-button"]')
@@ -2727,15 +2746,20 @@
       // role for a page we can't identify, which is the opposite of what C is for.
       if (!role) {
         noMatchFor = location.href;      // pill may now offer capture even on scanner-ATS hosts
+        const n = ((misses.get(location.href) || {}).n || 0) + 1;
+        misses.set(location.href, { n, next: Date.now() + missWait(n) });
         if (pinsRejected.length) {
           console.info("[JobScan] no panel — none of the", pinsRejected.length,
                        "live pins appear on this page:",
-                       pinsRejected.map((r) => r.company).join(", "));
+                       pinsRejected.map((r) => r.company).join(", "),
+                       `— retrying in ${Math.round(missWait(n) / 1000)}s`);
         } else {
-          console.info("[JobScan] no matching role for", location.href);
+          console.info("[JobScan] no matching role for", location.href,
+                       `— retrying in ${Math.round(missWait(n) / 1000)}s`);
         }
         return;
       }
+      misses.delete(location.href);      // resolved — this URL is not a dead end after all
       noMatchFor = null;
       // Keep the FULL payloads: each rejected pin is a complete /api/pins entry (résumé flag,
       // profile, job_id), so the panel can offer it as a one-click manual override — the fix
