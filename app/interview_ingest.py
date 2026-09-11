@@ -19,6 +19,9 @@ Boundaries, deliberately:
 
     python -m app.interview_ingest            # scan, ingest, print the table
     python -m app.interview_ingest --dry-run  # parse + match, write nothing
+
+  Exit 3 = it ran, but at least one 复盘 section was NOT indexed (bad heading, or no items in a
+  shape the parser reads). Silence was the actual bug here — see _sections. — 2026-08-10
 """
 from __future__ import annotations
 
@@ -31,13 +34,69 @@ from pathlib import Path
 from . import config as cfgmod
 from . import store
 
-# "## Amazon · 2026-07-06 · Round 3" / "## WOP.com · 2026-06 · Recruiter Screen". The second
-# field must look like a date — that alone filters non-interview sections ("## 答案库 / …").
-_HEADING = re.compile(r"^##\s+(?P<company>[^·\n]+?)\s*·\s*(?P<date>20\d{2}(?:-\d{2}){0,2})"
-                      r"(?:\s*·\s*(?P<round>.+?))?\s*$")
+# The heading grammar, as she ACTUALLY writes it. Scanned every md under 面试复盘/ on
+# 2026-08-10: 55 「##」 headings, three shapes, all with the company first —
+#   公司 · 日期 · 轮次        ← the README contract, 53 of 55
+#   公司 · 日期 (轮次)        ← 「## Amazon · 2026-06-23 (Technical Interview: …)」 round glued
+#                               onto the date with a paren instead of a ·
+#   公司 · 轮次 · 日期        ← 「## Anytime AI（疑似）· System Design Round … · 2026-06」
+# The old regex only knew shape 1, so the other two sections were dropped whole — 14 action
+# items that never reached the DB and nobody noticed for six weeks. Fix: split on ·, field 0
+# is the company, whichever LATER field starts with a date is the date, everything else is the
+# round. Anchoring on the date instead of on position turns three regexes into one rule and
+# absorbs the next variant she invents. — 2026-08-10
+_DATE_AT = re.compile(r"^(?P<date>20\d{2}(?:-\d{2}){0,2})(?![\d])")
+# Tolerant, not credulous: a date field may carry the round with it, but only when it was
+# GLUED ON with punctuation — 「2026-06-23 (Technical Interview: …)」. Without this, 「2026 06 23」
+# would read as the year 2026 with a round of "06 23", i.e. a wrong parse where the old regex
+# at least gave an honest refusal. Silent wrongness is worse than a loud skip. — 2026-08-10
+_ROUND_GLUE = re.compile(r"^\s*[(\[（【—–:：,，-]")
+# A 「##」 heading carrying BOTH a · and a year was MEANT to be an interview section. That pair
+# is the entire false-positive filter for the warning below: on the real tree it clears every
+# 「第一部分 · Coding」/「附录 · 高频术语」/「二、教练复盘（… 2026-07-20 整理）」 heading (16 of
+# them) while still flagging the two malformed interview headings. Verified 2026-08-10.
+_YEAR = re.compile(r"20\d{2}")
+_EDGE = re.compile(r"^[\s\-—–:,;.、]+|[\s\-—–:,;.、]+$")
+_WRAPS = (("(", ")"), ("（", "）"), ("[", "]"), ("【", "】"))
+
 _MARKER = re.compile(r'<!--\s*atoms-source\s+id="(?P<id>[^"]+)"')
 _CHECKBOX = re.compile(r"^\s*-\s*\[(?P<done>[ xX])\]\s*(?P<text>.+?)\s*$")
 _QUESTION = re.compile(r"^###\s*Q:\s*(?P<text>.+?)\s*$")
+
+
+def _tidy_round(s: str) -> str:
+    """Un-glue a round from the date it was written against: 「2026-06-23 (Technical Interview:
+    Coding + Design + BQ)」 → 「Technical Interview: Coding + Design + BQ」. Punctuation only —
+    her wording is never rewritten, the notes are the system of record."""
+    s = _EDGE.sub("", s.strip())
+    for op, cl in _WRAPS:
+        if s.startswith(op) and s.endswith(cl) and s.count(op) == 1:
+            return _EDGE.sub("", s[1:-1].strip())
+    return s
+
+
+def parse_heading(line: str) -> tuple[str, str, str] | None:
+    """(company, date, round) for an interview 「##」 heading; None when it isn't one."""
+    if not line.startswith("## "):
+        return None
+    fields = [f.strip() for f in line[3:].strip().split("·")]
+    if len(fields) < 2 or not fields[0]:
+        return None
+    for i in range(1, len(fields)):
+        m = _DATE_AT.match(fields[i])
+        if not m:
+            continue
+        tail = fields[i][m.end():]
+        if tail.strip() and not _ROUND_GLUE.match(tail):
+            continue
+        rest = [_tidy_round(tail)]
+        rest += [f for j, f in enumerate(fields) if j and j != i]
+        return fields[0], m["date"], " · ".join(f for f in rest if f)
+    return None
+
+
+def _looks_like_interview(line: str) -> bool:
+    return "·" in line and bool(_YEAR.search(line))
 
 
 def _derived_id(company: str, date: str) -> str:
@@ -45,19 +104,28 @@ def _derived_id(company: str, date: str) -> str:
     return f"{date}-{kebab}"
 
 
-def _sections(text: str, src_file: str, kind: str) -> list[dict]:
-    """Split one card-source file into per-interview sections with their items."""
+def _sections(text: str, src_file: str, kind: str, skipped: list | None = None) -> list[dict]:
+    """Split one card-source file into per-interview sections with their items.
+
+    `skipped` is the anti-silence channel: every heading that reads like an interview but
+    couldn't be parsed, and every section that parsed but yielded nothing, lands there so
+    main() can shout about it. A parser that drops input without complaining is the reason
+    28 action items sat outside the DB for six weeks. — 2026-08-10
+    """
     out: list[dict] = []
     cur: dict | None = None
-    for line in text.splitlines():
-        h = _HEADING.match(line)
+    for lineno, line in enumerate(text.splitlines(), 1):
         if line.startswith("## "):
             cur = None                                   # any ## ends the previous section
-        if h:
-            cur = {"company": h["company"].strip(), "date": h["date"],
-                   "round": (h["round"] or "").strip(), "heading": line.strip()[3:],
-                   "marker": None, "items": [], "src_file": src_file, "kind": kind}
-            out.append(cur)
+            h = parse_heading(line)
+            if h:
+                cur = {"company": h[0], "date": h[1], "round": h[2],
+                       "heading": line.strip()[3:], "line": lineno,
+                       "marker": None, "items": [], "src_file": src_file, "kind": kind}
+                out.append(cur)
+            elif skipped is not None and _looks_like_interview(line):
+                skipped.append({"file": src_file, "line": lineno, "heading": line.strip(),
+                                "why": "标题里有「·」和年份，但读不出 公司 · 日期 —— 整节被跳过"})
             continue
         if cur is None:
             continue
@@ -75,8 +143,15 @@ def _sections(text: str, src_file: str, kind: str) -> list[dict]:
             if q:
                 cur["items"].append({"kind": kind, "text": q["text"],
                                      "done": 0, "src_file": src_file})
+    want = "- [ ] checkbox" if kind == "action" else "### Q:"
     for s in out:
         s["marker"] = s["marker"] or _derived_id(s["company"], s["date"])
+        # The other silent drop, and the one that hid the Lucid/CipherData 行动清单 tables:
+        # the heading is fine, the content is there, but it's in a shape this parser can't
+        # read (a table, a plain bullet). Zero items out of a real 复盘 section is never right.
+        if skipped is not None and not s["items"]:
+            skipped.append({"file": src_file, "line": s["line"], "heading": s["heading"],
+                            "why": f"标题解析成功，但一条 {kind} 都没读到 —— 内容不是 `{want}` 格式？"})
     return out
 
 
@@ -154,9 +229,10 @@ def _match_role(conn, company: str) -> tuple[str | None, int]:
 
 def ingest(cfg: dict, conn, *, dry_run: bool = False) -> dict:
     merged: dict[str, dict] = {}
+    skipped: list[dict] = []
     for path, kind in _files(cfg):
         text = path.read_text(encoding="utf-8")
-        for s in _sections(text, path.name, kind):
+        for s in _sections(text, path.name, kind, skipped):
             g = merged.setdefault(s["marker"], {
                 "company": s["company"], "date": s["date"], "round": s["round"],
                 "sources": {}, "items": []})
@@ -197,7 +273,8 @@ def ingest(cfg: dict, conn, *, dry_run: bool = False) -> dict:
             if st and st["status"] in ("applied", "interviewing"):
                 store.record_signal(conn, eff_job, stage="interview", when=_day(g["date"]))
     return {"interviews": len(merged), "linked": linked, "ambiguous": ambiguous,
-            "standalone": standalone, "with_transcript": with_transcript}
+            "standalone": standalone, "with_transcript": with_transcript,
+            "skipped": skipped}
 
 
 def _day(d: str) -> str:
@@ -221,9 +298,28 @@ def main(argv: list[str]) -> int:
                 tag = r["role_title"] or ""
                 print(f"  {r['happened_on']:10}  {r['company'][:18]:18} {r['round_type'][:26]:26}"
                       f" q{r['n_questions']:>2} · act {r['n_done']}/{r['n_actions']}  {tag[:36]}")
+        # Loud, last, and on both streams — the silence is what cost six weeks, so a drop now
+        # ends the run with a nonzero status instead of scrolling past in a happy summary.
+        if res["skipped"]:
+            print(_skipped_report(res["skipped"]))
+            print(_skipped_report(res["skipped"]), file=sys.stderr)
+            return 3
     finally:
         conn.close()
     return 0
+
+
+def _skipped_report(skipped: list[dict]) -> str:
+    lines = [f"\n{'!' * 72}",
+             f"⚠️  {len(skipped)} 节没有进 DB —— 这些行动项/题目一条都没被索引：", ""]
+    for s in skipped:
+        lines += [f"    {s['file']}:{s['line']}", f"      ## {s['heading'].lstrip('# ')}",
+                  f"      ↳ {s['why']}"]
+    lines += ["",
+              "    修法：标题写成 `## 公司 · YYYY-MM-DD · 轮次`（日期第二段、`·` 不能少），",
+              "          行动项用 `- [ ] `、题目用 `### Q: `，然后重跑本命令。",
+              f"{'!' * 72}"]
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
