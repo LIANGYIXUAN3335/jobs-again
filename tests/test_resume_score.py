@@ -145,6 +145,52 @@ def test_rich_backend_jd_still_scores_strong():
     assert sc.verdict in ("apply", "strong"), sc.summary_line()
 
 
+def test_summary_self_praise_is_penalized_and_named():
+    """Shipped 2026-08-11: 30 résumés closed the summary with '— a strong fit for <JD title>.
+    Self-directed, ramps fast on new codebases.' and 18 went out as PDFs. Nothing scored the
+    summary: `achievements` reads only experience bullets, `parseability` only asks non-empty."""
+    puffed = ("Backend software engineer with production experience in Go and Python. Strengths "
+              "in reliability and code review — a strong fit for Sr. Software Engineer - Azure "
+              "Storage. Self-directed, ramps fast on new codebases.")
+    score, flags = resume_score.summary_quality(puffed, title="Sr. Software Engineer - Azure Storage")
+    assert score < 50, (score, flags)
+    assert any(f.startswith("self-praise") for f in flags)
+    assert any("mail-merged" in f for f in flags)      # verbatim JD title is its own tell
+
+
+def test_summary_with_operational_evidence_is_clean():
+    """The fix is not 'fewer adjectives' — it is naming a system, a scale and a failure mode."""
+    evidenced = ("Backend software engineer building distributed services in Go and Python. Cut "
+                 "invalid campaign submissions ~30% by modeling a dependency-heavy config flow as "
+                 "a state machine; traced a P99 tail-latency regression to a downstream timeout "
+                 "and fixed it with a tight timeout plus graceful degradation.")
+    score, flags = resume_score.summary_quality(evidenced, title="Sr. Software Engineer - Azure Storage")
+    assert score == 100 and flags == [], (score, flags)
+
+
+def test_absent_summary_is_neutral_not_zero():
+    """The base résumé carries no summary by design (it is a fact store; summaries are written
+    per-application). Scoring absence as 0 punished the base for a field it must not have —
+    and `parseability` already counts summary among its four required sections."""
+    assert resume_score.summary_quality(None) == (100, [])
+    assert resume_score.summary_quality("   ") == (100, [])
+
+
+def test_evidence_prompt_does_not_cry_wolf():
+    """Measured on the real corpus: an `ev < 2` trigger fired on 1722 of 3397 résumés, including
+    serviceable ones. A check that flags half the library gets ignored when it is right."""
+    thin_but_fine = ("Software engineer with 6+ years building and delivering production data and "
+                     "application systems end-to-end, from Python/Go backends and multi-step data "
+                     "pipelines to user-facing surfaces, shipping on CI/CD with product partners.")
+    _, flags = resume_score.summary_quality(thin_but_fine)
+    assert flags == [], flags        # one piece of evidence ("6+ years") is enough to stay quiet
+
+    # ...but a summary offering nothing checkable at all is still worth saying something about.
+    nothing = "Backend engineer proficient in Go, Python and SQL across AWS and GCP."
+    _, flags = resume_score.summary_quality(nothing)
+    assert any("operational evidence" in f for f in flags), flags
+
+
 def test_empty_jd_scores_the_prior_not_perfection():
     sc = _score("", "Software Engineer")
     assert sc.skills_coverage == 60         # (0 + k·p0) / (0 + k) = p0

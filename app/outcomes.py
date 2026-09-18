@@ -53,7 +53,7 @@ _NOT_A_RESPONSE = re.compile(
 
 # --- the company-level layer -----------------------------------------------------------------
 #
-# The patterns below are the same ones `app/company_board` and `tools/funnel_report` use to READ
+# The patterns below are the same ones `app/company_board` uses to READ
 # the mailbox; they live here because this is the module that WRITES, and an unattended writer
 # must not depend on a display module (company_board imports this file, not the other way
 # round). They are duplicated on purpose and the duplication is the bug risk — the two readers

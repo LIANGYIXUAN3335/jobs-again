@@ -1,8 +1,8 @@
-"""Outcome tracking: the schema migration, the monotonicity rules, and the funnel's refusal to
+"""Outcome tracking: the schema migration, the monotonicity rules, and the writer's refusal to
 report a rate it can't support."""
 import datetime
 
-from app import funnel, store
+from app import store
 from tests.test_store import role_row
 
 
@@ -77,30 +77,9 @@ def test_rejection_closes_the_row_and_counts_as_a_response(cfg):
     store.record_signal(conn, "gh:x:1", outcome="rejected")
     row = conn.execute("SELECT * FROM role_state WHERE job_id='gh:x:1'").fetchone()
     assert row["status"] == "rejected" and row["outcome"] == "rejected"
-    assert row["first_response_at"]              # a rejection IS a reply, and the funnel counts it
+    assert row["first_response_at"]              # a rejection IS a reply
 
 
-def test_funnel_holds_out_applications_too_young_to_judge(cfg):
-    conn = _applied(cfg, job_id="gh:x:1", days_ago=2)
-    rep = funnel.report(cfg, conn, ["score"])
-    assert rep["overall"]["applied"] == 1
-    assert rep["overall"]["mature"] == 0          # 2 days of silence means nothing
-    assert rep["overall"]["response_rate"] is None
-
-
-def test_funnel_refuses_to_call_a_trend_on_a_tiny_sample(cfg):
-    conn = _applied(cfg, job_id="gh:x:1", days_ago=60)
-    store.record_signal(conn, "gh:x:1", stage="interview")
-    rep = funnel.report(cfg, conn, ["score"])
-    assert rep["overall"]["responded"] == 1
-    assert rep["signal"]["verdict"] == "not enough data"
-    assert rep["by"]["score"][0]["enough"] is False
-
-
-def test_match_score_is_read_back_off_the_pdf_filename():
-    assert funnel._match_score("Casey Example - Stripe - Money [6176758] - 80.pdf") == 80
-    assert funnel._match_score("no score here.pdf") is None
-    assert funnel._match_score(None) is None
 
 
 # --- company-level attribution ---------------------------------------------------------------
@@ -108,7 +87,7 @@ def test_match_score_is_read_back_off_the_pdf_filename():
 # Every subject line below is a real one out of data/mail_label_scan.json. These are the cases
 # the old writer got wrong: it committed a signal only when the company had exactly one open
 # application, so at Nvidia (39), Mastercard (38), Anthropic (19) and Airbnb (12) it wrote
-# nothing at all and the funnel reported a response rate that was a property of the plumbing.
+# nothing at all, so the recorded response rate was a property of the plumbing.
 
 from app import outcomes                                            # noqa: E402
 from app import config as cfgmod                                    # noqa: E402
