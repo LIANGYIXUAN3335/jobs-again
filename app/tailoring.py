@@ -299,10 +299,25 @@ _ANGLE_HINTS = {
 }
 
 
+# Work-authorization boilerplate. Stripped BEFORE the payments match because "Green Card" is
+# the single biggest false trigger in the whole classifier: measured over 5,238 real JDs,
+# 91 contain "green card" and for 79 of them `card` was the ONLY payments term present — so
+# a routine visa clause was routing backend and AI-infra roles onto the payments track.
+# Caught 2026-08-12 on a "Senior/Staff Core Engineer — AI Agent Infrastructure" JD whose own
+# text says "RAG"; it still came out `payments`, because pay_terms runs first and wins.
+_WORK_AUTH_RE = re.compile(
+    r"\b(green[\s-]?card|permanent resident(?:\s+card)?|ead\s+card|"
+    r"citizen(?:ship)?\s+or\s+green[\s-]?card)\b")
+
+
 def suggest_angle(cfg: dict, role: dict) -> str:
     text = f"{role.get('title', '')} {role.get('jd_text', '')} {role.get('company', '')}".lower()
+    # Same fix as the 2026-08-10 `rag` one, applied to the list nobody re-checked: these were
+    # raw substrings, so "discard/wildcard/cards" hit `card`, "transactional" hit `transaction`,
+    # "moneyball" hit `money`. 96 of 5,238 JDs reached `payments` with no whole-word match at all.
+    pay_text = _WORK_AUTH_RE.sub(" ", text)
     pay_terms = ("payment", "fintech", "ledger", "billing", "money", "transaction", "card")
-    if any(t in text for t in pay_terms):
+    if any(re.search(rf"\b{t}s?\b", pay_text) for t in pay_terms):
         return "payments"
     # AI-native companies (R7): needs 2+ distinct model-layer terms so a JD that merely
     # name-drops "AI" once stays on the backend track.
