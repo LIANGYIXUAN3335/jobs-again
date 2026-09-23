@@ -19,17 +19,18 @@ from . import config as cfgmod
 from . import tailoring
 from . import trust
 
-# Questions the model must never answer — mirrors extension/content.js EXCLUDE, plus export-control.
-# No category is refused outright any more (owner's call, 2026-07-20: "just fill it, I review
-# before submitting"). What keeps answers honest is not a keyword blocklist but two things that
-# stay in force:
-#   • _SYSTEM's hard rule: ground every answer ONLY in the supplied facts, never invent.
-#   • _facts now carries the owner's own self-ID choices and work authorization, so demographic
-#     and eligibility questions are answered from what SHE recorded — including a deliberate
-#     "prefer not to answer" — instead of the model deciding anything.
-# A question with no supporting fact (criminal history, say) yields an empty answer and is left
-# blank for her, which is the desired behaviour rather than a guess.
-_NEVER = re.compile(r"(?!)")   # matches nothing
+# Questions the model must never answer — mirrors extension/content.js EXCLUDE, plus
+# export-control. These may be factual, but they are sensitive/legal/user-choice fields and the
+# owner must confirm them on the live form.
+_NEVER = re.compile(
+    r"gender|ethnic|hispanic|latin|\brace\b|racial|veteran|disab|pronoun|"
+    r"sexual orientation|lgbt|demographic|self.?identif|equal employment|\beeo\b|"
+    r"salary|compensation|desired pay|referr|referral|source of|how did you hear|"
+    r"sponsor|visa|authoriz|work permit|right to work|eligible to work|"
+    r"felony|conviction|criminal|background check|signature|sign your name|"
+    r"certif|attest|acknowledg|consent|privacy|terms|gdpr",
+    re.I,
+)
 
 _SYSTEM = """You are drafting job-application answers in the FIRST PERSON as the candidate, \
 Casey Example. Absolute rules:
@@ -432,10 +433,11 @@ def cover_letter(cfg: dict, role: dict, max_words: int = 180) -> str | None:
 
 
 def pick_option(cfg: dict, role: dict, question: str, options: list[str]) -> int:
-    """Choose the best option INDEX for a dropdown whose choices are full sentences (work
-    authorization, relocation/on-site, etc.), grounded in the candidate facts. Returns -1 when
-    none fit or the question is one she should answer herself. Used only as a fallback after the
-    deterministic rules miss — the options vary per company so they can't all be hard-coded."""
+    """Choose the best option INDEX for a non-sensitive dropdown whose choices are full
+    sentences, grounded in the candidate facts. Returns -1 when none fit or the question is one
+    she should answer herself."""
+    if _NEVER.search(question or "") or any(_NEVER.search(o or "") for o in options or []):
+        return -1
     key = load_key(cfg)
     if not key or not options:
         return -1
@@ -444,11 +446,11 @@ def pick_option(cfg: dict, role: dict, question: str, options: list[str]) -> int
     user = (
         f"Candidate facts:\n{_facts(cfg, role)}\n\n"
         f"Application question: {question}\n\nOptions:\n{numbered}\n\n"
-        "Pick the ONE option that is correct for this candidate given her facts (work "
-        "authorization, location, her stated self-ID choices). If she is authorized to work "
-        "with no sponsorship, choose the option that says so. If it's a relocation/on-site "
-        "question and she is in San Jose CA, prefer 'willing to relocate'. If no option fits, "
-        "or it's something only she can decide, answer -1.\n"
+        "Pick the ONE option that is correct for this candidate given her facts. Do not answer "
+        "work authorization, sponsorship, demographic/self-ID, salary, consent, attestation, "
+        "criminal-history, referral-source, or signature questions; answer -1 for those. If "
+        "it's a relocation/on-site question and she is in San Jose CA, prefer 'willing to "
+        "relocate'. If no option fits, or it's something only she can decide, answer -1.\n"
         "Reply with ONLY the option number (an integer), nothing else."
     )
     import anthropic

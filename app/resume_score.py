@@ -55,7 +55,10 @@ _HARD_SKILLS: dict[str, list[str]] = {
     "low latency": ["low latency", "low-latency"],
     "high availability": ["high availability", "high-availability"],
     "fault tolerance": ["fault tolerance", "fault-tolerant", "resilien", "survivab"],
-    "scalability": ["scalab", "scale", "large-scale", "large scale"],
+    # "scaling" needs its own variant: `scalab` doesn't reach it, and `scale` is 5 chars so it
+    # matches whole-word only (that short-token rule exists so "go" can't hit "google"). Without
+    # this, the most common JD phrasing — "scaling distributed systems" — scored zero. 2026-08-16.
+    "scalability": ["scalab", "scaling", "scale", "large-scale", "large scale"],
     "observability": ["observability", "observable"], "monitoring": ["monitoring", "monitor"],
     "Prometheus": ["prometheus"], "reliability": ["reliability", "reliable"],
     "event-driven": ["event-driven", "event driven"],
@@ -252,6 +255,16 @@ def _find(text: str, variants: list[str]) -> bool:
     for v in variants:
         if re.search(r"[\\()\[\].+]", v):        # regex-y variants used raw
             pat = v
+        elif len(v) >= 6 and v.endswith("e"):
+            # Prefix matching silently loses the -ing form of every e-final verb, because the
+            # e is dropped before the suffix: "secure" matches secured/secures but NOT
+            # securing; same for validate/validating, optimize/optimizing, migrate/migrating.
+            # Those are the most common résumé verbs, so a real, claimable keyword was
+            # invisible to the scorer. Add the -ing inflection explicitly rather than
+            # stripping the e and prefix-matching — "scale" → "scal" would swallow Scala.
+            # Found 2026-08-16 while tailoring: "securing user authentication" scored zero
+            # for `secure`, and rewording it to "secured with SSO" moved the score.
+            pat = r"\b(?:" + re.escape(v) + r"|" + re.escape(v[:-1]) + r"ing\b)"
         elif len(v) >= 6:                        # long stems match as a prefix:
             pat = r"\b" + re.escape(v)           # "scalab" → scalability/scalable, "monitor" → monitoring
         else:                                    # short tokens (go, c, sql, tls) stay whole-word

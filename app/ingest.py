@@ -83,6 +83,8 @@ def _scan_once(cfg: dict, seen: dict[str, float], force: bool = False,
                 msg = f"✓ {res['company']:<16} → {res['pdf']}"
                 if res["gaps"]:
                     msg += f"\n    gaps: {'; '.join(res['gaps'])}"
+                if res.get("review_prompt"):
+                    msg += f"\n    ⚑ review: {res['review_prompt']}"
                 print(msg)
             except tailoring.TailorError as exc:
                 print(f"✗ {yf.name}: {exc}")

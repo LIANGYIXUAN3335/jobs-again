@@ -59,7 +59,17 @@ _YEAR = re.compile(r"20\d{2}")
 _EDGE = re.compile(r"^[\s\-—–:,;.、]+|[\s\-—–:,;.、]+$")
 _WRAPS = (("(", ")"), ("（", "）"), ("[", "]"), ("【", "】"))
 
-_MARKER = re.compile(r'<!--\s*atoms-source\s+id="(?P<id>[^"]+)"')
+# `id="…"` is required in the pattern itself: `_atoms-coverage-triage.md` documents the marker
+# shape in prose (`<!-- atoms-source ... status="new" -->`) and a laxer regex read that sentence
+# as a real interview. 2026-08-16.
+_MARKER = re.compile(r'<!--\s*atoms-source\s+(?P<attrs>[^>]*?id="[^"]+"[^>]*?)-->')
+_ATTR = re.compile(r'(?P<k>[a-z_]+)="(?P<v>[^"]*)"')
+# A per-recap-file marker carries the heading fields the central files put in their `##` line:
+#   <!-- atoms-source id="2026-07-31-ford" added="…" status="new"
+#        company="Ford" date="2026-07-31" round="AI Role 技术筛选轮" -->
+# so one interview's file needs no machine-shaped heading of its own. 2026-08-16.
+_ACTION_H = re.compile(r"^#{2,3}\s*.*(行动项|行动清单|Action Items)")
+_AI_Q = re.compile(r"^\s*\[AI\]\s*")
 _CHECKBOX = re.compile(r"^\s*-\s*\[(?P<done>[ xX])\]\s*(?P<text>.+?)\s*$")
 _QUESTION = re.compile(r"^###\s*Q:\s*(?P<text>.+?)\s*$")
 
@@ -131,7 +141,9 @@ def _sections(text: str, src_file: str, kind: str, skipped: list | None = None) 
             continue
         m = _MARKER.search(line)
         if m:
-            cur["marker"] = m["id"].strip()
+            attrs = dict(_ATTR.findall(m["attrs"]))
+            if attrs.get("id"):
+                cur["marker"] = attrs["id"].strip()
             continue
         if kind == "action":
             c = _CHECKBOX.match(line)
@@ -155,8 +167,61 @@ def _sections(text: str, src_file: str, kind: str, skipped: list | None = None) 
     return out
 
 
+def _recap_sections(text: str, src_file: str, skipped: list | None = None) -> list[dict]:
+    """Parse ONE per-company recap file as a single interview section.
+
+    The central card-source files put company/date/round in a `## Company · Date · Round`
+    heading; a recap file is already about exactly one round, so the fields ride on its
+    marker instead and its own headings stay human (`## 一、当时问到的问题`).
+
+    Item kinds come from the line's shape, not the file it sits in — that is what lets one
+    file carry action items and questions at once:
+      `- [ ]` under a 行动项/行动清单 heading  -> action   (checkboxes elsewhere in the file,
+                                                 e.g. a `[确认]` list, are deliberately ignored)
+      `### Q:`                                -> tech_q, or ai_q when prefixed `[AI]`
+    """
+    m = _MARKER.search(text)
+    attrs = dict(_ATTR.findall(m["attrs"])) if m else {}
+    company, date = attrs.get("company", "").strip(), attrs.get("date", "").strip()
+    if not (attrs.get("id") and company and date):
+        if skipped is not None and m:
+            skipped.append({"file": src_file, "line": 1, "heading": src_file,
+                            "why": "复盘文件有 atoms-source 标记，但缺 company= 或 date= —— 整份被跳过"})
+        return []
+
+    sec = {"company": company, "date": date, "round": _tidy_round(attrs.get("round", "")),
+           "heading": attrs.get("round") or src_file, "line": 1,
+           "marker": attrs["id"].strip(), "items": [], "src_file": src_file, "kind": "recap"}
+    in_actions = False
+    for line in text.splitlines():
+        if line.startswith("#"):
+            in_actions = bool(_ACTION_H.match(line))
+        if in_actions:
+            c = _CHECKBOX.match(line)
+            if c:
+                sec["items"].append({"kind": "action", "text": c["text"],
+                                     "done": c["done"].lower() == "x", "src_file": src_file})
+                continue
+        q = _QUESTION.match(line)
+        if q:
+            t = q["text"]
+            kind = "ai_q" if _AI_Q.match(t) else "tech_q"
+            sec["items"].append({"kind": kind, "text": _AI_Q.sub("", t),
+                                 "done": 0, "src_file": src_file})
+    if skipped is not None and not sec["items"]:
+        skipped.append({"file": src_file, "line": 1, "heading": sec["heading"],
+                        "why": "复盘文件标记正常，但一条行动项/题目都没读到 —— 缺 `## 行动项` 节？"})
+    return [sec]
+
+
 def _files(cfg: dict) -> list[tuple[Path, str]]:
-    """(path, item-kind) for each card-source file that exists."""
+    """(path, item-kind) for each source that exists.
+
+    Two shapes are read, on purpose: the three central card-source files (legacy) and every
+    per-company recap file carrying an atoms-source marker (the direction of travel — one
+    interview, one file, per user 2026-08-16). Both are live during the migration; ingest()
+    dedupes items so a section present in both does not double up.
+    """
     iv = cfg.get("interviews") or {}
     base = Path(iv.get("dir") or (cfgmod.ROOT.parent / "面试复盘"))
     names = iv.get("files") or {
@@ -164,7 +229,19 @@ def _files(cfg: dict) -> list[tuple[Path, str]]:
         "tech_q": "Technical_Interview_Questions.md",
         "ai_q": "AI_Agent_Interview_Questions.md",
     }
-    return [(base / fname, kind) for kind, fname in names.items() if (base / fname).exists()]
+    central = {base / fname for fname in names.values()}
+    out = [(base / fname, kind) for kind, fname in names.items() if (base / fname).exists()]
+    for p in sorted(base.rglob("*.md")):
+        if p in central or "_archive" in p.parts or p.name == "README.md":
+            continue
+        try:
+            # A real marker, not the words "atoms-source" in prose — _atoms-coverage-triage.md
+            # talks *about* the markers and was getting picked up as an interview. 2026-08-16.
+            if _MARKER.search(p.read_text(encoding="utf-8")):
+                out.append((p, "recap"))
+        except OSError:
+            continue
+    return out
 
 
 # README.md is her hand-maintained master index: one line per interview with the local
@@ -232,13 +309,44 @@ def ingest(cfg: dict, conn, *, dry_run: bool = False) -> dict:
     skipped: list[dict] = []
     for path, kind in _files(cfg):
         text = path.read_text(encoding="utf-8")
-        for s in _sections(text, path.name, kind, skipped):
+        secs = (_recap_sections(text, path.name, skipped) if kind == "recap"
+                else _sections(text, path.name, kind, skipped))
+        for s in secs:
             g = merged.setdefault(s["marker"], {
                 "company": s["company"], "date": s["date"], "round": s["round"],
                 "sources": {}, "items": []})
             g["sources"][path.name] = s["heading"]
             g["round"] = g["round"] or s["round"]
             g["items"].extend(s["items"])
+
+    # Recap file wins outright. Migration *rewrites* each line ("准备 X" -> "念 X 卡 × 3 遍"),
+    # so text-equality dedupe cannot see that the two copies are the same task — Ford came out
+    # with 26 items where it has 13. Once an interview has a recap source, the central files
+    # are stale by definition for that id, so drop their items entirely. 2026-08-16.
+    # Precedence is per KIND, not per interview: action items migrate before questions do, so
+    # "recap wins outright" would silently drop the tech/AI questions that still live only in
+    # the central banks (Ford lost 18 of 26 items that way). A recap file only overrides the
+    # kinds it actually supplies.
+    central_names = {"Interview Action Items.md", "Technical_Interview_Questions.md",
+                     "AI_Agent_Interview_Questions.md"}
+    for marker, g in merged.items():
+        migrated = {i["kind"] for i in g["items"] if i["src_file"] not in central_names}
+        if migrated:
+            g["items"] = [i for i in g["items"]
+                          if i["src_file"] not in central_names or i["kind"] not in migrated]
+
+    # Belt and braces: within one source an item can still be listed twice. Key on (kind, text)
+    # and keep the first — a checked box in either place wins, so a migrated line is never
+    # resurrected as undone.
+    for g in merged.values():
+        seen: dict[tuple[str, str], dict] = {}
+        for it in g["items"]:
+            k = (it["kind"], it["text"].strip())
+            if k in seen:
+                seen[k]["done"] = seen[k]["done"] or it["done"]
+            else:
+                seen[k] = it
+        g["items"] = list(seen.values())
 
     iv = cfg.get("interviews") or {}
     base = Path(iv.get("dir") or (cfgmod.ROOT.parent / "面试复盘"))

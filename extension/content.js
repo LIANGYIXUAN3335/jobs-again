@@ -100,9 +100,8 @@
     ["country", /\bcountry\b/],
   ];
 
-  // NEVER auto-fill sensitive / voluntary fields — the user handles these by hand.
-  // ("how did you hear" is deliberately NOT here — it's answered as LinkedIn by commonAnswer.)
-  const EXCLUDE = /gender|ethnic|hispanic|latin|\brace\b|racial|veteran|disab|pronoun|sexual orientation|lgbt|demographic|self.?identif|equal employment|\beeo\b|salary|compensation|desired pay|referr|sponsor|visa|authoriz|felony|conviction|background check/;
+  // NEVER auto-fill sensitive, legal, voluntary, or user-choice fields.
+  const EXCLUDE = /gender|ethnic|hispanic|latin|\brace\b|racial|veteran|disab|pronoun|sexual orientation|lgbt|demographic|self.?identif|equal employment|\beeo\b|salary|compensation|desired pay|referr|referral|source of|how did you hear|sponsor|visa|authoriz|work permit|right to work|eligible to work|felony|conviction|criminal|background check|signature|sign your name|certif|attest|acknowledg|consent|privacy|terms|gdpr/i;
 
   function classify(el) {
     const t = fieldText(el);
@@ -167,16 +166,16 @@
     return false;
   }
 
-  // ---- common eligibility / logistics answers (deterministic, from the profile) ----
-  // Unlike EEO/demographic questions (which stay the user's to answer), these are factual
-  // questions we CAN answer for her — work authorization, sponsorship, residency, onsite/
-  // remote/relocate, "have you worked here before". Answered without the LLM: fast + correct.
+  // ---- common logistics answers (deterministic, from the profile) ----
+  // Sensitive/legal/user-choice questions return null above and stay manual. This block only
+  // handles lower-risk logistics like residency/location, onsite/remote/relocate, and
+  // "have you worked here before".
   const clean = (s) => (s || "").replace(/\s+/g, " ").trim().slice(0, 300);
   const short = (s) => clean(s).slice(0, 52);
 
-  // Fields that must NEVER be auto-answered — demographics, comp, criminal history. (Work
-  // authorization / sponsorship are deliberately NOT here: those we answer from the profile.)
-  const SENSITIVE = /gender|ethnic|hispanic|latin|\brace\b|racial|veteran|disab|pronoun|sexual orientation|lgbt|demographic|self.?identif|equal employment|\beeo\b|salary|compensation|desired pay|felony|conviction|criminal|background check|referr/i;
+  // Fields that must NEVER be auto-answered. They may be factual, but the candidate should
+  // confirm them on the live form because they are sensitive, legal, voluntary, or irreversible.
+  const SENSITIVE = EXCLUDE;
 
   function fullLoc(p) {
     const city = ((p.location || "").split(",")[0] || "San Jose").trim();
@@ -188,14 +187,7 @@
   function commonAnswer(label, profile) {
     const t = clean(label).toLowerCase();
     if (!t) return null;
-    // WORK AUTHORIZATION & SPONSORSHIP are ALWAYS eligibility toggles — decide them BEFORE the
-    // essay/length guard below can nuke a long-worded one (the box text on Workday runs past 120
-    // chars, which used to fall through to a default that answered authorization as "No"). She IS
-    // authorized (EAD/AOS) and needs NO sponsorship. Authorization is checked first, so a combined
-    // "authorized to work WITHOUT sponsorship?" reads correctly as Yes.
-    if (/authori[sz]ed to work|authori[sz]ation to work|legally (authorized|allowed|entitled|eligible)\b.{0,20}\bwork|(right|eligible|permitted|permission) to work|work authoriz/.test(t))
-      return { yesno: "yes" };
-    if (/\bsponsor/.test(t)) return { yesno: "no" };
+    if (SENSITIVE.test(t)) return null;
     // OPEN-ENDED essay questions must NEVER get a Yes/No or canned value — they go to the AI.
     // "Tell us about your experience working remote…" contains "remote", which used to trigger a
     // stray "Yes". A prompt that asks you to narrate is not an eligibility toggle.
@@ -214,16 +206,9 @@
     // Don't let them contact the CURRENT employer (job-search confidentiality) — a past/previous
     // employer is fine. "may we contact your current employer / present employer" → No.
     if (/(may we |can we |okay to )?contact.{0,30}(current|present)\s*employer|current employer.{0,20}contact/.test(t)) return NO;
-    // Order matters: a question can mention BOTH "authorized" and "sponsor" ("are you authorized
-    // to work WITHOUT sponsorship?" → Yes). Decide the specific "do you NEED sponsorship?" case
-    // first (No), THEN "are you authorized?" (Yes), and only a bare stray "sponsor" falls to No.
-    if (/(require|need|request|seek).{0,25}sponsor|sponsor.{0,20}(require|need)|will you (now|ever|in the future).{0,30}sponsor/.test(t)) return NO;
-    if (/authori[sz]|legally (allowed|entitled|eligible|authorized)|eligible to work|right to work|permitted to work|work permit|legally.*work/.test(t)) return YES;
-    if (/\bspons/.test(t)) return NO;                                       // any other sponsorship mention → No
     if (/(ever|previously|before|prior|former|formerly).{0,40}(employ|work)/.test(t) || /(employ|work(ed)?)\b.{0,25}(for us|by us|here before|at (this|our) (compan|organi)|our compan|current or former)/.test(t) || /current or former (employee|worker|contractor)/.test(t)) return NO;
     // Employed by / affiliated with a university, government, or public-sector entity → No (none
-    // of these apply to her; this is the standard screening answer). Guarded so it never steps on
-    // a work-authorization or "United States" phrasing.
+    // of these apply to her; this is the standard screening answer).
     if ((/(employ\w*|work\w*|affiliat\w*|officer|official|contractor)\b.{0,45}(universit|college|government|federal|state agenc|state government|public sector|public office|regulatory)/.test(t)
          || /\b(government|public)\s+(official|employee|officer|entity|agenc)/.test(t)) && !/authori[sz]|united states/.test(t)) return NO;
     // Citizenship / residency in an export-controlled or sanctioned country → No.
@@ -482,28 +467,10 @@
   }
 
   async function fillDemographics(prefs, log) {
-    prefs = prefs || {};
-    let acted = false;
-    let did = 0;                    // count for untilSettled — some forms reveal race only
-    const seen = new Set();         // after Hispanic/Latino is answered
-    did += fillEeoRadios(prefs, log);   // radio-based EEO (Ashby et al.) — combobox EEO below
-    for (const input of document.querySelectorAll("input[role=combobox]")) {
-      const label = comboLabel(input);
-      if (!label || !DEMOGRAPHIC.test(label) || seen.has(label)) continue;
-      seen.add(label);
-      const key = eeoKey(label);
-      const wanted = key && prefs[key] != null ? String(prefs[key]).trim() : "";  // "" → decline
-      const control = input.closest('[class*="control"]') || input.parentElement;
-      if (!control) continue;
-      if (acted) await humanPause();                             // pace + let react settle between fields
-      acted = true;
-      const r = await selectEeoOption(control, input, wanted);
-      if (r.ok) did++;
-      log(r.ok ? `${short(label)} → ${short(r.picked)}` : `${short(label)} — set manually`, r.ok ? "good" : "warn");
-    }
-    // every consent / agreement box on the page (demographic consent, terms, privacy…)
-    did += tickConsents(log);
-    return did;
+    const hasDemo = [...document.querySelectorAll("input[role=combobox],input[type=radio]")]
+      .some((el) => DEMOGRAPHIC.test(comboLabel(el) || controlLabel(el) || fieldText(el)));
+    if (hasDemo) log("self-ID / demographic questions left for your confirmation", "warn");
+    return 0;
   }
 
   // Deterministic pass over selects / radio groups / custom dropdowns / value text-fields.
@@ -1117,9 +1084,8 @@
 
   // SmartRecruiters page 2 — "Preliminary questions" (/screening). Each question is an
   // <sr-question-field-radio> (spl-radio options, selected via .click()) or
-  // <sr-question-field-select> (an spl-select combobox, driven by srPickSelect). Demographic
-  // questions (gender/race/disability/veteran) follow the owner's eeo config: decline unless a
-  // concrete answer was chosen. Signature/date attestation fields are filled from the profile.
+  // <sr-question-field-select> (an spl-select combobox, driven by srPickSelect). Sensitive,
+  // legal, voluntary, and attestation fields are logged for manual confirmation.
   async function fillSmartRecruitersScreening(role, log) {
     const eeo = role.eeo || {};
     const declineRe = /prefer not|don'?t wish|do(es)? not (want|wish)|decline|no answer/i;
@@ -1133,6 +1099,7 @@
       const radios = deepAll("spl-radio", w);
       if (!radios.length || radios.some((r) => r.getAttribute("aria-checked") === "true")) continue;
       const t = q.toLowerCase();
+      if (SENSITIVE.test(t)) { log("manual confirmation needed: " + q.slice(0, 42), "warn"); continue; }
       let wantRe = null;
       if (/legally authorized to work/.test(t)) wantRe = /^yes/i;
       else if (/visa sponsorship|require .*sponsor/.test(t)) wantRe = /^no/i;
@@ -1152,6 +1119,7 @@
       if ((cb.value || "").trim() && !/^select/i.test(cb.value)) continue;   // already answered
       const label = srComboLabel(cb).toLowerCase();
       const ph = (cb.placeholder || "").toLowerCase();
+      if (SENSITIVE.test(label) || SENSITIVE.test(ph)) { log("manual confirmation needed: " + (label || ph).slice(0, 40), "warn"); continue; }
       let want = null, seeds = null;
       if (/_gender/.test(cb.id) || /gender/.test(ph) || /gender/.test(label)) { if (wantsDecline(eeo.gender)) { want = declineRe; seeds = ["P", "D", "I"]; } }
       else if (/_ethnicity/.test(cb.id) || /race|ethnic/.test(ph) || /race|ethnic/.test(label)) { if (wantsDecline(eeo.race)) { want = declineRe; seeds = ["P", "D", "I"]; } }
@@ -1171,6 +1139,7 @@
       const q = (w.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
       const inp = deepAll("input, textarea", w).find((x) => x.getAttribute("role") !== "combobox");
       if (!inp || (inp.value || "").trim()) continue;
+      if (SENSITIVE.test(q)) { log("manual confirmation needed: " + q.slice(0, 42), "warn"); continue; }
       if (/signature/.test(q)) {
         const nm = ((role.profile || {}).preferred_name || (role.profile || {}).first_name || "") + " " + ((role.profile || {}).last_name || "");
         if (srNativeSet(inp, nm.trim())) { n++; log("signed: " + nm.trim(), "good"); }
@@ -1300,21 +1269,16 @@
   const CONSENT_RE = /consent|acknowledg|i agree|i accept|i certify|i confirm|i have read|terms|privacy|gdpr|understand and agree|authoriz/i;
 
   function tickConsents(log) {
-    let n = 0;
-    for (const c of document.querySelectorAll('input[type=checkbox]')) {
-      if (c.disabled || c.checked || !c.offsetParent) continue;
-      const group = c.closest('fieldset,[role=group],[data-automation-id*="CheckboxGroup"]');
-      if (group && group.querySelectorAll('input[type=checkbox]').length > 1) continue;   // an answer
+    const hasConsent = [...document.querySelectorAll('input[type=checkbox]')].some((c) => {
+      if (c.disabled || c.checked || !c.offsetParent) return false;
       let t = `${c.name || ""} ${c.id || ""}`;
       if (c.id) { const l = document.querySelector(`label[for="${CSS.escape(c.id)}"]`); if (l) t += " " + l.innerText; }
       let p = c;
       for (let i = 0; i < 4 && p; i++, p = p.parentElement) t += " " + (p.innerText || "");
-      if (!CONSENT_RE.test(t)) continue;
-      c.click();
-      if (c.checked) n++;
-    }
-    if (n) log(`checked ${n} consent box(es)`, "good");
-    return n;
+      return CONSENT_RE.test(t);
+    });
+    if (hasConsent) log("consent / acknowledgement checkbox left for your confirmation", "warn");
+    return 0;
   }
 
   function wdBlur() {                                  // rule 1 — never leave a prompt open
@@ -1758,16 +1722,11 @@
   }
 
   async function wdQuestions(role, log) {
-    // Owner's rule: EVERY required question must get an answer, aimed at getting the interview.
-    // Two passes: (1) specific eligibility/conflict phrasings, matched on the LEADING Yes/No (not
-    // an exact "Yes"/"No" — NVIDIA words options as full sentences like "Yes, I am authorized to
-    // work for any employer"); (2) a sweep over EVERY remaining "Select One" so nothing is blank.
+    // Fill only non-sensitive required questions. Sensitive/legal/user-choice questions are
+    // skipped and logged for manual confirmation.
     const YES = /^\s*yes\b/i, NO = /^\s*no\b/i;
     const profile = role.profile || {};
     const rules = [
-      // authorization MUST come before sponsorship: a combined "authorized to work WITHOUT
-      // sponsorship?" then correctly resolves to Yes (she is authorized), and once answered that
-      // box is no longer "select one" so the sponsorship rule can't re-touch it.
       [/authori[sz]ed to work|authori[sz]ation to work|legally (authorized|allowed|entitled|eligible)\b.{0,20}\bwork|(right|eligible|permitted|permission) to work|work authoriz/i, YES, "work authorized → Yes"],
       [/\bsponsor/i, NO, "sponsorship → No"],
       [/restrictive covenant|non-compete|non-disclosure/i, NO, "restrictive covenant → No"],
@@ -1783,16 +1742,18 @@
       let box, guard = 0;
       // some pages repeat the same shape several times — answer every match
       while ((box = wdBoxes().find((b) => q.test(b.innerText) && /select one/i.test(b.innerText))) && guard++ < 12) {
+        if (SENSITIVE.test(box.innerText)) {
+          log("manual confirmation needed: " + short(clean(box.innerText)), "warn");
+          break;
+        }
         const r = await wdPrompt(new RegExp(escapeRe(box.innerText.slice(0, 40))), want);
         if (r !== "ok") { log(name + " — pick manually", "warn"); break; }
         log("answered: " + name, "good");
       }
     }
 
-    // Pass 2 — the catch-all so NO required Select-One is left blank. commonAnswer handles most;
-    // an unrecognized REQUIRED one still gets a favorable default (acknowledgement/eligibility →
-    // Yes, otherwise the safe No) and is flagged for you to double-check. Demographics are skipped
-    // (wdSelfIdentify owns those); an unrecognized OPTIONAL question is left alone.
+    // Pass 2 — catch-all for non-sensitive required Select-One fields. An unrecognized OPTIONAL
+    // question is left alone.
     for (const box of wdBoxes().filter((b) => /select one/i.test(b.innerText))) {
       const q = clean(box.innerText).replace(/\bselect one\b\s*\*?/i, "").trim();
       if (SENSITIVE.test(q)) continue;
@@ -1801,17 +1762,10 @@
       if (ca && ca.yesno) want = ca.yesno === "yes" ? YES : NO;
       else if (ca && (ca.choice || ca.text)) want = new RegExp("^\\s*" + escapeRe(ca.choice || ca.text), "i");
       if (!want) {
-        // belt-and-suspenders for the two that MUST be right: authorization → Yes, sponsorship →
-        // No, even if commonAnswer somehow missed (auth checked first for the combined phrasing).
-        const ql = q.toLowerCase();
-        if (/authori[sz]ed to work|(right|eligible|permitted) to work|legally\b.{0,15}\bwork|work authoriz/.test(ql)) want = YES;
-        else if (/\bsponsor/.test(ql)) want = NO;
-        else {
-          const required = /\*/.test(box.innerText) || /\brequired\b/i.test(box.innerText);
-          if (!required) continue;
-          want = /\b(willing|able|agree|acknowledg|consent|accept|confirm|certif|available|eligible|comply|comfortable|understand)\b/i.test(q) ? YES : NO;
-          note = " (defaulted — please verify)";
-        }
+        const required = /\*/.test(box.innerText) || /\brequired\b/i.test(box.innerText);
+        if (!required) continue;
+        want = /\b(willing|able|available|comply|comfortable)\b/i.test(q) ? YES : NO;
+        note = " (defaulted — please verify)";
       }
       const r = await wdPrompt(new RegExp(escapeRe(box.innerText.slice(0, 40))), want);
       if (r === "ok") log("answered: " + short(q) + note, note ? "warn" : "good");
@@ -1865,12 +1819,7 @@
     if (!el || (el.value || "").trim()) return;
     const required = /\*/.test(box.innerText) || el.getAttribute("aria-required") === "true" || el.required;
     if (!required) { log("Desired Salary is optional — left blank", "good"); return; }
-    const r = await send({ type: "salary", jobId: role.job_id });
-    if (isContextDead(r)) { log("JobScan was reloaded — refresh this page (⌘R), then click Fill again.", "warn"); return; }
-    if (!r || !r.ok || !r.amount) { log("Desired Salary — couldn't determine a figure, fill it yourself", "warn"); return; }
-    const shown = "$" + Number(r.amount).toLocaleString();
-    if (wdSetText(el, String(r.amount))) log(`Desired Salary ${shown} — ${r.source}`, "good");
-    else log(`Desired Salary: type ${shown} yourself (${r.source}) — this box rejects scripted input`, "warn");
+    log("Desired Salary is required — fill it yourself after confirming the number", "warn");
   }
 
   // Signature / "type your name" boxes — the CC-305 form, e-signature panels, and the final
@@ -1887,68 +1836,14 @@
       if (/company|school|employer|university|contact name|reference/i.test(t)) continue;   // not a signature
       const el = box.querySelector('input[type=text],input:not([type]),textarea');
       if (!el || (el.value || "").trim() || isDropdownish(el)) continue;
-      if (wdSetText(el, legalFull)) { n++; log("signature name: " + legalFull, "good"); }
-      else log("signature name — type “" + legalFull + "” yourself", "warn");
+      log("signature / legal attestation left for you to type: " + legalFull, "warn");
     }
     return n;
   }
 
   async function wdSelfIdentify(profile, eeo, log) {
-    let did = 0;                                   // how many fields this pass actually changed
-    const decline = /prefer not|don'?t wish|do not wish|decline|not to self.?identify|do not want to answer/i;
-    const want = (key, fallback) => {
-      const v = (eeo || {})[key];
-      if (!v || decline.test(v)) return decline;
-      const yn = /^(yes|no)\b/i.exec(v.trim());
-      return yn ? new RegExp("^\\s*" + yn[1], "i") : new RegExp(escapeRe(v), "i");
-    };
-    for (const [q, w, name] of [
-      [/what is your gender/i, want("gender"), "Gender"],
-      [/hispanic or latino/i, want("hispanic_latino"), "Hispanic/Latino"],
-      [/served in the military|veteran/i, /^i am not a veteran$|not a protected veteran/i, "Veteran"],
-    ]) {
-      const r = await wdPrompt(q, w);
-      if (r === "ok") { did++; log("self-ID: " + name, "good"); }
-      else if (r === "no-option") log(name + " — pick manually", "warn");
-    }
-    // Race/ethnicity: a checkbox GROUP on Workday, and on many forms it only APPEARS once
-    // "Hispanic or Latino?" is answered — untilSettled() re-runs us so we catch it then.
-    const fs = document.querySelector('[data-automation-id="ethnicityMulti-CheckboxGroup"]');
-    if (fs) {
-      const boxes = [...fs.querySelectorAll("input[type=checkbox]")];
-      const eth = (eeo || {}).race;
-      const re = !eth || decline.test(eth) ? decline : new RegExp(escapeRe(eth), "i");
-      const hit = boxes.find((c) => re.test(labelFor(c)));
-      if (hit && !hit.checked) { hit.scrollIntoView({ block: "center" }); hit.click(); did++; log("self-ID: Ethnicity", "good"); }
-    } else if (!wdBox(/ethnicity|\brace\b/i)) {
-      // not on the page (yet) — a later pass will pick it up if answering Hispanic reveals it
-    }
-    // a plain prompt-style race question (some tenants use a dropdown, not a checkbox group)
-    const raceBox = wdBox(/what is your (race|ethnicity)/i);
-    if (raceBox && /select one/i.test(raceBox.innerText)) {
-      const eth = (eeo || {}).race;
-      const w = !eth || decline.test(eth) ? decline : new RegExp(escapeRe(eth), "i");
-      if (await wdPrompt(/what is your (race|ethnicity)/i, w) === "ok") { did++; log("self-ID: Race", "good"); }
-    }
-    // CC-305 disability form: choice + signature name + today's date
-    const dis = wdBoxes().find((b) => /check one of the boxes/i.test(b.innerText));
-    if (dis) {
-      const v = (eeo || {}).disability || "";
-      const re = /^no\b/i.test(v) ? /^no, i do not have a disability/i : decline.test(v) ? /do not want to answer/i : /^no, i do not have a disability/i;
-      const hit = [...dis.querySelectorAll("input[type=checkbox]")].find((c) => re.test(labelFor(c)));
-      if (hit && !hit.checked) { hit.scrollIntoView({ block: "center" }); hit.click(); did++; log("self-ID: Disability", "good"); }
-    }
-    if (wdSignName(profile, log)) did++;
-    const now = new Date();
-    if (wdById("SignedOn-dateSectionMonth-input")) {
-      await wdDate("SignedOn", {
-        Month: String(now.getMonth() + 1).padStart(2, "0"),
-        Day: String(now.getDate()).padStart(2, "0"),
-        Year: String(now.getFullYear()),
-      });
-    }
-    did += tickConsents(log);          // every consent/acknowledgement box on this page
-    return did;
+    log("self-ID / voluntary disclosure step left for your confirmation", "warn");
+    return 0;
   }
 
   // Every unresolved validation error on the page, each tied to the field it belongs to. This

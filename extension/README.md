@@ -1,10 +1,12 @@
 # JobScan Apply Helper (browser extension)
 
-Pre-fills **Greenhouse / Lever / Ashby** application forms with your profile + the tailored
-résumé PDF from your local JobScan, then **stops before submit** — you review and submit
-yourself. After you submit, one click marks the role `applied` (closing the dedup loop).
+Pre-fills **Greenhouse / Lever / Ashby** application forms with low-risk profile fields +
+the tailored résumé PDF from your local JobScan, then **stops before submit** — you review
+and submit yourself. After you submit, one click marks the role `applied` (closing the
+dedup loop).
 
-No LLM, no API key, no model — plain local JS talking to your local JobScan API.
+Optional AI drafting can fill editable open-ended prose questions when enabled in the local
+server. Sensitive/legal/user-choice fields stay manual.
 
 ## Install (Chrome, unpacked)
 
@@ -19,7 +21,8 @@ No LLM, no API key, no model — plain local JS talking to your local JobScan AP
 2. On the application page a floating **JobScan** panel appears (bottom-right) if the page
    matches a role in your DB. It shows the role and whether a tailored PDF is ready.
 3. Click **Fill this application** — it fills name/email/phone/LinkedIn/GitHub/location and
-   attaches the tailored PDF to the résumé field. It logs what it filled and what it left.
+   attaches the tailored PDF to the résumé field. It logs what it filled and what needs your
+   confirmation.
 4. **Review everything, fix the rest, and submit yourself.**
 5. Click **✓ I submitted this** → the role is marked `applied` in JobScan with the résumé
    variant used, so it never resurfaces in your review list.
@@ -27,8 +30,10 @@ No LLM, no API key, no model — plain local JS talking to your local JobScan AP
 ## What it deliberately does NOT do
 
 - **Never submits.** ToS, anti-bot, and accuracy all need a human — you click submit.
-- **Never fills sensitive/voluntary fields**: gender, ethnicity, veteran, disability,
-  work-authorization/visa, salary, "how did you hear". Those are yours to answer.
+- **Never fills sensitive/legal/user-choice fields**: gender, ethnicity, veteran,
+  disability, work authorization, sponsorship/visa, salary, referral/source, criminal or
+  background-check questions, consent, certification, attestation, signature, or submission.
+  Those are yours to answer.
 - **Only fills empty fields** — it won't overwrite anything you already typed.
 - Custom / multi-step forms may only partly fill. It fills what it can and lists the rest.
   Positioning: "~90% filled, you finish + submit," not auto-apply.
