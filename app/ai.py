@@ -15,6 +15,7 @@ import re
 
 import yaml
 
+from . import answer_log
 from . import config as cfgmod
 from . import tailoring
 from . import trust
@@ -71,8 +72,59 @@ credentials you don't have; stay truthful and general rather than leaving it bla
 - ONLY return an empty string for a legal / eligibility / demographic question (work \
 authorization, sponsorship, veteran / disability / race / gender, salary, criminal history, \
 U.S.-person status) — those are the candidate's to answer herself.
+- If a question asks the applicant to PERFORM an external action right now — call an API \
+endpoint and paste the output, run code and report the result, complete a puzzle/challenge/\
+assessment, record a video, attach or create a file — you cannot do that for her. Do NOT \
+fabricate a result and NEVER write that you are unable to do it (that text would be submitted \
+on the form). Return exactly the string "[NEEDS_HUMAN]" for that question so the field is \
+left blank for the candidate to complete herself.
 Return ONLY a JSON object mapping each question's number (as a string) to the answer string.
 """ + trust.RULE
+
+
+# Deterministic post-generation rejects (2026-08-20). Peer finding from sdh's 26-report defect
+# ledger: a rule the model must obey but keeps ignoring ("never say you're an AI") is useless as
+# a prompt soft-constraint — if it can be written as a no-model assertion, it should BE one.
+# Any match → the answer is dropped and the field left blank for the candidate; a blank field is
+# always recoverable, "As an AI language model…" on a submitted form is not. Quality concerns
+# (voice, filler words, relevance) stay with the critic + lessons loop — this list is only for
+# text that must never reach a form, regardless of how well it's written.
+_REJECT = [
+    ("ai_disclosure", re.compile(
+        r"\bas an AI\b|\bas a language model\b|\bAI (?:language )?model\b|\bI am an AI\b", re.I)),
+    # refusal of an ACTION the form asked for — verbs kept specific so a legitimate
+    # "I'm unable to relocate before June" style answer never trips it
+    ("refusal", re.compile(
+        r"\bI(?:'m| am) (?:not able|unable) to (?:call|access|run|execute|make|perform|browse|"
+        r"visit|open|complete|fetch|click|submit)\b|"
+        r"\bI (?:can(?:'t|not)|don'?t have the ability to) (?:call|access|run|execute|make|"
+        r"perform|browse|visit|open|complete|fetch|click|submit)\b|"
+        r"\bI don'?t have access to\b", re.I)),
+    ("placeholder", re.compile(r"\[[^\]]{0,40}\]|\{\{[^}]*\}\}|\bTODO\b|lorem ipsum", re.I)),
+]
+
+
+def _hard_reject(text: str) -> str | None:
+    """Reason string if `text` must never be typed onto a form, else None."""
+    for reason, rx in _REJECT:
+        if rx.search(text or ""):
+            return reason
+    return None
+
+
+def _lessons() -> str:
+    """Rules distilled from past answer evals (tools/answer_eval.py writes them to
+    data/answer_lessons.md, the owner can edit/delete lines freely). Appended to the system
+    prompt so a recurring mistake stops recurring. Best-effort and capped, so a malformed or
+    runaway file can never crowd out the base rules or break filling."""
+    try:
+        p = cfgmod.resolve_path("data/answer_lessons.md")
+        t = p.read_text(encoding="utf-8").strip() if p.exists() else ""
+        if not t:
+            return ""
+        return "\n\nLessons from human/automated review of past answers — follow these too:\n" + t[:2000]
+    except Exception:
+        return ""
 
 
 def load_key(cfg: dict) -> str | None:
@@ -159,6 +211,9 @@ def answer_questions(cfg: dict, role: dict, questions: list[str]) -> dict[str, s
     if not key:
         raise RuntimeError("no Anthropic API key (set secrets.yaml or ANTHROPIC_API_KEY)")
     todo = [(i, q) for i, q in enumerate(questions) if q and q.strip() and not _NEVER.search(q)]
+    for q in questions:
+        if q and q.strip() and _NEVER.search(q):
+            answer_log.log("unanswered", role, question=q.strip(), reason="never_filter")
     if not todo:
         return {}
     ai = cfg.get("ai") or {}
@@ -175,6 +230,8 @@ def answer_questions(cfg: dict, role: dict, questions: list[str]) -> dict[str, s
     )
     import anthropic
     client = anthropic.Anthropic(api_key=key)
+    needs_human: set[str] = set()   # questions the model flagged as "only a human can do this"
+    rejected: dict[str, str] = {}   # answers killed by the deterministic validator, by reason
 
     def _gen(extra: str) -> dict[str, str]:
         resp = client.messages.create(
@@ -182,7 +239,7 @@ def answer_questions(cfg: dict, role: dict, questions: list[str]) -> dict[str, s
             max_tokens=2500,
             thinking={"type": "adaptive"},
             output_config={"effort": ai.get("effort", "high")},
-            system=_SYSTEM,
+            system=_SYSTEM + _lessons(),
             messages=[{"role": "user", "content": base_user + extra}],
         )
         text = "".join(b.text for b in resp.content if b.type == "text")
@@ -190,8 +247,36 @@ def answer_questions(cfg: dict, role: dict, questions: list[str]) -> dict[str, s
         out: dict[str, str] = {}
         for i, q in todo:
             a = data.get(str(i)) or data.get(i) or ""
-            if isinstance(a, str) and a.strip():
-                out[q] = a.strip()
+            if not isinstance(a, str) or not a.strip():
+                continue
+            # "call this API and paste the output"-style questions: leave the field for the
+            # candidate rather than submit "I can't do that" (which once went onto a real form).
+            if "NEEDS_HUMAN" in a:
+                needs_human.add(q)
+                continue
+            bad = _hard_reject(a)
+            if bad:
+                rejected[q] = bad
+                continue
+            out[q] = a.strip()
+        return out
+
+    def _finish(out: dict[str, str], tries_used: int, verdict: dict | None) -> dict[str, str]:
+        """Single exit: persist every outcome (answered / needs-human / declined) then return."""
+        for q, a in out.items():
+            answer_log.log("answer", role, question=q.strip(), answer=a,
+                           model=ai.get("model"), effort=ai.get("effort"), tries=tries_used,
+                           critic_pass=None if verdict is None else bool(verdict.get("pass")),
+                           critic_issues=None if verdict is None else verdict.get("issues"))
+        for q in needs_human:
+            answer_log.log("unanswered", role, question=q.strip(), reason="needs_human")
+        for q, why in rejected.items():
+            if q not in out and q not in needs_human:
+                answer_log.log("unanswered", role, question=q.strip(),
+                               reason=f"validator_{why}")
+        for _, q in todo:
+            if q not in out and q not in needs_human and q not in rejected:
+                answer_log.log("unanswered", role, question=q.strip(), reason="model_declined")
         return out
 
     # generate → critique the NARRATIVE answers as a block → rewrite if they read like AI.
@@ -199,22 +284,24 @@ def answer_questions(cfg: dict, role: dict, questions: list[str]) -> dict[str, s
     ctx = (f"Role: {role['company']} — {role['title']}. These are answers to open-ended "
            "application questions; judge the multi-sentence ones for human voice.")
     tries = max(1, int(ai.get("quality_max_tries", 3)))
-    best, best_issues, extra = {}, 1 << 30, ""
+    best, best_issues, best_verdict, extra = {}, 1 << 30, None, ""
+    used = 0
     for _ in range(tries):
+        used += 1
         out = _gen(extra)
         if not out:
             break
         block = "\n\n".join(f"Q: {q}\nA: {a}" for q, a in out.items()
                             if len(a.split()) >= 12)          # only judge real prose
         if not block:
-            return out                                        # all short/factual — accept as-is
+            return _finish(out, used, None)                   # all short/factual — accept as-is
         verdict = _critique(cfg, block, facts, ctx)
         if len(verdict["issues"]) < best_issues:
-            best, best_issues = out, len(verdict["issues"])
+            best, best_issues, best_verdict = out, len(verdict["issues"]), verdict
         if verdict["pass"]:
-            return out
+            return _finish(out, used, verdict)
         extra = _revise_note(block, verdict)
-    return best
+    return _finish(best, used, best_verdict)
 
 
 def estimate_salary(cfg: dict, role: dict) -> int | None:
@@ -252,7 +339,9 @@ def estimate_salary(cfg: dict, role: dict) -> int | None:
     if not m:
         return None
     n = int(m.group(1))
-    return n if 40_000 <= n <= 900_000 else None
+    ok = 40_000 <= n <= 900_000
+    answer_log.log("salary", role, answer=(n if ok else None), raw=n, model=ai.get("model"))
+    return n if ok else None
 
 
 # Voice rules lifted from the cover-letter skill (~/.claude/skills/cover-letter/SKILL.md) so
@@ -411,25 +500,44 @@ def cover_letter(cfg: dict, role: dict, max_words: int = 180) -> str | None:
             max_tokens=1500,
             thinking={"type": "adaptive"},
             output_config={"effort": ai.get("effort", "high")},
-            system=_LETTER_SYSTEM,
+            system=_LETTER_SYSTEM + _lessons(),
             messages=[{"role": "user", "content": base_user + extra}],
         )
         return "".join(b.text for b in resp.content if b.type == "text").strip()
 
+    def _finish(text: str | None, tries_used: int, verdict: dict | None) -> str | None:
+        if text:
+            answer_log.log("cover_letter", role, answer=text,
+                           model=ai.get("model"), effort=ai.get("effort"), tries=tries_used,
+                           critic_pass=None if verdict is None else bool(verdict.get("pass")),
+                           critic_issues=None if verdict is None else verdict.get("issues"))
+        return text
+
     ctx = f"Company: {role.get('company')} — Role: {role.get('title')} (a short cover-letter note)."
     tries = max(1, int(ai.get("quality_max_tries", 3)))
-    best, best_issues, extra = None, 1 << 30, ""
+    best, best_issues, best_verdict, extra = None, 1 << 30, None, ""
+    used = 0
     for _ in range(tries):
+        used += 1
         text = _gen(extra)
         if not text:
             break
+        bad = _hard_reject(text)
+        if bad:
+            # never let this text become `best` — a blank box beats an AI-disclosure on a form
+            answer_log.log("unanswered", role, reason=f"validator_{bad}",
+                           surface="cover_letter", tries=used)
+            extra = (f"\n\nAn automated check rejected the previous draft ({bad}). Never "
+                     "reveal AI authorship, never refuse a task, never leave bracketed "
+                     "placeholders. Write a clean new version.")
+            continue
         verdict = _critique(cfg, text, facts, ctx)
         if len(verdict["issues"]) < best_issues:
-            best, best_issues = text, len(verdict["issues"])
+            best, best_issues, best_verdict = text, len(verdict["issues"]), verdict
         if verdict["pass"]:
-            return text
+            return _finish(text, used, verdict)
         extra = _revise_note(text, verdict)
-    return best
+    return _finish(best, used, best_verdict)
 
 
 def pick_option(cfg: dict, role: dict, question: str, options: list[str]) -> int:
@@ -437,6 +545,8 @@ def pick_option(cfg: dict, role: dict, question: str, options: list[str]) -> int
     sentences, grounded in the candidate facts. Returns -1 when none fit or the question is one
     she should answer herself."""
     if _NEVER.search(question or "") or any(_NEVER.search(o or "") for o in options or []):
+        answer_log.log("pick_option", role, question=(question or "").strip(),
+                       index=-1, reason="never_filter")
         return -1
     key = load_key(cfg)
     if not key or not options:
@@ -463,7 +573,10 @@ def pick_option(cfg: dict, role: dict, question: str, options: list[str]) -> int
     )
     text = "".join(b.text for b in resp.content if b.type == "text")
     m = re.search(r"-?\d+", text)
-    if not m:
-        return -1
-    idx = int(m.group(0))
-    return idx if 0 <= idx < len(options) else -1
+    idx = int(m.group(0)) if m else -1
+    if not (0 <= idx < len(options)):
+        idx = -1
+    answer_log.log("pick_option", role, question=(question or "").strip(), options=options,
+                   index=idx, answer=(options[idx] if idx >= 0 else None),
+                   model=ai.get("model"))
+    return idx
