@@ -8,6 +8,7 @@ data/*.db-shm
 data/*.db
 data/*.sqlite
 data/*.sqlite3
+data/
 data/*_backup.json
 data/mail_label_*.json
 data/logs/
@@ -46,3 +47,14 @@ secrets/
 
 # untracked scratch working files (only *.json / *.md were covered before)
 scratch_priors/_*
+
+# PRIVACY RED LINE (recite / 念稿练习, 2026-08-29). Her voice recordings, the ASR
+# transcripts of them, the reference TTS, the copied original interview audio, and every
+# graded take must never enter git history. Broad on purpose: anything under data/recite/
+# is personal audio or a judgement about how she speaks.
+data/recite/
+data/recite_numbers.yaml
+data/recite_lessons.md
+data/seeds/openers.json
+rough_queue.md
+data/recite/**

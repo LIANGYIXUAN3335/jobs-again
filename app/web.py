@@ -26,6 +26,8 @@ from . import ideas as ideasmod
 from . import ingest as ingestmod
 from . import mail as sendmail
 from . import mailcode as mailmod
+from . import recite as recitemod
+from . import recite_asr
 from . import store, tailoring
 
 cfg = cfgmod.load_config()
@@ -1483,6 +1485,433 @@ def health_page():
       ⚪ = 新任务还没到运行时间。看板网页本身不用打卡 — 你能打开这页就说明它活着。
       值班员每天 5 次巡查，发现<b>新出现的</b>红灯会弹 Mac 通知。</p>
       <table><tr><th></th><th>任务</th><th>节奏</th><th>上次打卡</th><th>用时</th><th>状态</th></tr>{trs}</table>""")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 念稿练习 (recite) — 2026-08-29。**只加不改**：新表建在 user_state.db，既有路由和表结构
+# 一个字没动。设计定稿见 scratchpad/product/spec-v3.md（v2 的 diff）+ 四份 critique-v3。
+#
+# 落点选 jobscan 而不是新起一个 app：launchd 常驻、8787 已在 LISTEN，日历里的 🎤 块放个
+# 链接点开即用。冷启动摩擦才是真正的流失风险，这条已经满足了。
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ITEM_ID_RX = re.compile(r"^[a-z0-9:_-]{1,80}$")
+
+
+def _recite_conn(conn):
+    recitemod.ensure_schema(conn)
+    return conn
+
+
+def _recite_item(conn, item_id: str) -> dict:
+    if not _ITEM_ID_RX.match(item_id or ""):
+        raise HTTPException(400, "bad item id")
+    row = conn.execute(
+        "SELECT i.*, s.box, s.due_on, s.n_takes, s.n_pass, s.streak, s.last_total, s.last_fix,"
+        "       s.exposed, s.exposure_stage, s.exposure_at, s.archived, s.needs_rewrite"
+        " FROM recite_items i LEFT JOIN recite_state s ON s.item_id=i.item_id"
+        " WHERE i.item_id=?", (item_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "no such recite item")
+    d = dict(row)
+    d["points"] = recitemod.parse_key_points(d.get("key_points") or "[]")
+    d["scored"], d["extra"] = recitemod.scored_cues(d["points"])
+    for k in ("variants", "delivery_notes", "extra_cues"):
+        try:
+            d[k] = json.loads(d.get(k) or "[]")
+        except Exception:
+            d[k] = []
+    d["canon_spans"] = recitemod.canon_spans(d.get("script") or "")
+    return d
+
+
+def _recite_company(raw: str) -> str:
+    """把 company 列上那些带括号/斜杠的长串压成一个可以当分组标题的短名。
+
+    库里真实存在 `TikTok / ByteDance (ads monetization loop; interviewer ex-Meta 5+y…)`
+    这样的值，三个变体其实是同一家公司 —— 不归一就会在侧栏里排出三个 TikTok。
+    """
+    s = (raw or "").strip()
+    for sep in ("(", "（", "/", ";", "，", ","):
+        if sep in s:
+            s = s.split(sep)[0]
+    s = s.strip(" -—·")
+    return s or "其他"
+
+
+def _recite_has_audio(slot: str, item_id: str) -> bool:
+    try:
+        return (recitemod.data_dir() / slot / f"{item_id}.mp3").exists()
+    except Exception:
+        return False
+
+
+def _recite_library(conn) -> list[dict]:
+    """全部条目（含 script 为空的）按 公司 → 场次 分组。库优先：这一页就是总库。"""
+    rows = [dict(r) for r in conn.execute(
+        "SELECT i.item_id, i.company, i.interview, i.kind, i.question, i.question_zh,"
+        "       i.target_sec, i.script, i.quality, i.deferred, i.link_group,"
+        "       s.box, s.last_total, s.archived,"
+        # n_takes 只在评分发生时才涨（apply_outcome），而 v2 里评分是可选的 —— 直接数
+        # recite_takes，否则她录了五遍库里还写「练过 0 次」。
+        "       (SELECT COUNT(*) FROM recite_takes t WHERE t.item_id=i.item_id) n_takes"
+        "  FROM recite_items i LEFT JOIN recite_state s ON s.item_id=i.item_id"
+        " ORDER BY i.company, i.interview, i.item_id")]
+    for d in rows:
+        d["co"] = _recite_company(d.get("company"))
+        d["has_script"] = bool((d.get("script") or "").strip())
+        d["has_orig"] = _recite_has_audio("orig", d["item_id"])
+        d["has_ref"] = _recite_has_audio("ref", d["item_id"])
+        d["title"] = (d.get("question") or d.get("question_zh") or d["item_id"]).strip()
+        d["subtitle"] = (d.get("question_zh") or "").strip()
+        d.pop("script", None)
+    return rows
+
+
+def _recite_groups(rows: list[dict]) -> list[dict]:
+    by_co: dict[str, dict] = {}
+    for d in rows:
+        co = by_co.setdefault(d["co"], {"name": d["co"], "n": 0, "sessions": {}})
+        co["n"] += 1
+        s = co["sessions"].setdefault(d.get("interview") or "（未分场）",
+                                      {"name": d.get("interview") or "（未分场）", "rows": []})
+        # 键名叫 rows 不叫 items：Jinja 里 `s.items` 会先命中 dict.items 方法，静默返回一个
+        # builtin 而不是列表 —— 这个坑只在渲染时炸，不在 Python 里。
+        s["rows"].append(d)
+    out = []
+    for co in by_co.values():
+        co["sessions"] = sorted(co["sessions"].values(), key=lambda s: s["name"])
+        out.append(co)
+    out.sort(key=lambda c: (-c["n"], c["name"]))
+    return out
+
+
+@app.get("/recite", response_class=HTMLResponse)
+def recite_home(request: Request, conn=Depends(view_conn)):
+    _recite_conn(conn)
+    c = recitemod.cfg_recite(cfg)
+    queue = recitemod.today_queue(conn, cfg)
+    for q in queue:
+        q["points"] = recitemod.parse_key_points(q.get("key_points") or "[]")
+        q["scored"], _ = recitemod.scored_cues(q["points"])
+    groups: dict[str, list[str]] = {}
+    for r in conn.execute("SELECT item_id, link_group FROM recite_items"
+                          " WHERE link_group IS NOT NULL AND link_group!=''"):
+        groups.setdefault(r["link_group"], []).append(r["item_id"])
+    dupes = {i for ids in groups.values() if len(ids) > 1 for i in ids}
+    counts = {"all": conn.execute(
+        "SELECT COUNT(*) n FROM recite_items").fetchone()["n"]}
+    counts["rough"] = conn.execute(
+        "SELECT COUNT(*) n FROM recite_items WHERE quality='rough' OR deferred=1").fetchone()["n"]
+    counts["archived"] = conn.execute(
+        "SELECT COUNT(*) n FROM recite_state WHERE archived=1").fetchone()["n"]
+    counts["thin"] = conn.execute(
+        "SELECT COUNT(*) n FROM recite_items WHERE scope='thin'").fetchone()["n"]
+    lib = _recite_library(conn)
+    counts["orig"] = sum(1 for d in lib if d["has_orig"])
+    counts["ref"] = sum(1 for d in lib if d["has_ref"])
+    counts["noscript"] = sum(1 for d in lib if not d["has_script"])
+    return templates.TemplateResponse(request, "recite.html", {
+        "queue": queue, "cfgr": c, "hist": recitemod.histogram(conn),
+        "calibrating": recitemod.calibrating_now(conn, cfg),
+        "dupes": dupes, "counts": counts,
+        "groups": _recite_groups(lib),
+        "kinds": sorted({d["kind"] for d in lib if d.get("kind")}),
+        "companies": sorted({d["co"] for d in lib}),
+        "queue_ids": {q["item_id"] for q in queue},
+    })
+
+
+@app.get("/recite/{item_id}", response_class=HTMLResponse)
+def recite_item_page(item_id: str, request: Request, conn=Depends(view_conn)):
+    _recite_conn(conn)
+    it = _recite_item(conn, item_id)
+    st = recitemod.get_state(conn, item_id)
+    n_takes = int(st["n_takes"] or 0)
+    variant = recitemod.variant_for(it, n_takes)
+    # 曝光轮由 recite_state.exposed 显式驱动，**不从 n_takes 推导**（MEM2-P1-4b）：录音先写盘
+    # 插行、再评分，ASR/LLM 挂掉时 n_takes 就变成了 1，曝光轮会永久消失，而她既没拿到基线
+    # 也没拿到反馈。
+    first_exposure = not int(st["exposed"] or 0)
+    takes = [dict(r) for r in conn.execute(
+        "SELECT * FROM recite_takes WHERE item_id=? ORDER BY id DESC LIMIT 5", (item_id,))]
+    for t in takes:
+        for k in ("metrics", "scores", "missed_cues", "fact_check", "red_flags"):
+            try:
+                t[k] = json.loads(t.get(k) or "null")
+            except Exception:
+                t[k] = None
+    it["has_orig"] = _recite_has_audio("orig", item_id)
+    n_recorded = conn.execute("SELECT COUNT(*) n FROM recite_takes WHERE item_id=?",
+                              (item_id,)).fetchone()["n"]
+    # 同一场次的邻居 —— 练完一条能直接跳下一条，不用回库再找。
+    sib = [dict(r) for r in conn.execute(
+        "SELECT item_id, question, question_zh FROM recite_items"
+        " WHERE interview=? ORDER BY item_id", (it.get("interview") or "",))]
+    idx = next((i for i, r in enumerate(sib) if r["item_id"] == item_id), -1)
+    return templates.TemplateResponse(request, "recite_item.html", {
+        "it": it, "st": dict(st), "variant": variant, "first_exposure": first_exposure,
+        "takes": takes, "cfgr": recitemod.cfg_recite(cfg),
+        "calibrating": recitemod.calibrating_now(conn, cfg),
+        "queue_ids": [q["item_id"] for q in recitemod.today_queue(conn, cfg)],
+        "n_recorded": n_recorded,
+        "prev_item": sib[idx - 1] if idx > 0 else None,
+        "next_item": sib[idx + 1] if 0 <= idx < len(sib) - 1 else None,
+        "sib_pos": (idx + 1, len(sib)) if idx >= 0 else (0, 0),
+    })
+
+
+@app.get("/api/recite/queue")
+def api_recite_queue(conn=Depends(view_conn)):
+    _recite_conn(conn)
+    return {"queue": [{k: v for k, v in q.items() if k != "key_points"}
+                      for q in recitemod.today_queue(conn, cfg)]}
+
+
+@app.get("/recite/audio/{item_id}/{slot}")
+def recite_audio(item_id: str, slot: str, conn=Depends(view_conn)):
+    """slot ∈ ref | orig | take-<id>。
+
+    路径必须 resolve 到 data/recite/ 之内，且 **不 mount StaticFiles 到 data/** —— 那个目录
+    装的是她的录音、转写和评分，隐私红线的第一条就是它不能被整目录暴露出去。
+    """
+    if not _ITEM_ID_RX.match(item_id or ""):
+        raise HTTPException(400, "bad item id")
+    root = recitemod.data_dir().resolve()
+    if slot == "ref":
+        p = root / "ref" / f"{item_id}.mp3"
+    elif slot == "orig":
+        p = root / "orig" / f"{item_id}.mp3"
+    elif slot.startswith("take-"):
+        _recite_conn(conn)
+        row = conn.execute("SELECT audio_path FROM recite_takes WHERE id=? AND item_id=?",
+                           (slot[5:] if slot[5:].isdigit() else -1, item_id)).fetchone()
+        if not row or not row["audio_path"]:
+            raise HTTPException(404, "no take audio")
+        p = root / "takes" / Path(row["audio_path"]).name
+    else:
+        raise HTTPException(400, "bad slot")
+    p = p.resolve()
+    if not str(p).startswith(str(root)) or not p.exists():
+        raise HTTPException(404, "not found")
+    return FileResponse(str(p))
+
+
+@app.post("/api/recite/{item_id}/exposure")
+def api_recite_exposure(item_id: str, body: dict, conn=Depends(view_conn)):
+    """A0 曝光轮的进度落库 —— 可中断、可恢复、可跳过。
+
+    恢复时若距 A0-② 超过 2 小时，回到 stage ① 重走（MEM3-3b）：那不是冷却，那是一个完整的
+    保持区间，而这一 take 仍会被记成 first_exposure=1 的"基线"，同时污染基线和 r 序列。
+    成本 75 秒，一生一次。
+    """
+    _recite_conn(conn)
+    recitemod.get_state(conn, item_id)
+    stage = max(0, min(4, int(body.get("stage") or 0)))
+    conn.execute("UPDATE recite_state SET exposure_stage=?, exposure_at=? WHERE item_id=?",
+                 (stage, store.la_now_iso(), item_id))
+    conn.commit()
+    return {"ok": True, "stage": stage}
+
+
+@app.post("/api/recite/{item_id}/mark")
+def api_recite_mark(item_id: str, body: dict, conn=Depends(view_conn)):
+    """这稿要改 / 归档 / 手动升降箱 / 量级标 thin / 误报加白。"""
+    _recite_conn(conn)
+    recitemod.get_state(conn, item_id)
+    act = str(body.get("action") or "")
+    if act == "needs_rewrite":
+        conn.execute("UPDATE recite_state SET needs_rewrite=1, snooze_until=? WHERE item_id=?",
+                     (recitemod._plus(3), item_id))
+        recitemod._append_rough(item_id, "她按了「这稿要改」")
+    elif act == "archive":
+        conn.execute("UPDATE recite_state SET archived=1 WHERE item_id=?", (item_id,))
+    elif act == "unarchive":
+        conn.execute("UPDATE recite_state SET archived=0 WHERE item_id=?", (item_id,))
+    elif act == "scope_thin":
+        conn.execute("UPDATE recite_items SET scope='thin' WHERE item_id=?", (item_id,))
+    elif act == "box":
+        conn.execute("UPDATE recite_state SET box=?, streak=0 WHERE item_id=?",
+                     (max(1, min(5, int(body.get("box") or 1))), item_id))
+    elif act == "snooze":
+        conn.execute("UPDATE recite_state SET due_on=? WHERE item_id=?",
+                     (recitemod._plus(int(body.get("days") or 1)), item_id))
+    else:
+        raise HTTPException(400, "unknown action")
+    conn.commit()
+    return {"ok": True}
+
+
+def _score_take(conn, take_id: int, it: dict, *, transcript_hint: str = "") -> dict:
+    """ASR → 指标 → 判官 → 硬门/软分 → 晋降箱。录音和 take 行此时已经在盘上了。"""
+    row = dict(conn.execute("SELECT * FROM recite_takes WHERE id=?", (take_id,)).fetchone())
+    path = recitemod.data_dir() / "takes" / Path(row["audio_path"]).name
+    metrics = recitemod.audio_metrics(path)
+    asr = ({"text": transcript_hint, "engine": "given", "error": ""} if transcript_hint
+           else recite_asr.transcribe(path, metrics.get("duration") or 0))
+    transcript = asr.get("text") or ""
+    metrics.update(recitemod.filler_counts(transcript))
+    metrics["wpm"] = recitemod.wpm(transcript, metrics)
+    metrics["asr_engine"] = asr.get("engine") or ""
+    metrics["asr_error"] = asr.get("error") or ""
+
+    script = it.get("script") or ""
+    r = recitemod.verbatim_ratio(transcript, script)
+    prev = recitemod.prev_transcript(conn, it["item_id"], exclude_take_id=take_id)
+    r_prev = recitemod.verbatim_ratio(transcript, prev) if prev else None
+
+    cfg_r = recitemod.cfg_recite(cfg)
+    calib = recitemod.calibrating_now(conn, cfg)
+    vt = row["variant_type"] or "original"
+    n_para = conn.execute(
+        "SELECT COUNT(*) n FROM recite_takes WHERE variant_type='paraphrase'").fetchone()["n"]
+
+    review = aimod.review_take(cfg, {
+        # 判官看到的必须是**这一次实际问她的**那个问题：变体档下答原问是 structure 失败，
+        # 不是 coverage 成功，而这个区分只有在 prompt 里问对了问题时才成立。
+        "question": row["variant"] or it.get("question") or "",
+        "scored_cues": [c["text"] for c in it["scored"]],
+        "delivery_notes": (it.get("delivery_notes") or [])[:1],
+        "script": script, "transcript": transcript, "metrics": metrics,
+        "target_sec": it.get("target_sec"), "wpm": metrics["wpm"],
+        "variant_type": vt, "variant_sec": row["variant_sec"],
+        "variant_hint": row["gate_note"] or "",
+        "why_line": row["why_line"], "why_q": it.get("why_q"),
+        "speaker_name": it.get("speaker_name"), "pace": it.get("pace"),
+    })
+
+    checks = recitemod.fact_check(transcript, it)
+    res = recitemod.judge_take(
+        cfg_r=cfg_r, item=it, points=it["points"], scored=it["scored"],
+        transcript=transcript, metrics=metrics, review=review,
+        why_line=row["why_line"] or "", variant_type=vt,
+        variant_sec=int(row["variant_sec"] or it.get("target_sec") or 60),
+        mode=row["mode"] or "recall", first_exposure=bool(row["first_exposure"]),
+        box=int((recitemod.get_state(conn, it["item_id"])["box"]) or 1),
+        calibrating=calib, r=r, n_paraphrase_takes=n_para,
+        number_flags=recitemod.number_flag_strings(checks))
+
+    conn.execute(
+        "UPDATE recite_takes SET transcript=?, metrics=?, verbatim_ratio=?, r_prev=?,"
+        " scores=?, red_flags=?, missed_cues=?, fact_check=?, fix_next=?, one_line=?,"
+        " verdict=?, judge_raw=?, passed=?, dur_sec=?, coverage=?, total=?, hard_ok=?,"
+        " gate_note=? WHERE id=?",
+        (transcript, json.dumps(metrics, ensure_ascii=False), r, r_prev,
+         json.dumps(review["scores"], ensure_ascii=False),
+         json.dumps(res["red_flags"], ensure_ascii=False),
+         json.dumps(res["missed_cues"], ensure_ascii=False),
+         json.dumps(checks, ensure_ascii=False), review["fix_next"], review["one_line"],
+         res["verdict"], json.dumps({"raw": review["raw"], "fixed": review["fixed"],
+                                     "error": review["error"], "issues": review["issues"],
+                                     "evidence": review["evidence"]}, ensure_ascii=False),
+         res["passed"], metrics.get("duration"), res["coverage"], res["total"],
+         res["hard_ok"], res["gate_note"], take_id))
+    conn.commit()
+
+    same_day = bool(conn.execute(
+        "SELECT COUNT(*) n FROM recite_takes WHERE item_id=? AND id<>? AND substr(ts,1,10)=?",
+        (it["item_id"], take_id, store.la_today())).fetchone()["n"])
+    st = recitemod.apply_outcome(
+        conn, cfg_r, it["item_id"], passed=bool(res["passed"]),
+        first_exposure=bool(row["first_exposure"]), variant_type=vt, same_day=same_day,
+        hard_red=bool(res["red_flags"]), demotes_on_fail=res["demotes_on_fail"],
+        total=float(res["total"]), fix_next=review["fix_next"])
+    if row["first_exposure"]:
+        conn.execute("UPDATE recite_state SET exposed=1, exposure_stage=4 WHERE item_id=?",
+                     (it["item_id"],))
+        conn.commit()
+    _recite_log({"item_id": it["item_id"], "take_id": take_id, "ts": store.la_now_iso(),
+                 "variant": vt, "passed": res["passed"], "total": res["total"],
+                 "coverage": res["coverage"], "r": r, "r_prev": r_prev,
+                 "metrics": metrics, "gate_note": res["gate_note"],
+                 "judge_fixed": review["fixed"], "judge_error": review["error"]})
+    return {"take_id": take_id, "transcript": transcript, "metrics": metrics,
+            "verbatim_ratio": r, "r_prev": r_prev, "fact_check": checks,
+            "scores": review["scores"], "issues": review["issues"],
+            "evidence": review["evidence"], "fix_next": review["fix_next"],
+            "one_line": review["one_line"], "judge_error": review["error"],
+            "state": st, "calibrating": calib, **res}
+
+
+def _recite_log(rec: dict) -> None:
+    """阈值全量落盘 —— 直方图和第一周的 pass_total 校准都靠它，且它不含音频。"""
+    try:
+        p = cfgmod.resolve_path("data/logs/recite_takes.jsonl")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+@app.post("/api/recite/{item_id}/take")
+async def api_recite_take(item_id: str, request: Request, conn=Depends(view_conn)):
+    """上传录音 → **先写盘 + 插行（scores=NULL）** → ASR → 指标 → LLM → 回填。
+
+    先写盘不是洁癖：ASR 或 Anthropic 任一失败，她那 90 秒不会丢。丢一次录音的挫败感远大于
+    少一次评分，而卡片可以老老实实说「评分没跑出来，录音已存 [重试评分]」。
+    """
+    _recite_conn(conn)
+    it = _recite_item(conn, item_id)
+    form = await request.form()
+    up = form.get("audio")
+    if up is None or not hasattr(up, "read"):
+        raise HTTPException(400, "no audio")
+    blob = await up.read()
+    if not blob:
+        raise HTTPException(400, "empty audio")
+    ext = ".mp4" if "mp4" in (getattr(up, "content_type", "") or "") else ".webm"
+    ts = store.la_now_iso().replace(":", "").replace("-", "")
+    name = f"{item_id.replace(':', '_')}-{ts}{ext}"
+    dst = recitemod.audio_dir("takes") / name
+    dst.write_bytes(blob)
+
+    st = recitemod.get_state(conn, item_id)
+    first_exposure = int(form.get("first_exposure") or 0) and not int(st["exposed"] or 0)
+    cur = conn.execute(
+        "INSERT INTO recite_takes(item_id, ts, mode, first_exposure, variant, variant_type,"
+        " variant_sec, why_line, audio_path, self_est, gate_note)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (item_id, store.la_now_iso(), form.get("mode") or "recall", int(first_exposure),
+         form.get("variant_q") or "", form.get("variant_type") or "original",
+         int(form.get("variant_sec") or it.get("target_sec") or 60),
+         (form.get("why_line") or "").strip(), name,
+         float(form.get("self_est")) if form.get("self_est") else None,
+         form.get("variant_hint") or ""))
+    conn.commit()
+    take_id = int(cur.lastrowid)
+    # ── 库优先返工（v2）：评分降级为可选。默认只存盘，不跑 ASR + 判官。 ──────────
+    # 她要的是「听原声 → 自己练 → 回听对比」，评分是这条链之外的一个按钮。
+    # 前端要评分时带 score=1，或者事后调 /api/recite/take/<id>/rescore。
+    if not str(form.get("score") or "").strip() in ("1", "true", "yes", "on"):
+        return {"take_id": take_id, "saved": True, "scored": False,
+                "audio_url": f"/recite/audio/{item_id}/take-{take_id}",
+                "scores": {}, "transcript": "", "verdict": "", "total": None,
+                "gate_note": ""}
+    try:
+        return _score_take(conn, take_id, it)
+    except Exception as e:      # 评分链任何一环挂掉都不该吃掉录音
+        return {"take_id": take_id, "saved": True, "judge_error": f"{type(e).__name__}: {e}",
+                "scores": {}, "transcript": "", "verdict": "", "total": None,
+                "gate_note": "评分没跑出来，录音已存"}
+
+
+@app.post("/api/recite/take/{take_id}/rescore")
+def api_recite_rescore(take_id: int, body: dict | None = None, conn=Depends(view_conn)):
+    """[让 AI 评一下] 走的就是这条。body 可选 {why_line, mode} —— why 现在在录完之后才问，
+    所以要允许回填到已经落盘的 take 行上；评分本身一个字没改。"""
+    _recite_conn(conn)
+    row = conn.execute("SELECT item_id FROM recite_takes WHERE id=?", (take_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "no such take")
+    body = body or {}
+    if str(body.get("why_line") or "").strip():
+        conn.execute("UPDATE recite_takes SET why_line=? WHERE id=?",
+                     (str(body["why_line"]).strip(), take_id))
+    if body.get("mode") in ("recall", "read"):
+        conn.execute("UPDATE recite_takes SET mode=? WHERE id=?", (body["mode"], take_id))
+    conn.commit()
+    return _score_take(conn, take_id, _recite_item(conn, row["item_id"]))
 
 
 if __name__ == "__main__":

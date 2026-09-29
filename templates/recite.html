@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>念稿库 · JobScan</title>
+<style>
+:root{--fg:#1c1c1e;--dim:#6b7280;--line:#e5e7eb;--bg:#fafafa;--card:#fff;--accent:#0b6b5e}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif}
+.wrap{max-width:1040px;margin:0 auto;padding:20px 18px 80px}
+h1{font-size:20px;margin:0 0 3px}
+.sub{color:var(--dim);font-size:13px;margin-bottom:14px}
+.sub b{color:var(--fg)}
+
+/* 今日推荐：压成一条横条，可关。它绝不占据视线中心，也绝不挡住库。 */
+.rec{background:#eef7ee;border:1px solid #cfe6d3;border-radius:9px;padding:8px 12px;
+     font-size:13px;margin-bottom:14px;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.rec .lb{font-weight:600;color:#2f6b3a;white-space:nowrap}
+.rec a{color:#2f6b3a;text-decoration:none;background:#fff;border:1px solid #cfe6d3;
+       border-radius:14px;padding:1px 9px;font-size:12.5px}
+.rec a:hover{background:#f4fbf5}
+.rec .x{margin-left:auto;cursor:pointer;color:#6b8c72;border:0;background:none;font-size:15px}
+
+/* 搜索 / 过滤 */
+.bar{position:sticky;top:0;z-index:5;background:var(--bg);padding:8px 0 10px;
+     border-bottom:1px solid var(--line);display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.bar input[type=search]{flex:1;min-width:200px;font:inherit;padding:8px 11px;
+     border:1px solid var(--line);border-radius:8px;background:#fff}
+.bar select{font:inherit;padding:7px 9px;border:1px solid var(--line);border-radius:8px;background:#fff}
+.bar label{font-size:13px;color:var(--dim);display:flex;gap:4px;align-items:center;cursor:pointer}
+.bar button{font:inherit;font-size:13px;padding:7px 11px;border:1px solid var(--line);
+     border-radius:8px;background:#fff;cursor:pointer}
+#hits{font-size:12.5px;color:var(--dim);margin:8px 0 0}
+
+/* 分组 */
+details.co{border:1px solid var(--line);border-radius:10px;background:var(--card);margin-top:10px;overflow:hidden}
+details.co>summary{cursor:pointer;padding:11px 14px;font-weight:600;list-style:none;
+     display:flex;gap:8px;align-items:baseline}
+details.co>summary::-webkit-details-marker{display:none}
+details.co>summary::before{content:"▸";color:var(--dim);font-weight:400}
+details.co[open]>summary::before{content:"▾"}
+details.co>summary .cn{color:var(--dim);font-weight:400;font-size:12.5px}
+details.ses{border-top:1px solid var(--line)}
+details.ses>summary{cursor:pointer;padding:8px 14px 8px 30px;font-size:13px;color:#374151;
+     list-style:none;background:#fbfcfc}
+details.ses>summary::-webkit-details-marker{display:none}
+details.ses>summary::before{content:"▸ ";color:var(--dim)}
+details.ses[open]>summary::before{content:"▾ "}
+
+.row{display:flex;gap:9px;align-items:flex-start;padding:8px 14px 8px 30px;border-top:1px solid #f1f3f5}
+.row:hover{background:#fbfdfc}
+.row .pl{flex:0 0 auto;width:30px;height:30px;border-radius:50%;border:1px solid var(--line);
+     background:#fff;cursor:pointer;font-size:13px;line-height:1;padding:0}
+.row .pl.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+.row .pl.ghost{visibility:hidden}
+.row .rb{flex:1;min-width:0}
+.row .rq{font-size:14px}
+.row .rz{font-size:12.5px;color:var(--dim);margin-top:1px}
+.row .rm{font-size:12px;color:var(--dim);margin-top:3px}
+.row .player{margin-top:6px}
+.row .player audio{width:100%;height:32px}
+.row a.go{flex:0 0 auto;align-self:center;background:var(--accent);color:#fff;text-decoration:none;
+     padding:5px 12px;border-radius:7px;font-size:13px;white-space:nowrap}
+.tag{display:inline-block;font-size:11px;padding:0 6px;border-radius:20px;background:#eef2f7;
+     color:#475569;margin-right:4px;line-height:18px}
+.tag.v{background:#eef7ee;color:#2f6b3a}
+.tag.w{background:#fff4e5;color:#a4560a}
+.tag.n{background:#fdf2f8;color:#9d2c6f}
+.hide{display:none !important}
+.foot{margin-top:24px;border-top:1px solid var(--line);padding-top:12px;color:var(--dim);font-size:12.5px}
+code{background:#f1f3f5;padding:1px 5px;border-radius:4px;font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>🎤 念稿库</h1>
+<div class="sub">
+  全库 <b>{{ counts.all }}</b> 条 · <b>{{ groups|length }}</b> 家公司 ·
+  🎧 原声 <b>{{ counts.orig }}</b> 段 ·
+  你说了 <b>{{ hist.spoken_min }}</b> 分钟（近 40 次）
+</div>
+
+{% if queue %}
+<div class="rec" id="recbar">
+  <span class="lb">今日推荐 {{ queue|length }} 条</span>
+  {% for q in queue[:8] %}<a href="/recite/{{ q.item_id }}"
+     title="{{ q.question or q.item_id }}">{{ (q.question_zh or q.question or q.item_id)[:26] }}</a>{% endfor %}
+  <button class="x" id="recx" title="收起（这台机器上记住）">×</button>
+</div>
+{% endif %}
+
+<div class="bar">
+  <input type="search" id="q" placeholder="搜问题 / 场次 / item id…（309 条全在下面）" autocomplete="off">
+  <select id="fco"><option value="">全部公司</option>
+    {% for c in companies %}<option value="{{ c }}">{{ c }}</option>{% endfor %}</select>
+  <select id="fkind"><option value="">全部类型</option>
+    {% for k in kinds %}<option value="{{ k }}">{{ k }}</option>{% endfor %}</select>
+  <label><input type="checkbox" id="forig"> 只看有原声</label>
+  <button id="expand">全部展开</button>
+  <button id="collapse">全部收起</button>
+</div>
+<div id="hits"></div>
+
+{% for co in groups %}
+<details class="co" data-co="{{ co.name }}" {% if loop.first %}open{% endif %}>
+  <summary>{{ co.name }} <span class="cn">{{ co.n }} 条 · {{ co.sessions|length }} 场</span></summary>
+  {% for s in co.sessions %}
+  <details class="ses" open>
+    <summary>{{ s.name }} · {{ s.rows|length }} 条</summary>
+    {% for d in s.rows %}
+    <div class="row" data-co="{{ co.name }}" data-kind="{{ d.kind or '' }}"
+         data-orig="{{ 1 if d.has_orig else 0 }}"
+         data-s="{{ (d.title ~ ' ' ~ d.subtitle ~ ' ' ~ s.name ~ ' ' ~ d.item_id)|lower }}">
+      {% if d.has_orig %}
+      <button class="pl" data-src="/recite/audio/{{ d.item_id }}/orig" title="听当时的原声">⏯</button>
+      {% else %}<button class="pl ghost" disabled>⏯</button>{% endif %}
+      <div class="rb">
+        <div class="rq">{{ d.title }}</div>
+        {% if d.subtitle and d.subtitle != d.title %}<div class="rz">{{ d.subtitle }}</div>{% endif %}
+        <div class="rm">
+          {% if d.kind %}<span class="tag">{{ d.kind }}</span>{% endif %}
+          {% if d.target_sec %}<span class="tag">{{ d.target_sec }}s</span>{% endif %}
+          {% if d.has_orig %}<span class="tag v">🎧 原声</span>{% else %}<span class="tag">无原声</span>{% endif %}
+          {% if not d.has_script %}<span class="tag w">无念稿 · 听+看点评</span>{% endif %}
+          {% if d.item_id in queue_ids %}<span class="tag n">今日</span>{% endif %}
+          {% if d.item_id in dupes %}<span class="tag w" title="和另一条共用同一个项目">🟡 撞车</span>{% endif %}
+          {% if d.quality == 'rough' or d.deferred %}<span class="tag w">稿要改</span>{% endif %}
+          {% if d.n_takes %}<span class="tag">录过 {{ d.n_takes }} 次{% if d.last_total %} · 上次 {{ '%.1f'|format(d.last_total) }}{% endif %}</span>{% endif %}
+        </div>
+        <div class="player"></div>
+      </div>
+      <a class="go" href="/recite/{{ d.item_id }}">练 →</a>
+    </div>
+    {% endfor %}
+  </details>
+  {% endfor %}
+</details>
+{% endfor %}
+
+<div class="foot">
+  {% for b in hist.buckets %}{{ b.name }} {{ b.n }} 次 · 过关 {{ b.pass_rate }}%{% if not loop.last %} ｜ {% endif %}{% endfor %}
+  <br>⚠ 稿要改 / 未过筛 {{ counts.rough }} · 已归档 {{ counts.archived }} · 无念稿 {{ counts.noscript }}
+  <br>导入：<code>python -m app.recite_import &lt;recap 目录&gt; --from-openers</code>
+</div>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  var rows = Array.prototype.slice.call(document.querySelectorAll(".row"));
+
+  // ── 行内原声试听：一次只开一个播放器，用真的 <audio controls>，能拖能倒回 ──────
+  var open = null;
+  document.addEventListener("click", function (e) {
+    var b = e.target.closest ? e.target.closest("button.pl") : null;
+    if (!b || b.disabled) return;
+    var slot = b.parentNode.querySelector(".player");
+    if (open && open.btn !== b) { open.slot.innerHTML = ""; open.btn.classList.remove("on"); open = null; }
+    if (b.classList.contains("on")) { slot.innerHTML = ""; b.classList.remove("on"); open = null; return; }
+    var a = document.createElement("audio");
+    a.controls = true; a.autoplay = true; a.preload = "none"; a.src = b.dataset.src;
+    slot.innerHTML = ""; slot.appendChild(a);
+    b.classList.add("on");
+    open = { btn: b, slot: slot };
+  });
+
+  // ── 搜索 + 过滤：全部在客户端做，309 行完全够用；命中会自动把分组展开 ──────────
+  function apply() {
+    var q = ($("q").value || "").trim().toLowerCase();
+    var co = $("fco").value, kind = $("fkind").value, orig = $("forig").checked;
+    var n = 0, filtering = !!(q || co || kind || orig);
+    rows.forEach(function (r) {
+      var ok = (!q || r.dataset.s.indexOf(q) >= 0) &&
+               (!co || r.dataset.co === co) &&
+               (!kind || r.dataset.kind === kind) &&
+               (!orig || r.dataset.orig === "1");
+      r.classList.toggle("hide", !ok);
+      if (ok) n++;
+    });
+    document.querySelectorAll("details.ses").forEach(function (s) {
+      var vis = s.querySelectorAll(".row:not(.hide)").length;
+      s.classList.toggle("hide", vis === 0);
+      if (filtering) s.open = true;
+    });
+    document.querySelectorAll("details.co").forEach(function (c) {
+      var vis = c.querySelectorAll(".row:not(.hide)").length;
+      c.classList.toggle("hide", vis === 0);
+      if (filtering) c.open = true;
+    });
+    $("hits").textContent = filtering ? ("命中 " + n + " 条") : "";
+  }
+  ["q", "fco", "fkind", "forig"].forEach(function (id) {
+    $(id).addEventListener("input", apply);
+    $(id).addEventListener("change", apply);
+  });
+  $("expand").addEventListener("click", function () {
+    document.querySelectorAll("details").forEach(function (d) { d.open = true; });
+  });
+  $("collapse").addEventListener("click", function () {
+    document.querySelectorAll("details.co").forEach(function (d) { d.open = false; });
+  });
+
+  // ── 今日推荐横条：关掉就记住，它是提示不是闸门 ────────────────────────────
+  var bar = $("recbar");
+  if (bar) {
+    try { if (localStorage.getItem("recite_recbar") === "off") bar.classList.add("hide"); } catch (e) {}
+    $("recx").addEventListener("click", function () {
+      bar.classList.add("hide");
+      try { localStorage.setItem("recite_recbar", "off"); } catch (e) {}
+    });
+  }
+})();
+</script>
+</body>
+</html>

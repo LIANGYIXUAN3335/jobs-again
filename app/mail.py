@@ -15,11 +15,25 @@ import pathlib
 import re
 import smtplib
 import ssl
+import time
 from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid, parseaddr
 
 from . import mailcode
+
+
+def _imap_connect(mc: dict, attempts: int = 3):
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"), timeout=30)
+        except OSError as e:
+            last = e
+            if i == attempts - 1:
+                break
+            time.sleep(5 * (i + 1))
+    raise last or RuntimeError("IMAP connection failed")
 
 
 def _dec(s: str) -> str:
@@ -63,7 +77,7 @@ def search_recent(cfg: dict, query: str = "", days: int = 14, limit: int = 25) -
     """List recent inbox messages (newest first): {uid, subject, from, date}. `query` does a
     Gmail-side full-text search (X-GM-RAW) when given, else just the time window."""
     mc, addr, pw = _creds(cfg)
-    M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"))
+    M = _imap_connect(mc)
     try:
         M.login(addr, pw)
         M.select("INBOX")
@@ -94,7 +108,7 @@ def get_message(cfg: dict, uid: str) -> dict:
     """Full message for drafting a reply: includes message_id / references so send_reply can
     thread, and reply_to (the address to answer)."""
     mc, addr, pw = _creds(cfg)
-    M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"))
+    M = _imap_connect(mc)
     try:
         M.login(addr, pw)
         M.select("INBOX")

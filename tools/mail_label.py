@@ -33,6 +33,7 @@ import json
 import pathlib
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -44,6 +45,24 @@ from app import mail, store  # noqa: E402
 ALL_MAIL = '"[Gmail]/All Mail"'
 CACHE = pathlib.Path(__file__).resolve().parents[1] / "data" / "mail_label_scan.json"
 BUCKET_STATE = pathlib.Path(__file__).resolve().parents[1] / "data" / "mail_label_buckets.json"
+
+
+def _incremental_with_retry(cfg: dict, *, days: int, root: str, dry: bool,
+                            attempts: int = 3) -> dict:
+    """Gmail IMAP occasionally closes the socket during batched header reads."""
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return incremental(cfg, days=days, root=root, dry=dry)
+        except (imaplib.IMAP4.abort, OSError) as e:
+            last = e
+            if i == attempts - 1:
+                break
+            wait = 5 * (i + 1)
+            print(f"IMAP transport error; retrying in {wait}s ({i + 1}/{attempts}): {e}",
+                  file=sys.stderr, flush=True)
+            time.sleep(wait)
+    raise last or RuntimeError("mail label incremental failed")
 
 # Senders that are plumbing, not the employer. The company must come from the display name or
 # the subject for these — "sample-bbdb2b94@example.com" is Ashby's mail server, not a company you
@@ -479,7 +498,7 @@ def scan(cfg: dict, query: str = "is:starred", days: int = 0, limit: int = 0,
     mc, addr, pw = mail._creds(cfg)
     gaz = _gazetteer(cfg)
     _say(progress, f"gazetteer: {len(gaz)} company names")
-    M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"))
+    M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"), timeout=30)
     M.login(addr, pw)
     try:
         M.select(ALL_MAIL, readonly=True)
@@ -608,7 +627,7 @@ def reconcile(cfg: dict, threads: list[dict], root: str = "Interviews", tiers=("
                 "buckets": collections.Counter(b for b, _t in want.values()),
                 "messages": sum(t["n"] for _b, ts in want.values() for t in ts), "written": False}
 
-    M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"))
+    M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"), timeout=30)
     M.login(addr, pw)
     made, copied, unfiled, pruned, failed = [], 0, [], [], []
     try:
@@ -753,7 +772,8 @@ def main(argv: list[str]) -> int:
     cfg = cfgmod.load_config()
     if args.incremental:
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        r = incremental(cfg, days=args.days or 3, root=args.root, dry=not args.apply)
+        r = _incremental_with_retry(cfg, days=args.days or 3, root=args.root,
+                                    dry=not args.apply)
         verb = "would file" if not args.apply else "filed"
         moved = len(r.get("unfiled", [])) if args.apply else len(r.get("moves", {}))
         print(f"[{stamp}] mail_label: {r['scanned_threads']} threads seen, {verb} "

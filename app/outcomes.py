@@ -7,12 +7,30 @@ import imaplib
 import json
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import applied_scan
 from . import config as cfgmod
 from . import mail, store
+
+
+def _scan_with_retry(cfg: dict, days: int, attempts: int = 3) -> dict:
+    """IMAP sometimes drops long reads mid-FETCH. Treat that as transport, not data."""
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            return scan(cfg, days=days)
+        except (imaplib.IMAP4.abort, OSError) as e:
+            last = e
+            if i == attempts - 1:
+                break
+            wait = 5 * (i + 1)
+            print(f"IMAP transport error; retrying in {wait}s ({i + 1}/{attempts}): {e}",
+                  file=sys.stderr, flush=True)
+            time.sleep(wait)
+    raise last or RuntimeError("outcomes scan failed")
 
 # --- what an email means. Order matters: the first match wins, most decisive first. ---
 _SIGNALS: list[tuple[str, str, str, re.Pattern]] = [
@@ -417,7 +435,7 @@ def committable(p: dict) -> bool:
 def scan(cfg: dict, days: int = 120, max_emails: int = 600) -> dict:
     """Return {proposals: [...], scanned, matched}. Nothing is written."""
     mc, addr, pw = mail._creds(cfg)
-    M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"))
+    M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"), timeout=30)
     M.login(addr, pw)
     conn = store.connect_view(cfg)
     try:
@@ -525,7 +543,7 @@ def main(argv: list[str]) -> int:
     if not available(cfg):
         print("mailbox not configured (mailcode.email + gmail_app_password in secrets.yaml)")
         return 1
-    res = scan(cfg, days=args.days)
+    res = _scan_with_retry(cfg, args.days)
     icon = {"offer": "🎉", "rejection": "❌", "onsite": "🏢", "interview": "📞", "assessment": "📝"}
     props = res["proposals"]
     print(f"scanned {res['scanned']} emails over {args.days}d → {res['matched']} outcome signals\n")
