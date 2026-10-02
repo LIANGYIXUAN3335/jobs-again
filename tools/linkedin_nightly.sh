@@ -44,6 +44,12 @@ else
     echo "!! ingest step failed — enriched files kept for retry"
 fi
 
+# Link li: rows to their real ATS postings (dedupe + direct apply links; owner-approved
+# 2026-09-15). Runs even when ingest failed — the historical backlog still deserves the
+# pass. Caps at 40 orphan-company probes per night and remembers dead ends in
+# data/li_resolve_state.json, so it chips away day by day.
+$PY tools/li_resolve.py --limit-companies 40 || echo "!! li_resolve step failed (continuing)"
+
 # Tailor whatever just landed, instead of waiting for the next 09:45 run. Ingest adds roles
 # (and new companies) to the review queue; without this they sit there résumé-less until the
 # following morning, which is exactly the "好多都没有 resume" the owner hit on 2026-07-30.

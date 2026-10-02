@@ -34,7 +34,7 @@ import yaml
 BASE = Path(__file__).resolve().parent.parent          # jobscan/
 sys.path.insert(0, str(BASE))
 
-from app import config as cfgmod, store  # noqa: E402
+from app import config as cfgmod, mail as _mail, store  # noqa: E402
 
 PENDING = "scratch_priors/linkedin_alerts_pending.json"
 SEEN = "scratch_priors/linkedin_alert_seen.json"
@@ -125,7 +125,7 @@ def main() -> None:
         seen = set()
 
     imap = imaplib.IMAP4_SSL("imap.gmail.com")
-    imap.login(addr, pw)
+    _mail.imap_login(imap, addr, pw)
     imap.select("INBOX", readonly=True)
     import datetime
     since = (datetime.date.today() - datetime.timedelta(days=args.days)).strftime("%d-%b-%Y")

@@ -52,7 +52,15 @@ async function queueTailoring(tr) {
     span.textContent = "queued";
     tr.querySelector(".title .apply").before(span, document.createTextNode(" "));
   }
-  alert(`Prompt written:\n${res.prompt_path}\n\nOpen it in VS Code, generate with Claude Code, save the YAML, then click "ingest résumés".`);
+  // Owner 2026-09-23: queueing starts the generation right away (background claude workers),
+  // so the message says what is happening instead of asking for a manual run.
+  const chipEl = tr.querySelector(".chip.tailor");
+  if (chipEl) chipEl.textContent = res.started ? "generating…" : "queued";
+  alert(res.started
+    ? `已排队并开始生成（${res.queued} 个岗位在这一批，约 2-3 分钟一份，完成后自动入库，刷新可见 📄）。`
+    : res.waiting
+      ? `已排队。正在跑的批次结束后会自动开始（队列里 ${res.queued} 个）。`
+      : `Prompt written:\n${res.prompt_path}`);
 }
 
 /* ---------- JD expand ---------- */
@@ -190,10 +198,22 @@ document.addEventListener("change", (e) => {
       focusIdx = rows().indexOf(rowOf(e.target));
       setStatus(rowOf(e.target), v, false);
     }
-  } else if (e.target.matches("#filters select")) {
-    e.target.form.submit();
   }
+  // 2026-09-28：筛选下拉不再改一项就自动提交——侧栏里一次调好几项再点 Apply（帮手工作台改版）。
 });
+
+/* ---------- 筛选侧栏收起 / 展开（owner 2026-09-28）：状态存 localStorage，list.html 顶部的内联脚本负责无闪恢复 ---------- */
+(() => {
+  const layout = document.querySelector(".layout"), btn = document.querySelector("#pane-toggle");
+  if (!layout || !btn) return;
+  const paint = () => { btn.textContent = layout.classList.contains("collapsed") ? "▶" : "◀"; };
+  paint();
+  btn.addEventListener("click", () => {
+    const collapsed = layout.classList.toggle("collapsed");
+    try { localStorage.setItem("jobscan.filterpane", collapsed ? "1" : "0"); } catch (_) {}
+    paint();
+  });
+})();
 
 document.querySelector("#add-co")?.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -201,3 +221,164 @@ document.querySelector("#add-co")?.addEventListener("submit", async (e) => {
   const name = inp.value.trim();
   if (name) { await api("/api/applied-companies", "POST", { name }); location.reload(); }
 });
+
+/* ---------- 投递身份（apply profile / name card）切换 ---------- */
+// 独立监听器：.idcard 没有 data-act，不会撞上面的状态按钮处理。
+document.addEventListener("click", async (e) => {
+  const b = e.target.closest("button.idcard");
+  if (!b) return;
+  const ap = window.APPLY_PROFILES || {};
+  const keys = Object.keys(ap.profiles || {});
+  if (keys.length < 2) return;
+  const next = keys[(keys.indexOf(b.dataset.profile) + 1) % keys.length];
+  const card = ap.profiles[next] || {};
+  if (!confirm(`把这个岗位的投递身份切成「${card.display_name || next}」？\n简历抬头（名字/邮箱/电话）立刻重打，自动填表也跟着换。`)) return;
+  b.disabled = true;
+  try {
+    const r = await api(
+      `/api/roles/${encodeURIComponent(rowOf(b).dataset.jobId)}/apply-profile`,
+      "POST", { profile: next });
+    b.dataset.profile = next;
+    b.textContent = card.label || next[0].toUpperCase();
+    b.title = `投递身份：${card.display_name || next}`;
+    b.classList.toggle("alt", next !== (ap.default || "casey"));
+    if (r.note) alert(`身份已记录，但简历没能当场重打：${r.note}\n(每日 autotailor 重出这份简历时会用新身份)`);
+  } finally { b.disabled = false; }
+});
+
+/* ---------- 「这家不让投了」→ cooldown（owner 2026-09-22） ---------- */
+// Same effect as a config.yaml `cooldowns:` entry (the scanner skips the company, review hides
+// its roles) without editing YAML, and it expires by itself. Independent listener: .cdbtn has
+// no data-act, so it never collides with the status buttons above.
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button.cdbtn");
+  if (!b) return;
+  const tr = rowOf(b);
+  const company = tr && tr.dataset.company;
+  if (!company || (b.nextElementSibling && b.nextElementSibling.classList.contains("cd-pop"))) return;
+  const pop = document.createElement("span");
+  pop.className = "cd-pop";
+  pop.innerHTML = `冷却 <select><option value="30">30 天</option><option value="60">60 天</option>` +
+    `<option value="90">90 天</option><option value="180">180 天</option></select> ` +
+    `<input placeholder="原因（可选）" size="18"> <button class="ok">确定</button><button class="no">取消</button>`;
+  b.after(pop);
+  pop.querySelector("input").focus();
+  pop.querySelector(".no").onclick = () => pop.remove();
+  pop.querySelector(".ok").onclick = async () => {
+    const days = +pop.querySelector("select").value;
+    const reason = pop.querySelector("input").value.trim();
+    const r = await api("/api/companies/cooldown", "POST", { company, days, reason });
+    pop.remove();
+    if (inReview) {
+      rows().filter((x) => x.dataset.company === company).forEach((x) => {
+        const jd = x.nextElementSibling;
+        x.classList.add("gone");
+        setTimeout(() => { if (jd && jd.classList.contains("jd-row")) jd.remove(); x.remove(); }, 250);
+      });
+    }
+    alert(`${company} 已加入 cooldown，到 ${r.until}。\n扫描从下一次起跳过这家；review 里它的 ${r.hidden_roles} 个岗位已隐藏。\n到期自动恢复；要提前解除去 /companies 页。`);
+  };
+});
+
+/* ---------- 全局投递身份开关（顶栏，像登录邮箱） ---------- */
+document.querySelectorAll(".id-switch a").forEach((a) =>
+  a.addEventListener("click", async (e) => {
+    e.preventDefault();
+    await api("/api/identity", "POST", { identity: a.dataset.id });
+    const u = new URL(location);
+    u.searchParams.delete("identity");   // URL 参数会盖过 cookie，切换后清掉
+    location.href = u;
+  }));
+
+/* ---------- one-click batch tailoring (owner 2026-09-23: 「不需要一个一个地去点」) ---------- */
+// Sends the page's own query string — the same filter params index() read — so the server
+// rebuilds exactly this list and queues every row on it that has no résumé yet. The run itself
+// is the nightly engine (tools/auto_tailor.sh: 4 headless claude workers → one ingest), so this
+// page only polls /api/tailor-batch/status; nothing here does any tailoring.
+const BATCH_FILTER_KEYS = ["status", "q", "company", "min_score", "verdict", "seen", "remote",
+  "seniority", "tag", "identity", "tailored", "ease", "sort", "rot", "showall"];
+let batchPollTimer = null;
+
+function batchBody(dryRun) {
+  const body = { dry_run: dryRun };
+  for (const k of BATCH_FILTER_KEYS) {
+    const v = params.get(k);
+    if (v !== null) body[k] = v;        // absent identity → server falls back to the cookie
+  }
+  return body;
+}
+
+function postBatch(dryRun) {
+  return fetch("/api/tailor-batch", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(batchBody(dryRun)),
+  });
+}
+
+const batchProgress = (s) => `已写 ${s.written}/${s.total} · 已入库 ${s.ingested}`;
+
+async function pollBatch() {
+  const btn = document.querySelector("#tailor-batch-btn");
+  const st = document.querySelector("#tailor-batch-status");
+  if (!btn || !st) return;
+  let s;
+  try { s = await (await fetch("/api/tailor-batch/status")).json(); }
+  catch { batchPollTimer = setTimeout(pollBatch, 15000); return; }   // server hiccup: keep polling
+  if (s.running) {
+    btn.disabled = true;
+    st.className = "dim busy";
+    st.textContent = `进行中 · ${batchProgress(s)}`;
+    st.title = (s.log_tail || []).join("\n");
+    batchPollTimer = setTimeout(pollBatch, 15000);
+    return;
+  }
+  batchPollTimer = null;
+  btn.disabled = false;
+  st.className = "dim done";
+  st.textContent = `完成 · ${batchProgress(s)} `;
+  const a = document.createElement("a");
+  a.href = "#"; a.textContent = "刷新看结果";
+  a.addEventListener("click", (e) => { e.preventDefault(); location.reload(); });
+  st.appendChild(a);
+}
+
+document.querySelector("#tailor-batch-btn")?.addEventListener("click", async () => {
+  const btn = document.querySelector("#tailor-batch-btn");
+  const st = document.querySelector("#tailor-batch-status");
+  btn.disabled = true;
+  st.className = "dim"; st.textContent = "统计中…";
+  try {
+    const r = await postBatch(true);
+    if (!r.ok) { alert(`${r.status}: ${await r.text()}`); st.textContent = ""; return; }
+    const dry = await r.json();
+    if (!dry.queued) { st.textContent = "当前列表里的岗位都已有简历，没什么可做的"; return; }
+    // 4 workers in parallel, 2–3 min per résumé → wall clock ≈ ceil(N/4) × 2–3 min
+    const rounds = Math.ceil(dry.queued / 4);
+    const capNote = dry.capped ? `\n（超出单批上限，排名最低的 ${dry.capped} 个这次不做）` : "";
+    if (!confirm(`给当前列表里还没有简历的 ${dry.queued} 个岗位一次性做简历？大约 ${rounds * 2}–${rounds * 3} 分钟（4 路并行，每份 2-3 分钟）。${capNote}`)) {
+      st.textContent = ""; return;
+    }
+    st.textContent = "写 prompt、启动 4 路 worker…";
+    const r2 = await postBatch(false);
+    if (r2.status === 409) { alert((await r2.json()).detail); st.textContent = ""; return; }
+    if (!r2.ok) { alert(`${r2.status}: ${await r2.text()}`); st.textContent = ""; return; }
+    const res = await r2.json();
+    if (!res.started) {
+      st.textContent = `没有启动：${res.queued} 个可做，${(res.skipped || []).length} 个写 prompt 失败`;
+      return;
+    }
+    st.className = "dim busy";
+    st.textContent = `已启动 ${res.queued} 份 · 等第一份写出来…`;
+    if (batchPollTimer) clearTimeout(batchPollTimer);
+    batchPollTimer = setTimeout(pollBatch, 15000);   // button stays disabled until running=false
+  } finally {
+    if (!batchPollTimer) btn.disabled = false;
+  }
+});
+
+// A reload mid-batch must not lose the progress line: if the lock is held, resume polling.
+if (document.querySelector("#tailor-batch-btn")) {
+  fetch("/api/tailor-batch/status").then((r) => r.json()).then((s) => {
+    if (s.running && s.total) pollBatch();
+  }).catch(() => {});
+}

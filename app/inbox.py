@@ -64,7 +64,7 @@ def _convo_key(from_addr: str, subject: str) -> str:
 def _client(cfg):
     mc, addr, pw = mail._creds(cfg)
     M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"), timeout=30)
-    M.login(addr, pw)
+    mail.imap_login(M, addr, pw)
     return M, addr
 
 
@@ -167,8 +167,7 @@ high-confidence scheduling email: set confidence "low" and let the human look at
 
 
 def _classify_and_draft(cfg, msg, slots, examples):
-    key = aimod.load_key(cfg)
-    if not key:
+    if not aimod.available(cfg):
         return None
     ex = "\n\n".join(f"Example of her past reply:\n{e}" for e in examples) or "(no past replies on file)"
     slot_txt = (("Her real availability windows to offer (phrase them naturally, don't dump "
@@ -185,15 +184,7 @@ def _classify_and_draft(cfg, msg, slots, examples):
     # short draft doesn't need Opus. Haiku 4.5 does NOT support adaptive thinking, so only add
     # thinking/effort for the Opus/Sonnet family.
     model = (cfg.get("inbox") or {}).get("model") or ai.get("model", "claude-haiku-4-5")
-    import anthropic
-    client = anthropic.Anthropic(api_key=key)
-    kwargs = {"model": model, "max_tokens": 1500, "system": _SYSTEM,
-              "messages": [{"role": "user", "content": user}]}
-    if "haiku" not in model:
-        kwargs["thinking"] = {"type": "adaptive"}
-        kwargs["output_config"] = {"effort": ai.get("effort", "high")}
-    resp = client.messages.create(**kwargs)
-    text = "".join(b.text for b in resp.content if b.type == "text")
+    text = aimod.complete(cfg, system=_SYSTEM, user=user, max_tokens=1500, model=model)
     try:
         return json.loads(aimod._extract_json(text))
     except Exception:
@@ -245,7 +236,11 @@ def triage(cfg: dict, max_llm: int = 12, days: int | None = None, limit: int = 6
     for h in heads:
         if _SKIP_SUBJECT.search(h["subject"] or "") or _SKIP_SENDER.search(h["from"] or ""):
             continue
-        full = mail.get_message(cfg, h["uid"])
+        try:
+            full = mail.get_message(cfg, h["uid"])
+        except (imaplib.IMAP4.abort, OSError, TimeoutError) as e:
+            print(f"skip uid {h['uid']}: IMAP detail fetch failed: {e}", flush=True)
+            continue
         mid = full.get("message_id") or f"uid:{h['uid']}"
         if store.queue_has(conn, mid):
             continue

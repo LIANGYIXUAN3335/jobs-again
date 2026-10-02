@@ -4,18 +4,27 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>JobScan</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v={{ asset_v() }}">
 </head>
 <body>
 
 <header class="topbar">
-  <h1>JobScan</h1>
+  <h1>JobScan{% if workspace and workspace.name %} <span class="ws-badge" title="这个实例服务的候选人（config workspace.name）">{{ workspace.name }}</span>{% endif %}</h1>
+  {% if apply_profiles.get('profiles') %}<span class="id-switch" title="当前投递身份（像登录邮箱）：切到 Y 后所有页面只看小号名下的公司，刷新不丢；「全部」= 退出登录两边都看">
+    <a href="#" data-id="" class="{{ 'on' if not params.identity }}">全部</a>
+    {%- for k, card in apply_profiles['profiles'].items() %}
+    <a href="#" data-id="{{ k }}" class="{{ 'on' if params.identity==k }}" title="{{ card.get('display_name', k) }}">{{ card.get('label', k[:1]|upper) }}</a>
+    {%- endfor %}
+  </span>{% endif %}
   <nav class="counts">
     {# Module 1 — the PIPELINE: one object (a role) moving through stages. #}
     <a href="/?status=new" class="{{ 'on' if params.status=='new' }}">review <b>{{ counts.new }}</b></a>
     <a href="/?status=applied" class="{{ 'on' if params.status=='applied' }}">applied <b>{{ counts.applied }}</b></a>
     <a href="/?status=interviewing" class="{{ 'on' if params.status=='interviewing' }}">interviewing <b>{{ counts.interviewing }}</b></a>
     <a href="/interviews" title="每场面试的问题与 action items，索引自 面试复盘/">🎤 复盘</a>
+    <a href="/recite" title="Recite 念稿练习：主问题、追问、原声对话都在这里">🎙 念稿</a>
+    <a href="/contacts" title="按公司、姓名和邮箱查看 recruiter 联系人">👥 联系人</a>
+    <a href="/outreach" title="自荐信草稿：联系人 → 这家的合格岗位 → 四段式草稿 → Gmail 草稿箱（你自己发）">✉️ 外联</a>
     {# 2026-08-03 瘦身：skip/rej/all 筛选与 /browse 从导航摘掉（路由还在，直接输网址可达）。
        关心的是走到哪一步：投了什么、面了什么、复盘了什么。 #}
     {# Module 2 — feeders & follow-through tools #}
@@ -27,7 +36,9 @@
     <a href="/followups" title="applications that have gone quiet">⏳ quiet</a>
     {# Module 3 — analytics & extras #}
     <a href="/health" title="定时任务体检表：谁按时跑了、谁失联、谁上次失败">🩺 体检</a>
+    <a href="/settings" title="工作台设置：一键授权 Google（Gmail + Calendar）、邮箱/日历接通状态">⚙ 设置</a>
     <a class="dim" href="/ideas" title="daily idea radar: Show HN · GH Trending · Product Hunt">💡</a>
+    <a href="/trends" title="鸭先知：市场在招什么技能、哪类岗最缺人（挂龄）、新词雷达、公司发岗突变">🦆 trend</a>
   </nav>
   <div class="runinfo">
     {% if run %}
@@ -40,6 +51,75 @@
   </div>
 </header>
 
+{# 2026-09-28（owner 拍板，帮手工作台改版）：筛选栏从页眉下方挪到左侧固定栏，改选项不再自动刷新，
+   点「Apply」才生效——帮手一次把公司/日期/简历状态都调好再刷新，页面也不会因为每改一项就跳一次。
+   hidden-companies 折叠块跟着搬进侧栏底部。右侧 .content 放配额条 + 岗位表。 #}
+<div class="layout">
+<script>/* 收起状态在渲染前恢复，避免闪一下（owner 2026-09-28：侧栏要能收回去） */
+try { if (localStorage.getItem("jobscan.filterpane") === "1") document.currentScript.parentElement.classList.add("collapsed"); } catch (_) {}</script>
+<aside class="filterpane">
+<div class="pane-head"><span>Filters</span><button type="button" id="pane-toggle" title="收起 / 展开筛选栏（记住你的选择）">◀</button></div>
+<form id="filters" method="get" action="/">
+  <input type="hidden" name="status" value="{{ params.status }}">
+  <input type="hidden" name="rot" value="{{ params.rot }}">
+  <input type="hidden" name="showall" value="{{ params.showall }}">
+  <label>Search<input name="q" value="{{ params.q }}" placeholder="company / title…"></label>
+  <label>Company<select name="company">
+    <option value="">all</option>
+    {% for c in companies %}<option value="{{ c }}" {{ 'selected' if params.company==c }}>{{ c }}</option>{% endfor %}
+  </select></label>
+  <label>Seen<select name="seen" id="seen-sel">
+    {% for v, label in [('all','any time'), ('today','new today'), ('week','this week'), ('two_weeks','last 2 weeks'), ('month','last 30 days')] %}
+      <option value="{{ v }}" {{ 'selected' if params.seen==v }}>{{ label }}</option>
+    {% endfor %}
+    {% if params.seen and params.seen not in ['all','today','week','two_weeks','month'] %}
+      <option value="{{ params.seen }}" selected>≥ {{ params.seen }}</option>
+    {% endif %}
+  </select>
+  <input type="date" id="seen-date" value="{{ params.seen if params.seen not in ['all','today','week','two_weeks','month'] else '' }}"
+         title="只看这天及之后首次出现的岗位（选了就覆盖上面的下拉；点 Apply 生效）"
+         onchange="var s=document.getElementById('seen-sel'); if(this.value){var o=[...s.options].find(o=>o.value===this.value)||new Option('≥ '+this.value,this.value); s.add(o); s.value=this.value;} else {s.value='all';}"></label>
+  <label>Verdict<select name="verdict">
+    <option value="">all</option>
+    {% for v in ['strong','consider','weak'] %}<option value="{{ v }}" {{ 'selected' if params.verdict==v }}>{{ v }}</option>{% endfor %}
+  </select></label>
+  <label>Resume<select name="tailored" title="tailored résumé state — ready = a validated, scored PDF exists for this role">
+    <option value="">all</option>
+    <option value="ready" {{ 'selected' if params.tailored=='ready' }}>📄 resume ready</option>
+    <option value="none" {{ 'selected' if params.tailored=='none' }}>⭘ needs resume</option>
+  </select></label>
+  <label>Apply friction<select name="ease" title="Greenhouse/Ashby/Lever/Rippling/SmartRecruiters are one public page with no account; Workday/Avature force an account + multi-step wizard; LinkedIn-sourced roles are neither and show under all">
+    <option value="">all</option>
+    <option value="easy" {{ 'selected' if params.ease=='easy' }}>⚡ one page, no account</option>
+    <option value="account" {{ 'selected' if params.ease=='account' }}>🔐 account + wizard</option>
+  </select></label>
+  <label>Level<select name="seniority">
+    <option value="">all</option>
+    <option value="mid" {{ 'selected' if params.seniority=='mid' }}>mid</option>
+    <option value="senior" {{ 'selected' if params.seniority=='senior' }}>senior</option>
+  </select></label>
+  <label>Location<select name="remote">
+    <option value="">all</option>
+    <option value="remote" {{ 'selected' if params.remote=='remote' }}>remote only</option>
+    <option value="bay" {{ 'selected' if params.remote=='bay' }}>🌉 remote or Bay Area</option>
+  </select></label>
+  <label>Tag<select name="tag" title="company flags from company_notes.yaml — onsite_interview / startup">
+    <option value="">all</option>
+    <option value="onsite" {{ 'selected' if params.tag=='onsite' }}>🏢 onsite interview</option>
+    <option value="startup" {{ 'selected' if params.tag=='startup' }}>🚀 startup</option>
+    <option value="onsite_or_startup" {{ 'selected' if params.tag=='onsite_or_startup' }}>🏢 or 🚀</option>
+  </select></label>
+  <label>Min score<input name="min_score" type="number" min="0" max="100" step="5" value="{{ params.min_score }}" placeholder="0–100"></label>
+  <label>Sort<select name="sort">
+    {% for v, label in [('diversity','one per company (score+fresh)'), ('score','score + fresh'), ('base_score','score only'), ('first_seen','newest'), ('company','company A-Z')] %}
+      <option value="{{ v }}" {{ 'selected' if params.sort==v }}>{{ label }}</option>
+    {% endfor %}
+  </select></label>
+  <div class="apply-row">
+    <button class="apply" title="套用左边所有筛选条件（改选项不会自动刷新）">Apply</button>
+    <a class="dim" href="/?status={{ params.status }}" title="清空全部筛选">reset</a>
+  </div>
+</form>
 <details class="settings">
   <summary>⚙ hidden companies ({{ applied_companies|length }})</summary>
   <div class="co-chips">
@@ -49,48 +129,44 @@
     <form id="add-co"><input placeholder="company name…"><button>hide</button></form>
   </div>
 </details>
-
-<form id="filters" method="get" action="/">
-  <input type="hidden" name="status" value="{{ params.status }}">
-  <input name="q" value="{{ params.q }}" placeholder="search company / title…">
-  <select name="company">
-    <option value="">company: all</option>
-    {% for c in companies %}<option value="{{ c }}" {{ 'selected' if params.company==c }}>{{ c }}</option>{% endfor %}
-  </select>
-  <select name="seen">
-    {% for v, label in [('all','seen: any time'), ('today','new today'), ('week','this week')] %}
-      <option value="{{ v }}" {{ 'selected' if params.seen==v }}>{{ label }}</option>
-    {% endfor %}
-  </select>
-  <select name="verdict">
-    <option value="">verdict: all</option>
-    {% for v in ['strong','consider','weak'] %}<option value="{{ v }}" {{ 'selected' if params.verdict==v }}>{{ v }}</option>{% endfor %}
-  </select>
-  <select name="seniority">
-    <option value="">level: all</option>
-    <option value="mid" {{ 'selected' if params.seniority=='mid' }}>mid</option>
-    <option value="senior" {{ 'selected' if params.seniority=='senior' }}>senior</option>
-  </select>
-  <select name="remote">
-    <option value="">location: all</option>
-    <option value="remote" {{ 'selected' if params.remote=='remote' }}>remote only</option>
-  </select>
-  <input name="min_score" type="number" min="0" max="100" step="5" value="{{ params.min_score }}" placeholder="min score">
-  <select name="sort">
-    {% for v, label in [('diversity','sort: one per company (score+fresh)'), ('score','sort: score + fresh'), ('base_score','sort: score only'), ('first_seen','sort: newest'), ('company','sort: company A-Z')] %}
-      <option value="{{ v }}" {{ 'selected' if params.sort==v }}>{{ label }}</option>
-    {% endfor %}
-  </select>
-  <button>filter</button>
-  <input type="hidden" name="rot" value="{{ params.rot }}">
+</aside>
+<div class="content">
+<div class="listbar">
   <span class="dim">{{ rows|length }} shown · keys: j/k move · Enter JD · a applied · s skip · x rejected · i interviewing · n new</span>
-</form>
+  {# 一键 tailor（owner 2026-09-23）：type=button，不提交筛选表单；app.js 读 URL 里的筛选参数原样 POST #}
+  <span class="batch-tailor">
+    <button type="button" id="tailor-batch-btn" title="把当前筛出来的、还没有简历的岗位一次性排进 tailor 批：走夜间同一条流水线（每 5 份简历一个 headless Claude 会话，最多同时 12 个，做完自动 ingest），不用逐行点 ✎">✎ 一键 tailor 当前列表</button>
+    <span id="tailor-batch-status" class="dim"></span>
+  </span>
+</div>
 
-{% if budget %}
+{# 投递节奏（2026-09-28，app/pace.py）：只在 review 页出现。limited = 今天只推冻结的 N 家。 #}
+{% set pz = (pace or {}).get('pace') or {} %}
+{% set pace_on = params.status == 'new' and pz.get('limited') and not params.showall %}
+{% if params.status == 'new' and pz.get('limited') %}
+<div class="pace-note{{ ' paused' if pace_on and pace.quota == 0 }}">
+  {% if params.showall %}
+    👀 正在看<b>全部</b>岗位（投递节奏「{{ pz.label }}」这一页暂时不生效）·
+    <a href="?{% for k, v in params.items() %}{% if k not in ('showall', 'rot') and v %}{{ k }}={{ v|urlencode }}&amp;{% endif %}{% endfor %}">回到今天的名单</a>
+  {% elif pace.quota == 0 %}
+    ⏸ 投递节奏：<b>{{ pz.label }}</b> —— 今天不推新岗位{% if pz.until %}，{{ pz.until }} 自动回「{{ pz.revert_label }}」{% endif %}。扫描照常，岗位都留着。
+  {% else %}
+    🎚 投递节奏：<b>{{ pz.label }}</b> · 今天 <b>{{ pace.frozen }}</b> 家 · 已处理 {{ pace.handled }} · 还剩 <b>{{ pace.remaining }}</b>
+    {% if pace.shown != pace.remaining %}<span class="dim">（筛选后显示 {{ pace.shown }}）</span>{% endif %}
+    {% if pz.until %}· {{ pz.until }} 自动回「{{ pz.revert_label }}」{% endif %}
+    {% if pace.remaining == 0 %}· 今天的份额做完了，新岗位明天见 ✅{% endif %}
+  {% endif %}
+  {% if pz.reverted_from %}<span class="dim">（「{{ pz.reverted_label }}」已到期，自动回到「{{ pz.label }}」）</span>{% endif %}
+  {% if not params.showall %}· <a href="?{% for k, v in params.items() %}{% if k not in ('showall', 'rot') and v %}{{ k }}={{ v|urlencode }}&amp;{% endif %}{% endfor %}showall=1" title="这一页临时看全部合格岗位，不改档位">看全部</a>{% endif %}
+  · <a href="/settings#pace">改档位</a>
+</div>
+{% endif %}
+{% if budget and not pace_on %}
 <div class="cap-note" title="{% for co, c in budget.blocked_companies.items() %}{{ co }}: {{ c.reason }}{% if c.reason == 'stock' %} — 配额用满 {{ c.used }}/{{ c.limit }}{% else %} — {{ c.reason_text|default(c.reason) }} 至 {{ c.until }}{% endif %}&#10;{% endfor %}">
   🎯 {{ budget.companies }} 家公司 · 每家 1 个岗位 ·
   <b>第 {{ budget.round_of }}/{{ budget.rounds }} 轮</b>（前 {{ budget.total }} 家打头）
   · 合格池 {{ budget.eligible }}
+  {% if cooldowns %}· ⏳ <a href="/companies#cooldowns" title="{% for cn, c in cooldowns.items() %}{{ c.company }} 到 {{ c.until }}{% if c.reason %}（{{ c.reason }}）{% endif %}&#10;{% endfor %}扫描跳过 + review 隐藏，到期自动恢复；点开管理">{{ cooldowns|length }} 家 cooldown 中</a>{% endif %}
   {% if budget.retired %}· <b>{{ budget.retired|length }}</b> 家已投满退休（{{ budget.retired[:4]|join(', ') }}{% if budget.retired|length > 4 %}…{% endif %}）{% endif %}
   <a class="rotbtn" href="?{% for k, v in params.items() %}{% if k != 'rot' and v %}{{ k }}={{ v|urlencode }}&amp;{% endif %}{% endfor %}rot={{ budget.next_rot }}">🔄 换一批</a>
   <div class="dim" style="margin-top:3px">
@@ -114,7 +190,7 @@
 </tr></thead>
 <tbody>
 {% for r in rows %}
-<tr data-job-id="{{ r.job_id }}">
+<tr data-job-id="{{ r.job_id }}" data-company="{{ r.company }}">
   {# Reading happens on the left, so acting used to mean a full-width pointer trip to the
      actions column — and a mis-aimed click marks the WRONG row, which is unrecoverable
      (the row leaves review immediately). These two need no extra input, so they can live
@@ -125,26 +201,29 @@
     <button data-act="applied" class="mark-applied" title="mark applied (key: a) — records the résumé variant selected in this row">✓</button>
     <button data-act="skip" title="skip (s)">–</button>
   </td>
-  <td class="co">{{ r.company }}</td>
+  <td class="co">{{ r.company }}{% if r.onsite %} <span class="chip onsite" title="in-person interview: {{ r.onsite_note or 'final round on site' }}">🏢</span>{% endif %}{% if r.startup %} <span class="chip startup" title="startup (company_notes.yaml: startup: true)">🚀</span>{% endif %} <button class="cdbtn" title="这家不让投了 → 加 cooldown：扫描跳过这家、review 隐藏它的岗位，到期自动恢复（/companies 页可解除）">🚫</button></td>
   <td class="title">
     <span class="title-link" title="show JD">{{ r.title }}</span>
     {% if r.seniority == 'senior' %}<span class="chip sr" title="senior-titled role">sr</span>{% endif %}
     {% if r.duplicate_of %}<span class="chip sr" title="LinkedIn shadow of the same physical posting — linked to {{ r.duplicate_of }}. Statuses cascade across the pair and funnel/budget count it as ONE application.">🔗 linked</span>{% endif %}
     {% if r.badge_ref %}<span class="chip warn" title="A DIFFERENT posting (job {{ r.badge_ref.job_id }}{% if r.badge_ref.date %}, {{ r.badge_ref.date }}{% endif %}) with the same company + same title — you marked that one “{{ r.badge_ref.status }}”. THIS is a separate/re-listed job ID, so it stays in review.">⚠ same title · {{ r.badge_ref.status }}{% if r.badge_ref.date %} {{ r.badge_ref.date[5:] }}{% else %} before{% endif %}</span>{% endif %}
     {% if r.hidden_company %}<span class="chip hide" title="company is in the hidden list">co-hidden</span>{% endif %}
+    {% if r.no_sponsor %}<span class="chip hide" title="JD says the employer will not sponsor a visa — hidden from review for a candidate who needs sponsorship (profile.needs_sponsorship)">🚫 no sponsorship</span>{% endif %}
+    {% if r.loc_excluded %}<span class="chip hide" title="outside the preferred locations (scoring.location_pref.review_only) — visible under 'all' only">📍 outside area</span>{% endif %}
     {% if r.cooldown %}<span class="chip warn" title="application cooldown — {{ r.cooldown.reason }}. Scanner skips this company and it's hidden from review until then.">⏳ cooldown to {{ r.cooldown.until }}</span>{% endif %}
     {% if r.tailor_status == 'ready' %}<a class="chip tailor ready{% if r.resume_score is not none %} rs-{{ 'strong' if r.resume_score >= 85 else ('ok' if r.resume_score >= 75 else 'low') }}{% endif %}" href="/api/roles/{{ r.job_id }}/resume.pdf" target="_blank" title="download tailored PDF · résumé↔JD fit score {{ r.resume_score if r.resume_score is not none else '?' }}/100 (85+ strong, 75-84 ok, &lt;75 weak) — separate from the job score on the left">📄 resume{% if r.resume_score is not none %} <b>{{ r.resume_score }}</b>{% endif %}</a>
     {% elif r.tailor_status and r.tailor_status != 'none' %}<span class="chip tailor" title="prompt written to output/prompts — generate with Claude Code, then Ingest">{{ r.tailor_status }}</span>{% endif %}
     <a class="apply" href="{{ r.apply_url }}" target="_blank" rel="noopener" title="open application page">↗</a>
   </td>
   <td class="loc">{% if r.is_remote %}<span class="chip remote">remote</span>{% endif %}<span title="{{ r.location or '' }}">{{ (r.location or '')|truncate(34, True) }}</span></td>
-  <td class="num score" title="stability {{ r.s_stability }} · culture {{ r.s_culture }} · depth {{ r.s_depth }} · wlb {{ r.s_wlb }} — verdict {{ r.verdict }}"><span class="vdot v-{{ r.verdict }}" title="{{ r.verdict }}"></span><b>{{ '%.0f'|format(r.weighted_score or 0) }}</b>{% if r.fresh_bonus %}<span class="chip fresh" title="freshness boost +{{ '%.0f'|format(r.fresh_bonus) }} — {{ 'posted' if r.fresh.posted_known else 'first seen' }} {{ r.fresh.date }} ({{ r.fresh.age_days }}d ago). Ranking only: the {{ '%.0f'|format(r.weighted_score or 0) }} on the left is the job's own score and does not change as it ages.">+{{ '%.0f'|format(r.fresh_bonus) }}</span>{% endif %}{% if r.diversify %}<span class="chip diversify" title="🎲 diversify +{{ '%.0f'|format(r.diversify.bonus) }} — first-ever application to {{ r.company }} (company avg score {{ r.diversify.company_mean }}, zero applications so far). One wildcard per company, at most a handful at a time; the subsidy disappears the moment any application goes out. Ranking only — the score on the left is the job's own and is unchanged.">🎲+{{ '%.0f'|format(r.diversify.bonus) }}</span>{% endif %}</td>
+  <td class="num score" title="stability {{ r.s_stability }} · culture {{ r.s_culture }} · depth {{ r.s_depth }} · wlb {{ r.s_wlb }} — verdict {{ r.verdict }}"><span class="vdot v-{{ r.verdict }}" title="{{ r.verdict }}"></span><b>{{ '%.0f'|format(r.weighted_score or 0) }}</b>{% if r.fresh_bonus %}<span class="chip fresh" title="freshness boost +{{ '%.0f'|format(r.fresh_bonus) }} — {{ 'posted' if r.fresh.posted_known else 'first seen' }} {{ r.fresh.date }} ({{ r.fresh.age_days }}d ago). Ranking only: the {{ '%.0f'|format(r.weighted_score or 0) }} on the left is the job's own score and does not change as it ages.">+{{ '%.0f'|format(r.fresh_bonus) }}</span>{% endif %}{% if r.fit %}<span class="chip {{ 'fresh' if r.fit.coverage >= 0.6 else ('locpref' if r.fit.coverage >= 0.3 else 'hide') }}" title="fit: this résumé base already names {{ (r.fit.coverage * 100)|round|int }}% of the hard skills this JD asks for (scoring.fit_pref). Ranking only: +{{ r.fit.bonus }}; under {{ ((r.fit_excluded and 1) or 0) and '' }}the review_min it moves to 'all'.">🎯{{ (r.fit.coverage * 100)|round|int }}%</span>{% endif %}{% if r.loc_pref and r.loc_pref.bonus %}<span class="chip locpref" title="location preference +{{ '%.0f'|format(r.loc_pref.bonus) }} — {{ 'remote' if r.loc_pref.kind == 'remote' else 'SF Bay Area' }} (优先远程或湾区, config scoring.location_pref). Ranking only — the score on the left is the job's own and is unchanged.">{{ '🏠' if r.loc_pref.kind == 'remote' else '🌉' }}+{{ '%.0f'|format(r.loc_pref.bonus) }}</span>{% endif %}{% if r.diversify %}<span class="chip diversify" title="🎲 diversify +{{ '%.0f'|format(r.diversify.bonus) }} — first-ever application to {{ r.company }} (company avg score {{ r.diversify.company_mean }}, zero applications so far). One wildcard per company, at most a handful at a time; the subsidy disappears the moment any application goes out. Ranking only — the score on the left is the job's own and is unchanged.">🎲+{{ '%.0f'|format(r.diversify.bonus) }}</span>{% endif %}</td>
   <td class="signals">
     {% if r.why %}<div class="why" title="{{ r.why }}">{{ r.why|truncate(60, True) }}</div>{% endif %}
     {% if r.caution %}<div class="caution" title="{{ r.caution }}">{{ r.caution|truncate(60, True) }}</div>{% endif %}
   </td>
   <td class="seen">{% if r.posted_at %}<span title="posted on the board {{ r.posted_at }}">📅 {{ r.posted_at }}</span>{% else %}<span title="this board publishes no posting date — showing when the scanner first saw it">{{ (r.first_seen or '')[:10] }}</span>{% endif %}{% if r.first_seen == today %} <span class="chip new">today</span>{% endif %}</td>
   <td class="actions">
+    {% if apply_profiles.get('profiles') %}{% set apdef = apply_profiles.get('default', 'casey') %}{% set apkey = r.apply_profile_effective or r.apply_profile or apdef %}{% set apcard = apply_profiles['profiles'].get(apkey) or {} %}<button class="idcard{% if apkey != apdef %} alt{% endif %}" data-profile="{{ apkey }}" {% if r.status in ('applied', 'interviewing') %}disabled title="投递身份：{{ apcard.get('display_name', apkey) }} — 已投出，锁定（申请是用这个抬头发出去的）"{% else %}title="投递身份：{{ apcard.get('display_name', apkey) }} — 点击换名片（名字/邮箱/电话），已有简历会立刻换抬头重打，自动填表也跟着换"{% endif %}>{{ apcard.get('label', apkey[:1]|upper) }}</button>{% endif %}
     <span class="status-chip" data-status="{{ r.status }}">{{ r.status }}</span>
     <select class="variant" title="resume variant recorded when marking applied">
       {% for v in resume_variants %}<option>{{ v }}</option>{% endfor %}
@@ -166,7 +245,10 @@
 {% endfor %}
 </tbody>
 </table>
+</div><!-- /.content -->
+</div><!-- /.layout -->
 
-<script src="/static/app.js"></script>
+<script>window.APPLY_PROFILES = {{ apply_profiles | tojson }};</script>
+<script src="/static/app.js?v={{ asset_v() }}"></script>
 </body>
 </html>

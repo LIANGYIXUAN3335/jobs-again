@@ -13,6 +13,11 @@ Four properties are load-bearing here and each is a way this could quietly go wr
 """
 from app import budget, store
 from tests.test_store import role_row
+import datetime
+
+# Seeded applications are dated a few days ago, not a fixed date: the fixed "2026-07-20" fell out
+# of the 60-day pace window on 2026-09-19 and the pace/blocked test began failing by itself.
+_RECENT = (datetime.date.fromisoformat(store.la_today()) - datetime.timedelta(days=5)).isoformat()
 
 
 def _cfg(cfg, *, depth=None, total=50, pool=3, tie=3, stock=None, pace=None, blocked=None):
@@ -45,7 +50,7 @@ def _seed(cfg, spec):
     store.upsert_roles(jobs, rows)
     view = store.connect_view(cfg)
     for jid in applied:
-        store.upsert_state(view, jid, status="applied", applied_date="2026-07-20")
+        store.upsert_state(view, jid, status="applied", applied_date=_RECENT)
     view.commit()
     return view
 
@@ -261,3 +266,19 @@ def test_depth_plan_is_bounded_by_pool_stock_and_target(cfg):
         plan = budget.depth_plan({"a": [role] * pool},
                                  {"a": {"used": used, "left": left}}, c)
         assert plan.get("a") == want, (pool, used, left)
+
+
+def test_stock_cap_can_be_switched_off(cfg):
+    """Owner 2026-09-22: stock OFF. An empty map is what every consumer reads as 'nobody capped';
+    the same rows under the old knob still retire the company, so the switch is the only change."""
+    rows = [{"company_norm": "acme", "company": "Acme", "own_status": "applied",
+             "applied_date": "2026-09-20"} for _ in range(9)]
+    on = budget.stock_status(rows, _cfg(cfg, stock={"default": 8, "window_days": 30}), "2026-09-22")
+    assert on["acme"]["retired"] and on["acme"]["used"] == 9
+    off = budget.stock_status(rows, _cfg(cfg, stock={"enabled": False, "default": 8}), "2026-09-22")
+    assert off == {}
+    picked, info = budget.select_daily(
+        [dict(r, job_id=f"gh:acme:{i}", title="SWE", rank_score=70, first_seen="2026-09-22", own_status="new")
+         for i, r in enumerate(rows)],
+        rows, _cfg(cfg, stock={"enabled": False, "default": 8}), "2026-09-22")
+    assert len(picked) == 9 and info["retired"] == [] and info["blocked_companies"] == {}

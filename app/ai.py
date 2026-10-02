@@ -2,15 +2,17 @@
 (config `ai.enabled` + a key in gitignored secrets.yaml / $ANTHROPIC_API_KEY).
 
 It drafts truthful, first-person answers to OPEN-ENDED application questions ("Why this
-company?", "Describe a project…"), grounded ONLY in Casey's résumé + profile. It NEVER
-answers EEO / legal / work-authorization / demographic questions — those are the user's to
-answer, and the model is instructed and pre-filtered to skip them (defense in depth vs. the
-extension's own EXCLUDE list).
+company?", "Describe a project…"), grounded ONLY in the candidate's résumé + profile. Legal /
+eligibility / EEO questions ARE answered too — from the recorded facts only (owner rescope
+2026-09-09; the owner reviews every form before submitting). The only machine-blank categories are
+compensation and referral source (_NEVER); everything else is fact-grounded or left empty.
 """
 from __future__ import annotations
 
 import json
 import os
+import sys
+import pathlib
 import re
 
 import yaml
@@ -20,40 +22,66 @@ from . import config as cfgmod
 from . import tailoring
 from . import trust
 
-# Questions the model must never answer — mirrors extension/content.js EXCLUDE, plus
-# export-control. These may be factual, but they are sensitive/legal/user-choice fields and the
-# owner must confirm them on the live form.
+# Questions the model must never answer — mirrors extension/content.js EXCLUDE.
+# 2026-09-09 owner rescoped this («我就是一个有 GC EAD 的普通人,这个是可以填的»): legal /
+# eligibility / EEO / criminal / signature questions are now AUTO-FILLED from the recorded
+# facts in _facts() — her status is simple and definite, and she reviews every form before
+# submitting. The guard against harm is FACT-GROUNDING (never guess an unrecorded fact — see
+# _SYSTEM), not category blanking. Only two categories stay machine-blank:
+# compensation (the dedicated /api/salary flow owns it) and referral/"how did you hear"
+# (situational facts nothing on file can answer).
 _NEVER = re.compile(
-    r"gender|ethnic|hispanic|latin|\brace\b|racial|veteran|disab|pronoun|"
-    r"sexual orientation|lgbt|demographic|self.?identif|equal employment|\beeo\b|"
-    r"salary|compensation|desired pay|referr|referral|source of|how did you hear|"
-    r"sponsor|visa|authoriz|work permit|right to work|eligible to work|"
-    r"felony|conviction|criminal|background check|signature|sign your name|"
-    r"certif|attest|acknowledg|consent|privacy|terms|gdpr",
+    # `referr` used to be a bare substring — it also matched "preferred", so Robinhood's
+    # "Which of the preferred qualifications…" was silently skipped (2026-09-23). Word-bounded now.
+    r"salary|compensation|desired pay|\breferral\b|\breferred by\b|\bwho referred\b|source of|how did you hear",
     re.I,
 )
 
+# The one sentence for every work-authorization / sponsorship box (owner 2026-08-07 定稿:
+# "不主动展开移民细节"). Overridden by config profile.work_authorization_answer; the extension
+# carries the same default (content.js LEGAL_CANON) for its deterministic path.
+_LEGAL_CANON = "I'm authorized to work in the US and I don't require sponsorship."
+
 _SYSTEM = """You are drafting job-application answers in the FIRST PERSON as the candidate, \
-Casey Example. Absolute rules:
+__NAME__. Absolute rules:
 - Ground every answer ONLY in the candidate facts provided. Never invent employers, titles, \
 dates, metrics, skills, or claims not present in the facts.
 
 Sound like a real person, not an AI or a press release. This matters:
-- Write the way a sharp engineer actually talks about her work — plain, direct, a little \
+- Write the way a sharp engineer actually talks about their work — plain, direct, a little \
 personal. Use contractions (I'm, I've, it's, that's). Vary sentence length; don't make every \
 sentence the same polished shape.
 - BAN this corporate/AI filler: "leverage", "spearheaded", "passionate about", "align with", \
 "excited to contribute", "I am confident that", "proven track record", "cutting-edge", \
 "seamlessly", "robust", "in today's fast-paced", "furthermore", "moreover", "delve". If a \
 sentence sounds like a cover-letter template, rewrite it plainer.
+- INTENT FIRST (owner 2026-09-11): before writing each answer, silently work out WHY the \
+employer asks this — what risk they're screening for, or what signal they hope to see. Then \
+write the answer so it (a) directly answers the literal question in the first sentence, and \
+(b) resolves the underlying concern with concrete evidence, not reassurance. Examples of the \
+translation: "describe your remote experience" is really "will coordination and delivery \
+suffer when you're not in the office?" — so state the arrangement, then show the mechanisms \
+that keep you coordinated and shipping. "Any cool project for fun?" is really "do you have \
+genuine drive beyond assigned work?". "Why this company?" is really "did you do homework, \
+and will you stay?". Never answer the surface question while leaving the real worry untouched.
 - Lead with the real thing you did or the real reason, not a throat-clearing preamble. It's \
-fine to be specific and slightly informal ("At TikTok I…", "What pulls me toward this is…").
+fine to be specific and slightly informal ("At __EMPLOYER_1__ I…", "What pulls me toward this is…").
 - For a "why this role/company" style answer, tell it like a person: first name, in plain words, \
 what THEY build or the problem THEY have (what you saw in the post), THEN connect one concrete \
 thing you actually did. Never compress it into an abstract equation like "X is a Y and that maps \
 what I do" — no human talks that way. Keep sentences short enough to read aloud without stumbling.
-- Reference real companies/projects (GMV Max, the AI-agent onboarding platform, the \
-MySQL/Cassandra product backend) where relevant, with the real numbers.
+- Reference the real companies/projects named in the candidate facts where relevant, with \
+the real numbers.
+- For "side project / personal project / built for fun / outside of work" questions: lead with \
+ONE of the Personal side projects from the candidate facts — pick whichever fits this company \
+best and tell it concretely (what it does, one or two real details), don't list them all. \
+Only fall back to a work anecdote if no side project fits at all. Never invent side projects \
+beyond that list.
+- For "remote work experience" questions: answer the question actually asked — HER OWN \
+experience of working away from the office — from the Remote work facts. Lead with the honest \
+arrangement (hybrid, days per week from home), then what makes them productive on home days. \
+Do NOT substitute distributed-team collaboration for personal remote experience, and never \
+imply they have worked fully remote.
 - Be concise and confident; no apologies, no "I hope to", no hedging.
 - SHORT SENTENCES — this is the point, NOT a short answer. One idea per sentence, the way you'd \
 say it out loud. Break up every long compound/complex sentence: a line that needs a comma-plus- \
@@ -61,20 +89,33 @@ say it out loud. Break up every long compound/complex sentence: a line that need
 but never in long winding sentences. Use contractions and plain words.
 - For a SHORT factual field (current job title, current/previous employer, most recent school, \
 degree, years of experience, current location/company), answer with JUST the value — e.g. \
-"Software Engineer", "TikTok", "Illinois Institute of Technology" — not a full sentence.
+"Software Engineer", "__EMPLOYER_1__", "__SCHOOL__" — not a full sentence.
 - Every REQUIRED question needs a real answer — do NOT return empty just because the résumé \
 doesn't spell it out. If it asks about your familiarity or experience with a common tool, \
 process, or system that this role or company uses (e.g. "describe your interaction with the \
 Workday system", "how have you used Jira?"), first work out what that thing is and how a software \
-engineer at a big company actually touches it, then answer from your real day-to-day at TikTok and \
-Meta — honest and a little general is fine. Don't invent specific projects, numbers, dates, or \
+engineer at a big company actually touches it, then answer from your real day-to-day at __EMPLOYER_1__ and \
+__EMPLOYER_2__ — honest and a little general is fine. Don't invent specific projects, numbers, dates, or \
 credentials you don't have; stay truthful and general rather than leaving it blank.
-- ONLY return an empty string for a legal / eligibility / demographic question (work \
-authorization, sponsorship, veteran / disability / race / gender, salary, criminal history, \
-U.S.-person status) — those are the candidate's to answer herself.
+- Legal / eligibility / demographic questions (work authorization, sponsorship, citizenship, \
+export control, security clearance, veteran / disability / race / gender, criminal history, \
+U.S.-person status) ARE answerable: the candidate facts record their definite status. \
+Answer them exactly from those facts — the owner reviews every form before submitting. \
+For a work-authorization or sponsorship question use the CANONICAL sentence given in the facts, \
+word for word (prefixed with "Yes." / "No." when the question is yes/no). Never volunteer the \
+visa type, EAD, I-485, green card or citizenship unless the question explicitly asks for the \
+status or basis — then name only the Employment Authorization Document (EAD). \
+Return an empty string ONLY for salary/compensation (a separate flow owns it) and for personal \
+facts NOT on file — non-compete details, whether they previously applied or interviewed at this \
+company, or anything else the facts above don't cover. NEVER guess those; an empty field the \
+candidate fills in 5 seconds beats a wrong commitment under their name.
+- NEVER volunteer a weakness, gap, or missing qualification — not in optional "anything else" \
+boxes either. An answer sells real overlap. If an OPTIONAL field has nothing strong to say, \
+return an empty string; no "happy to grow into the role", no "I should be straight about \
+something".
 - If a question asks the applicant to PERFORM an external action right now — call an API \
 endpoint and paste the output, run code and report the result, complete a puzzle/challenge/\
-assessment, record a video, attach or create a file — you cannot do that for her. Do NOT \
+assessment, record a video, attach or create a file — you cannot do that for them. Do NOT \
 fabricate a result and NEVER write that you are unable to do it (that text would be submitted \
 on the form). Return exactly the string "[NEEDS_HUMAN]" for that question so the field is \
 left blank for the candidate to complete herself.
@@ -104,12 +145,35 @@ _REJECT = [
 ]
 
 
-def _hard_reject(text: str) -> str | None:
-    """Reason string if `text` must never be typed onto a form, else None."""
+def _hard_reject(text: str, cfg: dict | None = None) -> str | None:
+    """Reason string if `text` must never be typed onto a form, else None. Workspace-specific
+    phrases come from config `ai.reject_phrases` (e.g. the owner's "never claim to hold an
+    H-1B") — they are facts about ONE candidate, so they cannot live in code."""
     for reason, rx in _REJECT:
         if rx.search(text or ""):
             return reason
+    for pat in ((cfg or {}).get("ai") or {}).get("reject_phrases") or []:
+        try:
+            if re.search(pat, text or "", re.I):
+                return "config_phrase"
+        except re.error:
+            continue
     return None
+
+
+def _personalize(text: str, cfg: dict) -> str:
+    """Fill the __NAME__ / __EMPLOYER_n__ / __SCHOOL__ tokens in a prompt from the workspace's
+    résumé base, so the same code serves any candidate (owner 2026-09-23)."""
+    try:
+        base = tailoring.load_base(cfg)
+    except FileNotFoundError:
+        base = {}
+    jobs = [j.get("company", "") for j in base.get("experience", []) if j.get("company")]
+    edu = base.get("education") or []
+    return (text.replace("__NAME__", base.get("name") or "the candidate")
+                .replace("__EMPLOYER_1__", jobs[0] if jobs else "my current employer")
+                .replace("__EMPLOYER_2__", jobs[1] if len(jobs) > 1 else (jobs[0] if jobs else "my previous employer"))
+                .replace("__SCHOOL__", (edu[0].get("school") if edu else "") or "my university"))
 
 
 def _lessons() -> str:
@@ -136,8 +200,102 @@ def load_key(cfg: dict) -> str | None:
     return os.environ.get("ANTHROPIC_API_KEY")
 
 
+def _ready(cfg: dict) -> bool:
+    """Some backend can answer: the CLI (when selected and installed) or the API key."""
+    return (backend(cfg) == "cli" and cli_available()) or bool(load_key(cfg))
+
+
+def backend(cfg: dict) -> str:
+    """'cli' = the machine's logged-in Claude Code (Max subscription, no API bill), 'api' = the
+    Anthropic key in secrets.yaml. Owner 2026-09-25: default cli, api is the fallback."""
+    return str((cfg.get("ai") or {}).get("backend") or "api").lower()
+
+
+def cli_available() -> bool:
+    return pathlib.Path(_CLAUDE_BIN).exists()
+
+
 def available(cfg: dict) -> bool:
-    return bool((cfg.get("ai") or {}).get("enabled")) and bool(load_key(cfg))
+    if not (cfg.get("ai") or {}).get("enabled"):
+        return False
+    if backend(cfg) == "cli" and cli_available():
+        return True
+    return bool(load_key(cfg))
+
+
+def model_label(cfg: dict) -> str:
+    """What to write in answers.jsonl: which backend AND model produced the text."""
+    ai = cfg.get("ai") or {}
+    if backend(cfg) == "cli" and cli_available():
+        return "cli:" + str(ai.get("cli_model") or _CLI_MODEL)
+    return str(ai.get("model") or "claude-opus-4-8")
+
+
+_CLAUDE_BIN = os.path.expanduser("~/.local/bin/claude")
+_CLI_MODEL = "claude-opus-5-5"
+_CLI_CWD = cfgmod.resolve_path("data/cli_cwd")      # an EMPTY dir: no CLAUDE.md, no repo context leaks into the answer
+
+
+def _complete_cli(cfg: dict, system: str, user: str, *, effort: str | None, timeout: int) -> str:
+    """One headless `claude -p` turn on the subscription. Tools off, one turn, own system prompt,
+    JSON envelope so we get the bare answer text back. Raises on any failure (caller falls back)."""
+    import subprocess
+    ai = cfg.get("ai") or {}
+    model = str(ai.get("cli_model") or _CLI_MODEL)
+    _CLI_CWD.mkdir(parents=True, exist_ok=True)
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}   # never bill the API by accident
+    argv = [_CLAUDE_BIN, "-p", user, "--model", model, "--output-format", "json",
+            "--system-prompt", system, "--tools", "", "--max-turns", "1", "--no-session-persistence"]
+    if effort:
+        argv += ["--effort", str(effort)]
+    r = subprocess.run(argv, cwd=str(_CLI_CWD), env=env, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0 and not r.stdout.strip():
+        raise RuntimeError(f"claude -p exit {r.returncode}: {r.stderr.strip()[:300]}")
+    try:
+        d = json.loads(r.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError):
+        raise RuntimeError(f"claude -p returned no JSON envelope: {r.stdout[:200]!r}")
+    if d.get("is_error"):
+        raise RuntimeError(f"claude -p error: {str(d.get('result'))[:300]}")
+    return str(d.get("result") or "")
+
+
+def _complete_api(cfg: dict, system: str, user: str, *, max_tokens: int, model: str | None,
+                  thinking: bool, effort: str | None) -> str:
+    key = load_key(cfg)
+    if not key:
+        raise RuntimeError("no Anthropic API key (set secrets.yaml or ANTHROPIC_API_KEY)")
+    ai = cfg.get("ai") or {}
+    model = model or ai.get("model", "claude-opus-4-8")
+    import anthropic
+    client = anthropic.Anthropic(api_key=key)
+    kwargs = {"model": model, "max_tokens": max_tokens, "system": system,
+              "messages": [{"role": "user", "content": user}]}
+    if "haiku" not in model:                      # Haiku 4.5 has no adaptive thinking / effort
+        if thinking:
+            kwargs["thinking"] = {"type": "adaptive"}
+        kwargs["output_config"] = {"effort": effort or ai.get("effort", "high")}
+    resp = client.messages.create(**kwargs)
+    return "".join(b.text for b in resp.content if b.type == "text")
+
+
+def complete(cfg: dict, *, system: str, user: str, max_tokens: int = 1500, model: str | None = None,
+             thinking: bool = True, effort: str | None = None) -> str:
+    """Every model call in JobScan goes through here. Backend per config ai.backend: `cli` runs
+    the local Claude Code on the subscription and falls back to the API key when the CLI fails
+    (not logged in, quota window, timeout) — loudly, one stderr line — so a form fill never
+    silently dies; `api` is the original path, byte-for-byte."""
+    ai = cfg.get("ai") or {}
+    if backend(cfg) == "cli" and cli_available():
+        try:
+            return _complete_cli(cfg, system, user, effort=effort or ai.get("effort"),
+                                 timeout=int(ai.get("cli_timeout_sec", 120)))
+        except Exception as e:  # noqa: BLE001 — fall back, but say so
+            print(f"ai: claude CLI failed ({type(e).__name__}: {str(e)[:160]}); "
+                  f"{'falling back to the API key' if load_key(cfg) else 'no API key to fall back to'}", file=sys.stderr)
+            if not load_key(cfg):
+                raise
+    return _complete_api(cfg, system, user, max_tokens=max_tokens, model=model, thinking=thinking, effort=effort)
 
 
 def _facts(cfg: dict, role: dict) -> str:
@@ -152,7 +310,14 @@ def _facts(cfg: dict, role: dict) -> str:
     if prof.get("preferred_name"):
         parts.append(f"Preferred name: {prof['preferred_name']} {prof.get('preferred_last_name', '')}".strip())
     for k, label in (("location", "Location"), ("country", "Country"),
-                     ("work_authorization", "Work authorization")):
+                     ("work_authorization", "Work authorization"),
+                     ("years_of_experience",
+                      "Years of experience (canonical — use for any years question or bucket)"),
+                     ("relocation", "Relocation / onsite willingness"),
+                     ("notice_period",
+                      "Notice period (an earliest-start-date question = about this long after an offer)"),
+                     ("favorite_recent_ai",
+                      "Favorite recent AI development (canonical talking points — phrase to fit the question)")):
         if prof.get(k):
             parts.append(f"{label}: {prof[k]}")
     eeo = cfg.get("eeo") or {}
@@ -162,11 +327,47 @@ def _facts(cfg: dict, role: dict) -> str:
                      "never substitute a real value for it):")
         for k, v in eeo.items():
             parts.append(f"  {k.replace('_', ' ')}: {v}")
-    parts.append("No criminal convictions have been recorded for this candidate; if a question "
-                 "asks about criminal history or a background check and no fact covers it, "
-                 "leave the answer empty rather than guessing.")
+    # Legal / eligibility persona (owner 2026-09-09): simple and fully recorded — answer these
+    # confidently. Anything NOT listed here or in the profile is not a fact on file.
+    canon = prof.get("work_authorization_answer") or _LEGAL_CANON
+    legal = list(prof.get("legal_facts") or [])
+    legal.append("Work authorization / sponsorship — CANONICAL ANSWER, use these exact words: "
+                 f"\"{canon}\" (prefix Yes./No. for a yes/no question). Do NOT volunteer visa type or "
+                 "immigration details unless the question explicitly asks for the status/basis — then "
+                 f"answer \"{prof.get('visa_status_answer') or 'see the facts above'}\"")
+    legal.append("Employment history: exactly the employers listed below — no other employment, "
+                 "internship, vendor, contractor or temp relationship with any company")
+    parts.append("Legal / eligibility facts (definite — answer such questions from these; anything "
+                 "NOT listed here is not a fact on file):\n" + "\n".join(f"  - {x}" for x in legal))
+    for k, label in (("ethnicity", "Race/ethnicity self-identification"),
+                     ("veteran_status", "Veteran status"),
+                     ("disability_status", "Disability status")):
+        if prof.get(k):
+            parts.append(f"{label}: {prof[k]}")
     for e in base.get("education", []):
         parts.append(f"Education: {e['degree']}, {e['school']} ({e['dates']})")
+    # Remote-work facts (2026-09-11): without these, "describe your remote experience"
+    # got answered with distributed-team collaboration — which reads as "never worked
+    # remote". Owner-confirmed: hybrid at __EMPLOYER_1__ and Meta, never fully remote.
+    rw = base.get("remote_work") or {}
+    if rw:
+        parts.append("\nRemote work experience (owner-confirmed, honest): " + rw.get("arrangement", ""))
+        parts.extend(f"  - {f}" for f in rw.get("facts", []))
+    # Personal side projects (2026-09-11): without these, questions explicitly about
+    # side/personal projects could only reach for early-career work anecdotes. But they are
+    # STRICTLY for that question shape (owner 2026-09-15, after "Share something cool" came
+    # back as a side-project pitch): any general cool/proud/impressive-work question must be
+    # answered from the employment experience below — the résumé is the baseline, and the
+    # reader has it open in the other tab.
+    if base.get("side_projects"):
+        parts.append(
+            "\nPersonal side projects — use ONLY when the question explicitly asks about a "
+            "personal / side / hobby / outside-of-work project. For any general question "
+            "(coolest thing you've built, proudest work, exceptional work, impressive "
+            "project), answer from the employment experience below instead:")
+    for p in base.get("side_projects", []):
+        parts.append(f"\nPersonal side project: {p['name']} ({p.get('year','')}, {p.get('stack','')}):")
+        parts.extend(f"  - {f}" for f in p.get("facts", []))
     parts.append("Skills: " + ", ".join(
         s for items in (base.get("skills_master") or {}).values() for s in items))
     for job in base.get("experience", []):
@@ -207,9 +408,8 @@ def _extract_json(text: str) -> str:
 def answer_questions(cfg: dict, role: dict, questions: list[str]) -> dict[str, str]:
     """Draft answers for the open-ended `questions`. Returns {question: answer}; skips any
     question that matches the never-answer filter or that the model declines (empty answer)."""
-    key = load_key(cfg)
-    if not key:
-        raise RuntimeError("no Anthropic API key (set secrets.yaml or ANTHROPIC_API_KEY)")
+    if not _ready(cfg):
+        raise RuntimeError("no model backend: log in the claude CLI (ai.backend: cli) or set an Anthropic API key")
     todo = [(i, q) for i, q in enumerate(questions) if q and q.strip() and not _NEVER.search(q)]
     for q in questions:
         if q and q.strip() and _NEVER.search(q):
@@ -228,21 +428,11 @@ def answer_questions(cfg: dict, role: dict, questions: list[str]) -> dict[str, s
         f"Return a JSON object mapping the question number (string) to the answer.\n\n"
         f"Questions:\n{numbered}"
     )
-    import anthropic
-    client = anthropic.Anthropic(api_key=key)
     needs_human: set[str] = set()   # questions the model flagged as "only a human can do this"
     rejected: dict[str, str] = {}   # answers killed by the deterministic validator, by reason
 
     def _gen(extra: str) -> dict[str, str]:
-        resp = client.messages.create(
-            model=ai.get("model", "claude-opus-4-8"),
-            max_tokens=2500,
-            thinking={"type": "adaptive"},
-            output_config={"effort": ai.get("effort", "high")},
-            system=_SYSTEM + _lessons(),
-            messages=[{"role": "user", "content": base_user + extra}],
-        )
-        text = "".join(b.text for b in resp.content if b.type == "text")
+        text = complete(cfg, system=_personalize(_SYSTEM, cfg) + _lessons(), user=base_user + extra, max_tokens=2500)
         data = json.loads(_extract_json(text))
         out: dict[str, str] = {}
         for i, q in todo:
@@ -254,7 +444,7 @@ def answer_questions(cfg: dict, role: dict, questions: list[str]) -> dict[str, s
             if "NEEDS_HUMAN" in a:
                 needs_human.add(q)
                 continue
-            bad = _hard_reject(a)
+            bad = _hard_reject(a, cfg)
             if bad:
                 rejected[q] = bad
                 continue
@@ -265,7 +455,7 @@ def answer_questions(cfg: dict, role: dict, questions: list[str]) -> dict[str, s
         """Single exit: persist every outcome (answered / needs-human / declined) then return."""
         for q, a in out.items():
             answer_log.log("answer", role, question=q.strip(), answer=a,
-                           model=ai.get("model"), effort=ai.get("effort"), tries=tries_used,
+                           model=model_label(cfg), effort=ai.get("effort"), tries=tries_used,
                            critic_pass=None if verdict is None else bool(verdict.get("pass")),
                            critic_issues=None if verdict is None else verdict.get("issues"))
         for q in needs_human:
@@ -313,8 +503,7 @@ def estimate_salary(cfg: dict, role: dict) -> int | None:
     reference figure FOR the candidate, who still reviews it before submitting. Returns None
     when the model won't give a usable number.
     """
-    key = load_key(cfg)
-    if not key:
+    if not _ready(cfg):
         return None
     ai = cfg.get("ai") or {}
     user = (
@@ -326,21 +515,14 @@ def estimate_salary(cfg: dict, role: dict) -> int | None:
         "screens the candidate out.\n"
         "Reply with ONLY an integer. No $, no commas, no words, no range."
     )
-    import anthropic
-    client = anthropic.Anthropic(api_key=key)
-    resp = client.messages.create(
-        model=ai.get("model", "claude-opus-4-8"),
-        max_tokens=600,
-        system="You are a compensation research assistant. Answer with a single integer only.",
-        messages=[{"role": "user", "content": user}],
-    )
-    text = "".join(b.text for b in resp.content if b.type == "text")
+    text = complete(cfg, system="You are a compensation research assistant. Answer with a single integer only.",
+                    user=user, max_tokens=600, thinking=False)
     m = re.search(r"\b(\d{5,6})\b", text.replace(",", ""))
     if not m:
         return None
     n = int(m.group(1))
     ok = 40_000 <= n <= 900_000
-    answer_log.log("salary", role, answer=(n if ok else None), raw=n, model=ai.get("model"))
+    answer_log.log("salary", role, answer=(n if ok else None), raw=n, model=model_label(cfg))
     return n if ok else None
 
 
@@ -356,7 +538,7 @@ HOW A HUMAN ACTUALLY TELLS THIS (follow this shape):
    describe the job to a friend. Start from what you SAW in the post. e.g. "You're building the
    engine that keeps long agent sessions from falling over." Not a definition, not "X is a Y".
 2. THEN connect to ONE concrete thing YOU did, told as a small story: what you built, where, and
-   one real number. "That's close to what I do at TikTok — I own the state logic behind our
+   one real number. "That's close to what I do at __EMPLOYER_1__ — I own the state logic behind our
    multi-step advertiser flows, and it cut invalid states by 30%."
 3. One or two more sentences at most: a second real overlap, or a genuine specific reason this
    company pulls you. Then stop.
@@ -367,7 +549,7 @@ THE #1 THING TO AVOID — abstract "mapping" sentences that compress two ideas i
    WHY:  no human talks like that. It stacks abstract nouns and states an equivalence instead of
           telling what happened.
    GOOD: "I read that you're building an orchestration engine for long agent sessions. I've
-          basically been doing that at TikTok — I built the state-machine logic behind our
+          basically been doing that at __EMPLOYER_1__ — I built the state-machine logic behind our
           multi-step async advertiser flows."
    Say what you SAW, then what you DID. Never "X is Y, and that maps Z".
 
@@ -376,8 +558,7 @@ Language rules (these are the heart):
   of breath, the sentence is too long or too abstract. Keep sentences under ~20 words.
 - Use contractions (I'm, I've, you're, that's). Active voice. Own the work: "the service I built".
 - No self-adjectives. Show it through the work, never "I am a passionate, results-driven engineer".
-- ONE number per claim, not a wall of metrics. Name real projects (GMV Max, the AI-agent
-  onboarding platform, the MySQL/Cassandra product backend) with the real numbers from the facts.
+- ONE number per claim, not a wall of metrics. Name the real projects from the facts with the real numbers from the facts.
 - BANNED, do not use: "I am excited/thrilled to apply", "I am confident that", "I am passionate
   about", "proven track record", "results-driven", "leverage", "spearheaded", "furthermore",
   "moreover", "in today's fast-paced world", "not only... but also", "I believe my skills align",
@@ -391,6 +572,24 @@ Language rules (these are the heart):
   pattern. Write flowing prose. No signposting ("Let's explore", "It's worth noting").
 - NEVER invent a fact. Every claim must trace to the candidate facts given. If something would
   help but isn't in the facts, leave it out — do not fabricate.
+
+THE MISMATCH FUSE (decide this BEFORE writing anything):
+A letter may only SELL real overlap. NEVER mention, list, or apologize for qualifications the
+candidate lacks — no "I don't have X", no "while I haven't", no "happy to talk through where
+I'd need to grow". A letter that has to negotiate a gap is a letter that should not exist.
+So first decide: does the candidate's actual professional identity (backend / distributed-systems
+software engineer) credibly serve this role's PRIMARY domain? If the role is a specialist
+practitioner job in another field — offensive security / red team / pentest, hardware or silicon
+engineering, mechanical/electrical, construction, legal, research science — and the facts contain
+no real work IN that field, DO NOT write a letter. Output exactly one line instead:
+MISMATCH: <one plain sentence naming the field gap>
+Nothing else. Adjacent is fine (a backend SWE applying for a backend role at a security COMPANY
+is a normal match); dressing adjacency up as field expertise is not — that fails in the interview.
+What is NOT a mismatch (write the letter, sell only the real overlap, never mention the gap):
+a preferred/required degree or PhD, publication wishes, years-of-experience bars, missing
+individual tools or languages, or a JD that wants research/domain flavor ALONGSIDE real backend
+software engineering she does have. The fuse is for a DIFFERENT PRACTICE — not for a harder or
+fancier version of her own practice.
 
 Output the paragraph text ONLY. No greeting, no sign-off, no subject line, no markdown.
 """ + trust.RULE
@@ -436,23 +635,13 @@ Return ONLY a JSON object:
 def _critique(cfg: dict, text: str, facts: str, context: str) -> dict:
     """Judge whether `text` reads like a real person and stays grounded. Returns
     {"pass": bool, "issues": [str], "fix": str}. On any error, passes (never blocks output)."""
-    key = load_key(cfg)
-    if not key or not (text or "").strip():
+    if not _ready(cfg) or not (text or "").strip():
         return {"pass": True, "issues": [], "fix": ""}
     ai = cfg.get("ai") or {}
     user = (f"Candidate facts:\n{facts}\n\n{context}\n\n"
             f'Text to judge:\n"""\n{text}\n"""\n\nJudge it and return the JSON verdict.')
-    import anthropic
-    client = anthropic.Anthropic(api_key=key)
     try:
-        resp = client.messages.create(
-            model=ai.get("model", "claude-opus-4-8"),
-            max_tokens=900,
-            output_config={"effort": ai.get("effort", "high")},
-            system=_CRITIC_SYSTEM,
-            messages=[{"role": "user", "content": user}],
-        )
-        t = "".join(b.text for b in resp.content if b.type == "text")
+        t = complete(cfg, system=_CRITIC_SYSTEM, user=user, max_tokens=900, thinking=False)
         d = json.loads(_extract_json(t))
     except Exception:
         return {"pass": True, "issues": [], "fix": ""}
@@ -480,8 +669,7 @@ def cover_letter(cfg: dict, role: dict, max_words: int = 180) -> str | None:
     person (owner's ask — the old single-shot drafts came out machine-voiced). On a fail it
     rewrites with the critic's notes, up to `ai.quality_max_tries`. Returns the passing draft, or
     the least-flawed attempt if none passes. None if the model gives nothing at all."""
-    key = load_key(cfg)
-    if not key:
+    if not _ready(cfg):
         return None
     ai = cfg.get("ai") or {}
     facts = _facts(cfg, role)
@@ -491,24 +679,13 @@ def cover_letter(cfg: dict, role: dict, max_words: int = 180) -> str | None:
         f"{trust.fence('job description', role.get('jd_text'), 6000)}\n\n"
         f"Write the paragraph in under {max_words} words."
     )
-    import anthropic
-    client = anthropic.Anthropic(api_key=key)
-
     def _gen(extra: str) -> str:
-        resp = client.messages.create(
-            model=ai.get("model", "claude-opus-4-8"),
-            max_tokens=1500,
-            thinking={"type": "adaptive"},
-            output_config={"effort": ai.get("effort", "high")},
-            system=_LETTER_SYSTEM + _lessons(),
-            messages=[{"role": "user", "content": base_user + extra}],
-        )
-        return "".join(b.text for b in resp.content if b.type == "text").strip()
+        return complete(cfg, system=_personalize(_LETTER_SYSTEM, cfg) + _lessons(), user=base_user + extra, max_tokens=1500).strip()
 
     def _finish(text: str | None, tries_used: int, verdict: dict | None) -> str | None:
         if text:
             answer_log.log("cover_letter", role, answer=text,
-                           model=ai.get("model"), effort=ai.get("effort"), tries=tries_used,
+                           model=model_label(cfg), effort=ai.get("effort"), tries=tries_used,
                            critic_pass=None if verdict is None else bool(verdict.get("pass")),
                            critic_issues=None if verdict is None else verdict.get("issues"))
         return text
@@ -522,7 +699,14 @@ def cover_letter(cfg: dict, role: dict, max_words: int = 180) -> str | None:
         text = _gen(extra)
         if not text:
             break
-        bad = _hard_reject(text)
+        if text.startswith("MISMATCH:"):
+            # the fuse fired: a domain-mismatch role must get NO letter, not a spun one.
+            # Return the marker so the endpoint can refuse with the reason (409), and log it
+            # as unanswered — a blank box beats a letter that opens with the candidate's gaps.
+            answer_log.log("unanswered", role, reason="mismatch_fuse",
+                           surface="cover_letter", tries=used, answer=text)
+            return text
+        bad = _hard_reject(text, cfg)
         if bad:
             # never let this text become `best` — a blank box beats an AI-disclosure on a form
             answer_log.log("unanswered", role, reason=f"validator_{bad}",
@@ -540,6 +724,22 @@ def cover_letter(cfg: dict, role: dict, max_words: int = 180) -> str | None:
     return _finish(best, used, best_verdict)
 
 
+def _legal_guidance(cfg: dict) -> str:
+    """One line telling the picker how THIS candidate answers the two legal yes/no questions and
+    a visa-status list — from profile.work_authorized / needs_sponsorship / visa_status_pick."""
+    prof = cfg.get("profile") or {}
+    wa = prof.get("work_authorized", True)
+    ns = bool(prof.get("needs_sponsorship", False))
+    pick = prof.get("visa_status_pick") or ["EAD", "Employment Authorization Document", "Other"]
+    wrong = prof.get("status_terms_wrong") or ["citizen", "permanent resident", "H-1B"]
+    return (f"'authorized to work in the US?' → {'Yes' if wa else 'No'}"
+            + (" (and, if the options say both, the one that also says NO sponsorship is needed)" if wa and not ns
+               else " (and, if the options say both, the one that says sponsorship WILL be needed)" if wa and ns else "")
+            + f"; 'require visa sponsorship now or in the future?' → {'Yes' if ns else 'No'}"
+            + f"; a work-authorization or visa STATUS list → the option naming {' / '.join(pick[:3])}"
+            + f" (never {', '.join(wrong[:4])})")
+
+
 def pick_option(cfg: dict, role: dict, question: str, options: list[str]) -> int:
     """Choose the best option INDEX for a non-sensitive dropdown whose choices are full
     sentences, grounded in the candidate facts. Returns -1 when none fit or the question is one
@@ -548,37 +748,30 @@ def pick_option(cfg: dict, role: dict, question: str, options: list[str]) -> int
         answer_log.log("pick_option", role, question=(question or "").strip(),
                        index=-1, reason="never_filter")
         return -1
-    key = load_key(cfg)
-    if not key or not options:
+    if not _ready(cfg) or not options:
         return -1
     ai = cfg.get("ai") or {}
     numbered = "\n".join(f"{i}. {o}" for i, o in enumerate(options))
     user = (
         f"Candidate facts:\n{_facts(cfg, role)}\n\n"
         f"Application question: {question}\n\nOptions:\n{numbered}\n\n"
-        "Pick the ONE option that is correct for this candidate given her facts. Do not answer "
-        "work authorization, sponsorship, demographic/self-ID, salary, consent, attestation, "
-        "criminal-history, referral-source, or signature questions; answer -1 for those. If "
-        "it's a relocation/on-site question and she is in San Jose CA, prefer 'willing to "
-        "relocate'. If no option fits, or it's something only she can decide, answer -1.\n"
+        "Pick the ONE option that is correct for this candidate given the facts. Legal / "
+        f"eligibility questions ARE answerable from the facts: {_legal_guidance(cfg)}; demographic "
+        "self-ID → exactly the recorded preference. If it's a relocation/on-site question, follow "
+        f"the recorded relocation fact ({(cfg.get('profile') or {}).get('relocation') or 'not on file'}). "
+        "Answer -1 ONLY for salary/compensation, referral source, signature fields, or when no "
+        "option is correct for the facts on file.\n"
         "Reply with ONLY the option number (an integer), nothing else."
     )
-    import anthropic
-    client = anthropic.Anthropic(api_key=key)
-    resp = client.messages.create(
-        model=ai.get("model", "claude-opus-4-8"),
-        max_tokens=400,
-        system="You map a candidate's facts to the single correct dropdown option. Answer with one integer.",
-        messages=[{"role": "user", "content": user}],
-    )
-    text = "".join(b.text for b in resp.content if b.type == "text")
+    text = complete(cfg, system="You map a candidate's facts to the single correct dropdown option. Answer with one integer.",
+                    user=user, max_tokens=400, thinking=False)
     m = re.search(r"-?\d+", text)
     idx = int(m.group(0)) if m else -1
     if not (0 <= idx < len(options)):
         idx = -1
     answer_log.log("pick_option", role, question=(question or "").strip(), options=options,
                    index=idx, answer=(options[idx] if idx >= 0 else None),
-                   model=ai.get("model"))
+                   model=model_label(cfg))
     return idx
 
 
@@ -779,21 +972,10 @@ def review_take(cfg: dict, ctx: dict) -> dict:
     if name:
         parts.append(f"\nIn this interview the interviewer called her {name}.")
 
-    import anthropic
-    client = anthropic.Anthropic(api_key=key)
     user = "\n".join(parts)
 
     def _ask(max_tokens: int, think: bool) -> str:
-        kw = {"thinking": {"type": "adaptive"}} if think else {}
-        resp = client.messages.create(
-            model=ai.get("model", "claude-opus-4-8"),
-            max_tokens=max_tokens,
-            output_config={"effort": ai.get("effort", "high")},
-            system=_RECITE_SYSTEM + _lessons(),
-            messages=[{"role": "user", "content": user}],
-            **kw,
-        )
-        return "".join(b.text for b in resp.content if b.type == "text")
+        return complete(cfg, system=_RECITE_SYSTEM + _lessons(), user=user, max_tokens=max_tokens, thinking=think)
 
     # max_tokens 要装下 thinking + JSON。2000 在长条目上被 thinking 吃光过，返回了零个 text
     # block —— 而那正好是判官"没给分但也没报错"的样子，最难查的一种失败。宽一点，并且

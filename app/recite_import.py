@@ -576,6 +576,59 @@ def import_openers(conn, cfg: dict) -> dict:
     return {"imported": n}
 
 
+# ---------------------------------------------------------------- 通道 ④ 参考件（他人实录）
+
+def import_reference(conn, recap_path: Path, speaker: str) -> dict:
+    """他人实录整场导入（她的裁决 8/31：所有面试都要在库里，包括阿雅的 Apple screen1）。
+
+    和主通道的差别：**不受 `script != null` 准入约束**（他人实录本来就不产她的念稿），
+    source='reference' + deferred=1 —— 库里可见、可听、可看对话，但不进练习队列、不建
+    recite_state。target_sec 用原声段时长兜底。
+    """
+    doc = json.loads(recap_path.read_text(encoding="utf-8"))
+    interview = doc.get("interview") or recap_path.stem.replace(".recap", "")
+    slug = _slugify(interview)
+    seg_root = recap_path.parent.parent / "segments"
+    if not seg_root.exists():
+        seg_root = recap_path.parent / "segments"
+    n = copied = 0
+    for it in doc.get("items") or []:
+        raw_id = str(it.get("id") or "")
+        short = raw_id.split("-")[-1] if raw_id else f"a{n:02d}"
+        item_id = f"iv:{slug}:{short}"
+        script = (it.get("script") or "").strip()
+        oa = it.get("orig_audio") or {}
+        target = int(hand) if (hand := it.get("target_sec")) else 0
+        if not target:
+            if script:
+                target = recite.target_sec_from_words(len(recite.words(script)))
+            else:
+                target = max(MIN_TARGET, min(MAX_TARGET,
+                                             int(oa.get("end", 0)) - int(oa.get("start", 0))))
+        pts = recite.parse_key_points(it.get("key_points") or [])
+        name = copy_orig(seg_root, slug, short, item_id) if oa else ""
+        copied += bool(name)
+        upsert_item(conn, {
+            "item_id": item_id, "source": "reference", "company": doc.get("company") or "",
+            "interview": interview, "kind": _kind_of(it),
+            "question": it.get("question") or "", "question_zh": it.get("question_zh") or "",
+            "script": script, "script_zh_gloss": it.get("script_zh_gloss") or "",
+            "key_points": json.dumps(pts, ensure_ascii=False),
+            "orig_text": it.get("orig_text") or "", "orig_audio": name,
+            "critique_zh": it.get("critique_zh") or "", "target_sec": target,
+            "variants": "[]", "scope": "unknown", "quality": "ok", "deferred": 1,
+            "story_id": "", "link_group": None, "delivery_notes": "[]",
+            "why_q": it.get("why_q") or "", "why_ref": it.get("why_ref") or "",
+            "gloss_precord": 0, "pace": None,
+            "debrief_line": it.get("debrief_line") or "",
+            "followup_q": it.get("followup_q") or "", "speaker_name": speaker,
+            "asr_dirty": 0, "extra_cues": "[]",
+        })
+        n += 1
+    conn.commit()
+    return {"imported": n, "orig_copied": copied, "interview": interview}
+
+
 # ---------------------------------------------------------------- 报告
 
 def report(stats: dict) -> int:
@@ -614,6 +667,8 @@ def main(argv=None) -> int:
     ap.add_argument("--from-openers", action="store_true")
     ap.add_argument("--company", action="append", default=[])
     ap.add_argument("--all", dest="all_dir")
+    ap.add_argument("--reference", help="单场他人实录的 recap.json 路径")
+    ap.add_argument("--speaker", default="", help="他人实录里的受访者叫什么（如 阿雅）")
     a = ap.parse_args(argv)
 
     cfg = cfgmod.load_config()
@@ -629,6 +684,10 @@ def main(argv=None) -> int:
         print(f"  公司 {s['companies']} · 导入 {s['imported']}")
         if s["no_cue"]:
             print(f"  ⚠️ 无 Cue card，拒绝导入：{', '.join(s['no_cue'])}")
+    if a.reference:
+        print(f"→ 参考件通道（他人实录）：{a.reference}")
+        s = import_reference(conn, Path(a.reference), a.speaker)
+        print(f"  「{s['interview']}」导入 {s['imported']} 条 · 原声拷贝 {s['orig_copied']}")
     if a.from_openers or a.all_dir:
         print("→ 开口微稿")
         print(f"  导入 {import_openers(conn, cfg)['imported']}")

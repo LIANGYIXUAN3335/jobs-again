@@ -51,9 +51,13 @@ Score each item:
   "ai_disclosure"   — the text reveals or implies it was written by an AI/assistant
   "refusal"         — says "I can't / I'm unable to ..." about a task the form asked to perform
   "should_be_blank" — the question demanded an external action (call an API and paste the
-                      output, run code, solve a challenge, attach a file) or a legal/EEO/
-                      salary choice; ANY generated text here is wrong — the field should have
-                      been left for the candidate
+                      output, run code, solve a challenge, attach a file), asked for
+                      salary/compensation or referral source, or asked a personal fact NOT in
+                      the candidate facts (non-compete, prior application/interview at this
+                      company, anything else the facts don't cover) that got answered anyway. NOTE (owner 2026-09-09): legal /
+                      eligibility / EEO answers that MATCH the recorded facts are CORRECT
+                      behavior — do not flag those; flag them only when they contradict or
+                      exceed the facts
   "placeholder"     — contains template residue like [Company], TODO, lorem, unfilled blanks
   "off_target"      — confidently answers about a different company/role than the context
   "overclaim"       — inflates seniority/scope beyond the facts (e.g. claims to have led an

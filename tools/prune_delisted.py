@@ -35,7 +35,7 @@ from app import config as cfgmod, store  # noqa: E402
 BACKUP = "data/purged_delisted_backup.json"
 
 
-def main(dry: bool):
+def main(dry: bool, min_lag_days: int = 0):
     cfg = cfgmod.load_config()
     conn = store.connect_view(cfg)      # attaches jobs + user_state
 
@@ -58,11 +58,24 @@ def main(dry: bool):
         " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
         f" WHERE {NOT_BOARD.format(col='r.job_id')}").fetchall()
 
+    import datetime
     gone = []
     for r in rows:
         seen = (r["last_seen"] or "")[:10]
         newest = comax.get(r["company_norm"]) or ""
         if seen and newest and seen < newest and (r["own_status"] or "new") == "new":
+            # --min-lag-days (2026-09-15): a role seen YESTERDAY but not today sits on the
+            # soft edge the module docstring warns about — one day of scan variance
+            # (pagination, keyword filter) looks identical to a delisting. Holding those
+            # back costs nothing: a real delisting only grows staler and prunes next run.
+            if min_lag_days:
+                try:
+                    lag = (datetime.date.fromisoformat(newest)
+                           - datetime.date.fromisoformat(seen)).days
+                except ValueError:
+                    lag = min_lag_days
+                if lag < min_lag_days:
+                    continue
             gone.append(dict(r))
 
     print(f"{'would delete' if dry else 'deleting'} {len(gone)} delisted roles:")
@@ -91,14 +104,23 @@ if __name__ == "__main__":
     # Deliberately strict: this deletes rows, and the old `main("--dry" in sys.argv)` meant
     # ANY unrecognised flag ran the real thing — `--help` deleted 293 roles on 2026-07-30.
     # Unknown args now abort, and the destructive path needs an explicit --apply.
-    args = set(sys.argv[1:])
+    argv = sys.argv[1:]
+    min_lag = 0
+    if "--min-lag-days" in argv:
+        i = argv.index("--min-lag-days")
+        try:
+            min_lag = int(argv[i + 1])
+        except (IndexError, ValueError):
+            sys.exit("--min-lag-days needs an integer")
+        del argv[i:i + 2]
+    args = set(argv)
     known = {"--dry", "--apply", "-h", "--help"}
     if args - known:
         sys.exit(f"unknown option(s): {' '.join(sorted(args - known))}\n"
-                 "usage: prune_delisted.py [--dry | --apply]")
+                 "usage: prune_delisted.py [--dry | --apply] [--min-lag-days N]")
     if not args or args & {"-h", "--help"}:
         sys.exit(__doc__)
     if "--dry" in args:
-        main(True)
+        main(True, min_lag)
     elif "--apply" in args:
-        main(False)
+        main(False, min_lag)

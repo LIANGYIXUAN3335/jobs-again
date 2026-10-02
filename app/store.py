@@ -8,6 +8,7 @@ import datetime
 import json
 import re
 import sqlite3
+import sys
 from zoneinfo import ZoneInfo
 
 from . import budget
@@ -137,6 +138,15 @@ CREATE TABLE IF NOT EXISTS applied_companies (
 CREATE TABLE IF NOT EXISTS company_batch (
   company_norm TEXT PRIMARY KEY, batch_date TEXT, job_ids TEXT
 );
+-- 回头看 Hindsight 的预测（用户动作 → 本库；机器信号在 ideas.db，写者纪律见 app/hindsight.py）。
+-- mode='live' 新品封盘（当天封、不可改）；'backtest' 老题盲猜练手，开奖答案抄进 revealed_verdict。
+CREATE TABLE IF NOT EXISTS idea_predictions (
+  key TEXT NOT NULL, mode TEXT NOT NULL,
+  predicted TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  revealed_verdict TEXT, revealed_at TEXT,
+  PRIMARY KEY (key, mode)
+);
 CREATE TABLE IF NOT EXISTS reply_queue (
   msg_id TEXT PRIMARY KEY,              -- email Message-ID, for dedup
   uid TEXT, from_addr TEXT, from_name TEXT, reply_to TEXT,
@@ -180,6 +190,61 @@ CREATE TABLE IF NOT EXISTS company_overrides (
   note TEXT DEFAULT '',
   set_at TEXT NOT NULL
 );
+
+-- 手动 cooldown（owner 2026-09-22 拍板）：在表单上看到「这家不让投了」（ATS 限次数 / 一次只能
+-- 一份在跑），在 review 页或 /companies 看板点一下就进这张表。效果与 config.yaml `cooldowns:`
+-- 完全一样（扫描跳过这家 + review 隐藏它的岗位），只是不用改 YAML；until < today 自动失效，
+-- 解除即删行。一家一行。扫描器只读这张表（user_state.db 的唯一写者是 UI）。
+CREATE TABLE IF NOT EXISTS company_cooldowns (
+  company_norm TEXT PRIMARY KEY,
+  company TEXT NOT NULL,
+  until TEXT NOT NULL,
+  reason TEXT DEFAULT '',
+  set_at TEXT NOT NULL
+);
+
+-- 投递节奏（owner 2026-09-28，app/pace.py）：一行设置 + 每天的工作表。
+-- pace_settings：当前档位（sprint/normal/slow/pause/custom）、自动恢复日期、自定义的两个数。
+-- pace_daily：kind='shown' = 当天冻结的 review 名单（每家一个岗位，pos 是顺序）；
+--             kind='tailored' = 当天 autotailor 已排进批次的岗位（算每日简历额度）；
+--             kind='filled' = 哨兵行，记「今天已经按 N 家找过一轮」，免得队列不足 N 家时每次刷新都重算。
+CREATE TABLE IF NOT EXISTS pace_settings (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  mode TEXT NOT NULL,
+  until TEXT,
+  set_at TEXT NOT NULL,
+  companies_per_day INTEGER,
+  tailor_per_day INTEGER
+);
+CREATE TABLE IF NOT EXISTS pace_daily (
+  day TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('shown','tailored','filled')),
+  job_id TEXT NOT NULL,
+  company_norm TEXT,
+  pos INTEGER NOT NULL DEFAULT 0,
+  at TEXT NOT NULL,
+  PRIMARY KEY (day, kind, job_id)
+);
+
+-- Outreach drafts（owner 2026-09-23）：给招聘联系人的自荐信草稿，一人一行（按邮箱）。
+-- 生成 → 她在 /outreach 页改 → 存进 Gmail 草稿箱 → 她自己在 Gmail 里发。这里只记草稿和状态。
+-- status: draft（已生成）| saved（已进 Gmail 草稿箱）| dismissed（不发）| error（生成失败）
+CREATE TABLE IF NOT EXISTS outreach_drafts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  contact_email TEXT NOT NULL UNIQUE,
+  contact_name TEXT DEFAULT '',
+  company TEXT NOT NULL,
+  source TEXT DEFAULT '',
+  subject TEXT DEFAULT '',
+  body TEXT DEFAULT '',
+  roles_json TEXT DEFAULT '[]',
+  resume_path TEXT,
+  status TEXT NOT NULL DEFAULT 'draft',
+  error TEXT DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  saved_at TEXT
+);
 """
 
 
@@ -209,6 +274,149 @@ def set_company_override(conn, company: str, action: str | None, note: str = "")
             (company, action, note,
              datetime.datetime.now(LA).isoformat(timespec="seconds")))
     conn.commit()
+
+
+def manual_cooldowns(conn, today: str | None = None) -> dict[str, dict]:
+    """{norm_key: {company, until, reason, set_at, source:'manual'}} — UI-set cooldowns that
+    have not expired (`until` is inclusive)."""
+    today = today or la_today()
+    out: dict[str, dict] = {}
+    for r in conn.execute("SELECT * FROM company_cooldowns"):
+        if (r["until"] or "") >= today:
+            out[r["company_norm"]] = {"company": r["company"], "until": r["until"],
+                                      "reason": r["reason"] or "", "set_at": r["set_at"],
+                                      "source": "manual"}
+    return out
+
+
+def set_company_cooldown(conn, company: str, days: int | None = None,
+                         until: str | None = None, reason: str = "") -> dict:
+    """Put `company` on cooldown until `until` (ISO date, inclusive) or `days` from today.
+    Same company again = overwrite (the later decision wins). Returns the stored row."""
+    company = (company or "").strip()
+    if not company:
+        raise ValueError("empty company")
+    today = datetime.date.fromisoformat(la_today())
+    if until:
+        u = datetime.date.fromisoformat(str(until)[:10])   # garbage → ValueError → 422 upstream
+    else:
+        d = 30 if days is None else int(days)      # 0 is a value, not "unset" — it must fail below
+        if not 1 <= d <= 365:
+            raise ValueError("days must be between 1 and 365")
+        u = today + datetime.timedelta(days=d)
+    if u < today:
+        raise ValueError("until is in the past")
+    cn = cfgmod.norm_key(company)
+    row = {"company_norm": cn, "company": company, "until": u.isoformat(),
+           "reason": (reason or "").strip(), "set_at": la_now_iso()}
+    conn.execute(
+        "INSERT INTO company_cooldowns(company_norm, company, until, reason, set_at)"
+        " VALUES(?,?,?,?,?) ON CONFLICT(company_norm) DO UPDATE SET company=excluded.company,"
+        "   until=excluded.until, reason=excluded.reason, set_at=excluded.set_at",
+        (cn, company, row["until"], row["reason"], row["set_at"]))
+    conn.commit()
+    return {**row, "source": "manual"}
+
+
+def clear_company_cooldown(conn, company: str) -> bool:
+    cur = conn.execute("DELETE FROM company_cooldowns WHERE company_norm=?",
+                       (cfgmod.norm_key(company),))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def _config_company_name(cfg: dict, cn: str) -> str:
+    """Display name for a config cooldown: the scan list's spelling, else the `cooldowns:` key
+    as she wrote it, else the norm key itself."""
+    for c in cfg.get("companies") or []:
+        if cfgmod.norm_key(c.get("name", "")) == cn:
+            return c["name"]
+    for k in cfg.get("cooldowns") or {}:
+        if cfgmod.norm_key(k) == cn:
+            return k
+    return cn
+
+
+def _merge_cooldowns(cfg: dict, manual: dict[str, dict], today: str) -> dict[str, dict]:
+    out = {cn: {**cd, "source": "config", "company": _config_company_name(cfg, cn)}
+           for cn, cd in cfgmod.active_cooldowns(cfg, today).items()}
+    for cn, cd in manual.items():
+        if cn not in out or cd["until"] > out[cn]["until"]:   # both sides → the later date wins
+            out[cn] = cd
+    return out
+
+
+def active_cooldowns(conn, cfg: dict, today: str | None = None) -> dict[str, dict]:
+    """config.yaml `cooldowns:` ∪ UI-set cooldowns (company_cooldowns), keyed by norm_key;
+    each entry carries until / reason / source ('config' | 'manual') / company. The UI and
+    discovery use this; the scanner uses active_cooldowns_readonly (it must not write user db)."""
+    today = today or la_today()
+    return _merge_cooldowns(cfg, manual_cooldowns(conn, today), today)
+
+
+def active_cooldowns_readonly(cfg: dict, today: str | None = None) -> dict[str, dict]:
+    """Scanner side of active_cooldowns: user_state.db opened READ-ONLY and never created —
+    it has exactly one writer (the UI). No file, no table, or a locked file → config only,
+    with a line on stderr so a silent fallback never masquerades as 'no manual cooldowns'."""
+    today = today or la_today()
+    p = user_db_path(cfg)
+    if not p.exists():
+        return _merge_cooldowns(cfg, {}, today)
+    try:
+        ro = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        ro.row_factory = sqlite3.Row
+        try:
+            manual = manual_cooldowns(ro, today)
+        finally:
+            ro.close()
+    except sqlite3.Error as e:
+        print(f"cooldowns: could not read manual cooldowns from {p.name} ({e}); config only",
+              file=sys.stderr)
+        manual = {}
+    return _merge_cooldowns(cfg, manual, today)
+
+
+# ---------- outreach drafts ----------
+
+def outreach_list(conn) -> list[dict]:
+    return [dict(r) for r in conn.execute(
+        "SELECT * FROM outreach_drafts ORDER BY updated_at DESC")]
+
+
+def outreach_get(conn, draft_id: int) -> dict | None:
+    r = conn.execute("SELECT * FROM outreach_drafts WHERE id=?", (draft_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def outreach_upsert(conn, rec: dict) -> dict:
+    """Create or replace the draft for rec['contact_email'] (one live draft per contact)."""
+    now = la_now_iso()
+    conn.execute(
+        "INSERT INTO outreach_drafts(contact_email, contact_name, company, source, subject, body,"
+        " roles_json, resume_path, status, error, created_at, updated_at)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
+        " ON CONFLICT(contact_email) DO UPDATE SET contact_name=excluded.contact_name,"
+        "   company=excluded.company, source=excluded.source, subject=excluded.subject,"
+        "   body=excluded.body, roles_json=excluded.roles_json, resume_path=excluded.resume_path,"
+        "   status=excluded.status, error=excluded.error, updated_at=excluded.updated_at, saved_at=NULL",
+        (rec["contact_email"].lower(), rec.get("contact_name", ""), rec["company"], rec.get("source", ""),
+         rec.get("subject", ""), rec.get("body", ""), json.dumps(rec.get("roles") or [], ensure_ascii=False),
+         rec.get("resume_path"), rec.get("status", "draft"), rec.get("error", ""), now, now))
+    conn.commit()
+    r = conn.execute("SELECT * FROM outreach_drafts WHERE contact_email=?", (rec["contact_email"].lower(),)).fetchone()
+    return dict(r)
+
+
+def outreach_update(conn, draft_id: int, **fields) -> dict | None:
+    allowed = {"subject", "body", "status", "error", "saved_at", "resume_path"}
+    sets = {k: v for k, v in fields.items() if k in allowed}
+    if not sets:
+        return outreach_get(conn, draft_id)
+    sets["updated_at"] = la_now_iso()
+    conn.execute("UPDATE outreach_drafts SET " + ", ".join(f"{k}=?" for k in sets) + " WHERE id=?",
+                 (*sets.values(), draft_id))
+    conn.commit()
+    return outreach_get(conn, draft_id)
 
 
 def batch_get(conn, company_norm: str) -> dict | None:
@@ -311,6 +519,10 @@ _USER_MIGRATIONS = [
     ("role_state", "duplicate_of", "TEXT"),
     ("role_state", "response_confidence", "TEXT"),
     ("interviews", "source", "TEXT"),
+    # 投递身份（apply profile）：这个岗位用哪张“名片”投 — NULL/'casey' = 默认名片，
+    # 'alex' = 法名名片（config.yaml apply_profiles 里定义）。岗位级、不锁公司（owner
+    # 2026-09-08 拍板：同公司不同岗允许不同身份）。
+    ("role_state", "apply_profile", "TEXT"),
 ]
 _JOBS_MIGRATIONS = [
     ("roles", "posted_at", "TEXT"),
@@ -429,6 +641,7 @@ _STATE_COLS = [
     "stage", "outcome", "outcome_note", "first_response_at", "last_contact_at",
     "duplicate_of",     # missing here would silently NULL it on every upsert_state
     "response_confidence",
+    "apply_profile",    # which identity card this role is applied with (None = default)
 ]
 
 
@@ -904,6 +1117,31 @@ def _sort_rows(out: list[dict], sort: str) -> None:
         out.sort(key=lambda r: (r["rank_score"] or 0, r["first_seen"] or ""), reverse=True)
 
 
+def effective_profile_key(cfg: dict, role: dict) -> str:
+    """这个岗位实际用哪张投递名片（apply profile）：岗位级手动选择 > 公司级小号名单 >
+    默认名片。公司级名单（config apply_profiles.companies，key=company_norm）只影响还没
+    投出的岗位 —— 已投的是历史事实，事后把公司划给小号不改写当时用什么身份投的。"""
+    ap = cfg.get("apply_profiles") or {}
+    default = ap.get("default") or "casey"
+    profiles = ap.get("profiles") or {}
+    explicit = role.get("apply_profile")
+    if explicit and explicit in profiles:
+        return explicit
+    # 2026-09-25: an applied row with NO recorded card used to fall back to the default card,
+    # so at a 小号 company the extension filled Casey + candidate whenever the role had
+    # already been marked applied (by a confirmation-mail scan, a twin cascade, or a first
+    # attempt). Since api_set_status now freezes the card at apply time, an explicit value is
+    # the history; a missing one is unknown, and the company map is the better guess.
+    key = (ap.get("companies") or {}).get((role.get("company_norm") or "").lower())
+    return key if key in profiles else default
+
+
+# One public page, no account: apply in one sitting. Workday/Avature demand a per-company
+# account plus a 5-6 step wizard — a different class of effort entirely.
+_EASY_ATS = {"greenhouse", "ashby", "lever", "rippling", "smartrecruiters", "gem"}
+_ACCOUNT_ATS = {"workday", "avature"}
+
+
 def fetch_view(
     conn: sqlite3.Connection,
     cfg: dict,
@@ -918,16 +1156,48 @@ def fetch_view(
     seniority: str = "",
     sort: str = "diversity",     # keep select_daily's company interleave; see _sort_rows
     rot: int = 0,
+    tag: str = "",               # 'onsite' | 'startup' — company-level flags from company_notes.yaml
+    identity: str = "",          # apply-profile key ('casey'/'alex') — 只看这张名片名下的岗位
+    tailored: str = "",          # 'ready' = has a validated résumé PDF · 'none' = doesn't
+    ease: str = "",              # 'easy' = one-page no-account boards · 'account' = login+wizard
+    pace: bool = False,          # apply 投递节奏 (app/pace.py) to the review tab — only the review
+                                 # page and autotailor opt in; outreach / tools see the full queue
 ) -> dict:
+    # Company-level tags live in company_notes.yaml (onsite_interview / startup), never in the
+    # roles DB: they describe the COMPANY's hiring process, not a posting, and the owner edits
+    # them by hand. Loaded once per view so each row can carry its chips + the tag filter works.
+    notes_all = cfgmod.load_company_notes(cfg)
     rows = [dict(r) for r in conn.execute(
         "SELECT r.*, s.status AS own_status, s.notes, s.applied_date,"
         "       s.applied_with_resume, s.tailor_status, s.tailored_resume_path,"
-        "       s.status_updated_at, s.duplicate_of"
+        "       s.status_updated_at, s.duplicate_of, s.apply_profile"
         " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
     )]
     applied_cos = {r["name_norm"]: r["display_name"] for r in
                    conn.execute("SELECT * FROM applied_companies")}
-    cooldown_cos = cfgmod.active_cooldowns(cfg)     # {norm_key: {until, reason}}
+    # config.yaml ∪ UI-set (company_cooldowns) — {norm_key: {until, reason, source, company}}
+    cooldown_cos = active_cooldowns(conn, cfg, la_today())
+    # Workspace eligibility applied at VIEW time (owner 2026-09-23): the shared jobs.db keeps
+    # one score per role, and each candidate's own dead-ends are filtered here —
+    #   needs_sponsorship → hide JDs that say the employer will not sponsor;
+    #   location_pref.review_only → review shows only remote / preferred-area roles.
+    prof = cfg.get("profile") or {}
+    needs_spon = bool(prof.get("needs_sponsorship"))
+    loc_only = bool(((cfg.get("scoring") or {}).get("location_pref") or {}).get("review_only"))
+    # Fit rank (owner 2026-09-23): the shared jobs.db scores every role with the OWNER's keyword
+    # weights, so a second candidate's queue led with infra JDs asking 13 hard skills of which
+    # he names 6 (résumé score 54) while hers ask 5 and she names 4. With fit_pref on, each row
+    # gets +bonus × (JD hard skills the candidate's base already names / JD hard skills) on
+    # rank_score, and rows under review_min leave the review tab (still under 'all').
+    fit_cfg = (cfg.get("scoring") or {}).get("fit_pref") or {}
+    fit_on = bool(fit_cfg.get("enabled"))
+    fit_base: set = set()
+    if fit_on:
+        from . import resume_score as _rs, tailoring as _tl
+        try:
+            fit_base = _rs.base_hard_skills(_tl._base_text(_tl.load_base(cfg)))
+        except FileNotFoundError:
+            fit_on = False
     sig_mode = cfg.get("signature_match", "badge")
 
     closed_by_sig: dict[tuple, dict] = {}
@@ -937,14 +1207,24 @@ def fetch_view(
 
     today = la_today()
     week_ago = (datetime.date.fromisoformat(today) - datetime.timedelta(days=6)).isoformat()
+    two_weeks_ago = (datetime.date.fromisoformat(today) - datetime.timedelta(days=13)).isoformat()
+    month_ago = (datetime.date.fromisoformat(today) - datetime.timedelta(days=29)).isoformat()
 
     out = []
     counts = {"new": 0, "applied": 0, "interviewing": 0, "skip": 0, "rejected": 0}
+    # For the duplicate_of hide below: only honour a link whose canonical row still exists —
+    # purge tools DELETE FROM roles, and a dangling link must not vanish a live posting
+    # (followup.py:105 guards the same way).
+    live_ids = {r["job_id"] for r in rows}
     for r in rows:
         eff = r["own_status"] or "new"
         r["status"] = eff
         r["notes"] = r["notes"] or ""
         r["hidden_company"] = r["company_norm"] in applied_cos
+        cn_notes = notes_all.get(r["company_norm"], {})
+        r["onsite"] = bool(cn_notes.get("onsite_interview"))
+        r["onsite_note"] = cn_notes.get("onsite_note") or ""
+        r["startup"] = bool(cn_notes.get("startup"))
         cd = cooldown_cos.get(r["company_norm"])
         r["cooldown"] = cd                          # {until, reason} or None
         r["resume_score"] = resume_score_from_path(r.get("tailored_resume_path"))
@@ -957,7 +1237,22 @@ def fetch_view(
                               allow_inferred=not r["job_id"].startswith(("cap:", "manual:")))
         r["fresh"] = f
         r["fresh_bonus"] = f["bonus"]
-        r["rank_score"] = (r["weighted_score"] or 0) + f["bonus"]
+        # 优先远程或湾区 (owner 2026-09-22): rank-only lift, same contract as freshness
+        lp = scoring.location_pref(r.get("location"), r.get("is_remote"), cfg)
+        r["loc_pref"] = lp
+        r["rank_score"] = (r["weighted_score"] or 0) + f["bonus"] + lp["bonus"]
+        r["no_sponsor"] = needs_spon and scoring.no_sponsorship_jd(r.get("jd_text"))
+        r["loc_excluded"] = loc_only and lp["kind"] not in ("remote", "bay")
+        r["fit"] = None
+        r["fit_excluded"] = False
+        if fit_on:
+            from . import resume_score as _rs
+            cov = _rs.fit_coverage(_rs.jd_hard_skills(r.get("jd_hash"), r.get("jd_text")), fit_base)
+            if cov is not None:
+                bonus = round(float(fit_cfg.get("bonus", 15)) * cov, 1)
+                r["fit"] = {"coverage": round(cov, 2), "bonus": bonus}
+                r["rank_score"] += bonus
+                r["fit_excluded"] = cov < float(fit_cfg.get("review_min", 0.30))
         r["badge_ref"] = None
         hidden_sig = False
         if eff == "new" and sig_mode != "off":
@@ -975,8 +1270,13 @@ def fetch_view(
 
         # verdict 'drop' (over the years ceiling / non-US) is a dead-end — keep it out of the
         # review queue entirely (it still shows under 'all'), and never auto-tailored.
+        # A linked li: shadow row (role_state.duplicate_of → canonical ATS row) is the same
+        # physical posting twice — only the canonical row (direct apply link, full JD) stays
+        # in the review queue. Owner-approved 2026-09-15; budget/followup already count this way.
         in_review = (eff == "new" and not r["hidden_company"] and not hidden_sig and not cd
-                     and r["verdict"] != "drop")
+                     and r["verdict"] != "drop"
+                     and not r["no_sponsor"] and not r["loc_excluded"] and not r["fit_excluded"]
+                     and not (r["duplicate_of"] and r["duplicate_of"] in live_ids))
         r["in_review"] = in_review
         if in_review:
             counts["new"] += 1
@@ -1003,11 +1303,45 @@ def fetch_view(
             continue
         if remote == "remote" and not r["is_remote"]:
             continue
-        if seen == "today" and r["first_seen"] != today:
+        if remote == "bay" and r["loc_pref"]["kind"] not in ("remote", "bay"):
+            continue                      # "remote or Bay Area" — the location_kind classifier
+        # 投递身份：每行算出实际用哪张名片（手动 > 公司小号名单 > 默认），徽章和
+        # identity 过滤都用它。放在 tag 过滤旁边，跟其他公司级属性一个待遇。
+        r["apply_profile_effective"] = effective_profile_key(cfg, r)
+        if identity and r["apply_profile_effective"] != identity:
+            continue
+        if tailored == "ready" and (r["tailor_status"] or "") != "ready":
+            continue
+        if tailored == "none" and (r["tailor_status"] or "") == "ready":
+            continue
+        # Application friction (owner 2026-09-10): one-page public forms vs boards that force
+        # account creation + a multi-step wizard. 'manual' (LinkedIn/captured) roles land on
+        # arbitrary external portals — they count as neither and only show under "all".
+        if ease == "easy" and r["ats"] not in _EASY_ATS:
+            continue
+        if ease == "account" and r["ats"] not in _ACCOUNT_ATS:
+            continue
+        if tag == "onsite" and not r["onsite"]:
+            continue
+        if tag == "startup" and not r["startup"]:
+            continue
+        if tag == "onsite_or_startup" and not (r["onsite"] or r["startup"]):
+            continue
+        # Compare on the DATE only: li:/cap: rows store a full timestamp in first_seen
+        # ("2026-09-22T08:51:18-07:00"), so an equality test against the date hid every
+        # LinkedIn/captured role from "new today" (59 in the queue, 4 shown, 2026-09-22).
+        if seen == "today" and (r["first_seen"] or "")[:10] != today:
             continue
         if seen == "week" and (r["first_seen"] or "") < week_ago:
             continue
-        if seen not in ("all", "today", "week") and seen and r["first_seen"] != seen:
+        if seen == "two_weeks" and (r["first_seen"] or "") < two_weeks_ago:
+            continue
+        if seen == "month" and (r["first_seen"] or "") < month_ago:
+            continue
+        # 任意日期值 = 截止线「这天及之后」。2026-09-11 之前是"恰好那天"，从没被用过；
+        # owner 的真实需求是"太旧的不投"，截止线才是那个语义。
+        if seen not in ("all", "today", "week", "two_weeks", "month") and seen \
+                and (r["first_seen"] or "") < seen:
             continue
         if q:
             hay = f'{r["company"]} {r["title"]}'.lower()
@@ -1058,6 +1392,10 @@ def fetch_view(
             div_picks.append({"company": top["company"], "job_id": top["job_id"],
                               "title": top["title"], "score": top["weighted_score"],
                               "company_mean": round(mean, 1)})
+
+    if fit_on:
+        from . import resume_score as _rs
+        _rs.save_jd_cache()
 
     _sort_rows(out, sort)
 
@@ -1111,9 +1449,35 @@ def fetch_view(
         out = [r for r in out if r["company_norm"] not in active or r["job_id"] in active[r["company_norm"]]]
         counts["new"] = sum(len(v) for v in active.values())
 
+    pace_info: dict = {}
+    if status == "new" and pace:
+        from . import pace as pacemod
+        # The day's list is frozen from the UNFILTERED queue (same budget order the page uses,
+        # rot=0), so which filter was on at first open never decides the day's companies.
+        full = lambda: fetch_view(conn, cfg, status="new", sort="diversity", rot=0)["rows"]
+        live = {r["job_id"] for r in rows if r.get("in_review")}
+        out, pace_info = pacemod.apply_review(conn, cfg, out, full, today, live_ids=live)
+        if pace_info["pace"]["limited"]:
+            counts["new"] = len(out)
+    elif pace:
+        # applied / interviewing / all tabs: keep the nav's "review N" in step with the paced
+        # review tab. Read-only — visiting another tab never creates the day's freeze; before
+        # the freeze exists the badge shows what the first open will push (≤ N companies).
+        from . import pace as pacemod
+        eff = pacemod.effective(conn, cfg, today)
+        if eff["limited"]:
+            n = eff["companies_per_day"]
+            live_rows = [r for r in rows if r.get("in_review")]
+            if pacemod.has_freeze(conn, today):
+                ids = {f["job_id"] for f in pacemod._frozen(conn, today)[:n]}
+                counts["new"] = sum(1 for r in live_rows if r["job_id"] in ids)
+            else:
+                counts["new"] = min(n, len({r["company_norm"] for r in live_rows}))
+
     companies = sorted({r["company"] for r in rows})
     return {
         "rows": out,
+        "pace": pace_info,
         "counts": counts,
         "total_roles": len(rows),
         "companies": companies,
@@ -1121,6 +1485,8 @@ def fetch_view(
         "cap_info": cap_info,
         "budget": budget_info,
         "diversify_picks": div_picks,
+        "cooldowns": cooldown_cos,            # the header shows a count + link to manage them
+        "workspace": cfg.get("workspace") or {},   # {name} of the candidate this instance serves
         "run": last_run(conn),
         "today": today,
     }
@@ -1137,7 +1503,8 @@ def lookup_role_by_ids(conn: sqlite3.Connection, candidates: list[str]) -> dict 
     hits = []
     for cand in candidates:
         for r in conn.execute(
-            "SELECT r.*, s.status AS own_status, s.tailor_status, s.tailored_resume_path"
+            "SELECT r.*, s.status AS own_status, s.tailor_status, s.tailored_resume_path,"
+            "       s.apply_profile"
             " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
             " WHERE r.job_id LIKE ?",
             (f"%:{cand}",),
@@ -1151,7 +1518,8 @@ def lookup_role_by_ids(conn: sqlite3.Connection, candidates: list[str]) -> dict 
             # globally unique enough to match anywhere in the URL, including after an '='.
             pat = f"%{cand}%" if len(cand) >= 12 else f"%/{cand}%"
             for r in conn.execute(
-                "SELECT r.*, s.status AS own_status, s.tailor_status, s.tailored_resume_path"
+                "SELECT r.*, s.status AS own_status, s.tailor_status, s.tailored_resume_path,"
+                "       s.apply_profile"
                 " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
                 " WHERE r.apply_url LIKE ?",
                 (pat,),
@@ -1205,7 +1573,8 @@ def lookup_role_by_apply_url(conn: sqlite3.Connection, urls: list[str]) -> dict 
     hits = []
     for jid in hit_ids:
         r = conn.execute(
-            "SELECT r.*, s.status AS own_status, s.tailor_status, s.tailored_resume_path"
+            "SELECT r.*, s.status AS own_status, s.tailor_status, s.tailored_resume_path,"
+            "       s.apply_profile"
             " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
             " WHERE r.job_id = ?", (jid,)).fetchone()
         if r:
@@ -1223,7 +1592,7 @@ def get_role(conn: sqlite3.Connection, job_id: str) -> dict | None:
     r = conn.execute(
         "SELECT r.*, s.status AS own_status, s.notes, s.applied_date,"
         "       s.applied_with_resume, s.tailor_status, s.prompt_path,"
-        "       s.tailored_resume_path"
+        "       s.tailored_resume_path, s.apply_profile"
         " FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
         " WHERE r.job_id = ?",
         (job_id,),

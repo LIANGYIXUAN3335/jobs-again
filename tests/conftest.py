@@ -11,4 +11,6 @@ def cfg(tmp_path):
     c["user_db_path"] = str(tmp_path / "user_state.db")
     c["output_dirs"] = {"prompts": str(tmp_path / "prompts"),
                         "resumes": str(tmp_path / "resumes")}
+    # Tests stub the Anthropic SDK; never let a test shell out to the real claude CLI.
+    c["ai"] = {**(c.get("ai") or {}), "backend": "api"}
     return c

@@ -27,15 +27,52 @@ code { background: #eee; padding: 0 4px; border-radius: 3px; }
   background: #1a1d21; color: #fff; text-decoration: none; font-weight: 600;
 }
 .rotbtn:hover { background: #374151; }
+/* 一键 tailor 当前列表（owner 2026-09-23）：坐在筛选条末尾，跟 .cap-note 一个色系 */
+.batch-tailor { display: inline-flex; align-items: center; gap: 6px; margin-left: auto; }
+#tailor-batch-btn { background: #f1f5f9; border-color: #cbd5e1; color: #334155; font-weight: 600; }
+#tailor-batch-btn:hover { background: #e2e8f0; }
+#tailor-batch-btn:disabled { opacity: .6; cursor: progress; }
+#tailor-batch-status.busy { color: #b45309; }
+#tailor-batch-status.done { color: #15803d; }
 
 .settings { margin: 4px 0 8px; color: #555; }
 .settings summary { cursor: pointer; user-select: none; }
 .co-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 0; align-items: center; }
 .co-chips form { display: inline-flex; gap: 4px; }
 
-#filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px; }
-#filters input[name=q] { width: 200px; }
-#filters input[name=min_score] { width: 90px; }
+/* 2026-09-28 帮手工作台改版：筛选栏在左侧固定栏，右侧是岗位表。改选项不自动刷新，点 Apply 才生效。 */
+.layout { display: flex; gap: 14px; align-items: flex-start; }
+.filterpane {
+  flex: 0 0 232px; position: sticky; top: 8px; max-height: calc(100vh - 16px); overflow: auto;
+  background: #fff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px 10px 8px;
+}
+.content { flex: 1 1 auto; min-width: 0; }
+.pane-head { display: flex; align-items: center; justify-content: space-between; margin: -2px 0 8px; font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: .03em; }
+#pane-toggle { padding: 1px 7px; font-size: 11px; line-height: 1.4; color: #64748b; border-color: #e2e8f0; }
+/* 收起：侧栏缩成一条 30px 的窄轨，只剩 ▶ 按钮；表格吃满整行 */
+.layout.collapsed .filterpane { flex-basis: 30px; padding: 6px 3px; overflow: hidden; }
+.layout.collapsed .filterpane > :not(.pane-head) { display: none; }
+.layout.collapsed .pane-head { margin: 0; justify-content: center; }
+.layout.collapsed .pane-head span { display: none; }
+.layout.collapsed #pane-toggle { padding: 1px 5px; }
+#filters { display: flex; flex-direction: column; gap: 8px; margin: 0; }
+#filters label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: .03em; }
+#filters label > input, #filters label > select { width: 100%; font-size: 13px; color: #1a1d21; text-transform: none; letter-spacing: 0; }
+#filters #seen-date { margin-top: 3px; }
+#filters .apply-row { display: flex; align-items: center; gap: 10px; margin-top: 2px; position: sticky; bottom: -8px; background: #fff; padding: 6px 0 4px; }
+#filters button.apply { flex: 1; background: #1a1d21; color: #fff; border-color: #1a1d21; font-weight: 600; padding: 6px 8px; }
+#filters button.apply:hover { background: #374151; }
+.filterpane .settings { margin: 10px 0 0; padding-top: 8px; border-top: 1px solid #eef1f4; font-size: 12px; }
+/* 投递节奏横条（2026-09-28）：跟 .cap-note 一个位置，颜色区分——有额度是蓝，暂停是琥珀 */
+.pace-note { margin: 0 0 10px; padding: 7px 10px; border-radius: 5px; background: #eff6ff; border: 1px solid #bfdbfe; color: #1e3a8a; }
+.pace-note.paused { background: #fffbeb; border-color: #fde68a; color: #92400e; }
+.pace-note a { color: inherit; font-weight: 600; }
+.listbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 8px; }
+.listbar .batch-tailor { margin-left: auto; }
+@media (max-width: 900px) {
+  .layout { flex-direction: column; }
+  .filterpane { position: static; flex-basis: auto; width: 100%; max-height: none; }
+}
 input, select, button, textarea {
   font: inherit; padding: 3px 6px; border: 1px solid #cfd3d8; border-radius: 4px; background: #fff;
 }
@@ -72,6 +109,8 @@ td.seen { white-space: nowrap; color: #555; }
 .chip.warn { background: #fdecea; color: #b3261e; cursor: help; }
 .chip.hide { background: #e8e8e8; color: #777; }
 .chip.sr { background: #ede9fe; color: #5b21b6; }
+.chip.onsite { background: #fef3c7; color: #92400e; cursor: help; padding: 0 3px; }
+.chip.startup { background: #dcfce7; color: #166534; cursor: help; padding: 0 3px; }
 /* freshness boost — ranking only, so it sits BESIDE the score rather than changing it */
 .chip.fresh { background: #e6f4ea; color: #1e7a3a; font-weight: 700; cursor: help; }
 .chip.diversify { background: #ede9fe; color: #6d28d9; font-weight: 700; cursor: help; }
@@ -143,3 +182,31 @@ tr.jd-row pre {
 }
 .jd-meta { color: #8a8f98; font-size: 12px; }
 td.empty { text-align: center; color: #8a8f98; padding: 30px; }
+
+/* 投递身份名片徽章：默认名片灰底 A；切到备用名片（法名 Alex）变蓝底 Y */
+.idcard { border: 1px solid #ccc; background: #f2f2f2; color: #555; border-radius: 50%;
+  width: 20px; height: 20px; padding: 0; font-size: 11px; font-weight: 700;
+  line-height: 18px; text-align: center; cursor: pointer; margin-right: 2px; }
+.idcard.alt { background: #1a73e8; border-color: #1a73e8; color: #fff; }
+.idcard:disabled { opacity: .5; cursor: wait; }
+
+/* 顶栏全局身份开关 */
+.id-switch { display: inline-flex; gap: 2px; margin-left: 10px; vertical-align: middle;
+  border: 1px solid #ddd; border-radius: 12px; padding: 2px; }
+.id-switch a { padding: 1px 9px; border-radius: 10px; font-size: 12px; color: #666;
+  text-decoration: none; }
+.id-switch a.on { background: #1a73e8; color: #fff; font-weight: 600; }
+
+/* 「这家不让投了」→ cooldown：company 格里的小按钮 + 内联小表单（owner 2026-09-22） */
+.cdbtn { border: none; background: none; padding: 0 2px; font-size: 11px; opacity: .3;
+  cursor: pointer; vertical-align: middle; }
+td.co:hover .cdbtn, .cdbtn:hover { opacity: 1; }
+.cd-pop { font-size: 12px; font-weight: 400; margin-left: 4px; white-space: nowrap; }
+.cd-pop select, .cd-pop input, .cd-pop button { font-size: 12px; padding: 1px 4px; margin-left: 2px; }
+
+/* 优先远程或湾区：排序加分徽章（owner 2026-09-22） */
+.chip.locpref { background: #e0f2fe; color: #075985; font-weight: 700; cursor: help; }
+
+/* 工作台徽章：顶栏 JobScan 后面写着这个实例是谁的（owner 2026-09-23） */
+.ws-badge { display: inline-block; margin-left: 8px; padding: 1px 9px; border-radius: 10px; font-size: 12px;
+  font-weight: 600; vertical-align: middle; background: #ede9fe; color: #5b21b6; }

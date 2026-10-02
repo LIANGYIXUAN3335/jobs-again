@@ -32,8 +32,10 @@ REGISTRY = [
     ("followup", "跟进提醒（投了没回音）", "每周一/四 09:20"),
     ("bqautoprep", "BQ 自动备考", "每天 9/11/13/15/17 点"),
     ("atoms-backfill", "atoms 卡片质检（另一项目）", "每周日 02:30"),
+    ("deadlinks", "死链大扫除（下架/失效岗位）", "每周日随 09:00 扫描"),
 ]
 _NAMES = {n for n, _, _ in REGISTRY}
+_RETIRED = {"retire_preps"}
 
 
 def read() -> list[dict]:
@@ -53,6 +55,8 @@ def read() -> list[dict]:
     rows = []
     for name, zh, cadence in REGISTRY:
         rows.append(_status(name, zh, cadence, cards.pop(name, None), now))
+    for name in _RETIRED:
+        cards.pop(name, None)
     for name, card in sorted(cards.items()):          # 没在注册表里的照样显示
         rows.append(_status(name, name, "", card, now))
     return rows
