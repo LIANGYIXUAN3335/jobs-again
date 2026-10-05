@@ -107,3 +107,64 @@ def test_freshness_is_not_baked_into_the_score_or_the_rescore_trigger():
     # ...so retuning freshness must not trigger a full rescore of every stored role.
     tuned = dict(CFG, scoring=dict(CFG["scoring"], freshness={"enabled": True, "bonus": 25}))
     assert scoring.config_hash(tuned) == scoring.config_hash(CFG)
+
+
+def test_location_kind_recognises_remote_and_the_sf_bay_area_only():
+    """优先远程或湾区 (owner 2026-09-22). Strings are real ones from roles.location."""
+    from app.scoring import location_kind as k
+    assert k("San Francisco, CA", 0) == "bay"
+    assert k("US, CA, Santa Clara", 0) == "bay"            # Nvidia's Workday format
+    assert k("San Francisco Bay Area", 0) == "bay"
+    assert k("San Mateo, CA, United States · San Mateo, CA", 0) == "bay"
+    assert k("Sunnyvale", 0) == "bay"
+    assert k("Newark, CA", 0) == "bay" and k("Newark, NJ", 0) is None
+    assert k("Belmont, MA", 0) is None and k("Dublin, Ireland", 0) is None
+    assert k("Tampa Bay Area", 0) is None                  # a bay, not THE Bay
+    assert k("2 Locations", 0) is None and k("Seattle, WA", 0) is None and k("", 0) is None
+    assert k("Remote - US", 0) == "remote" and k("New York, NY", 1) == "remote"
+    assert k("Remote - Canada", 1) is None and k("Remote - United Kingdom", 0) is None   # foreign remote is not for a US candidate
+    assert k("Remote - US or Canada", 1) == "remote"                                       # a US marker keeps it
+
+
+def test_location_pref_is_rank_only_and_configurable():
+    from app.scoring import location_pref
+    cfg = {"scoring": {"location_pref": {"enabled": True, "bonus": 8}}}
+    assert location_pref("Palo Alto, CA", 0, cfg) == {"kind": "bay", "bonus": 8.0}
+    assert location_pref("Austin, TX", 0, cfg) == {"kind": None, "bonus": 0.0}
+    off = {"scoring": {"location_pref": {"enabled": False}}}
+    assert location_pref("Palo Alto, CA", 0, off)["bonus"] == 0.0
+    no_remote = {"scoring": {"location_pref": {"bonus": 8, "remote": False}}}
+    assert location_pref("Remote", 1, no_remote) == {"kind": "remote", "bonus": 0.0}
+
+
+# 2026-09-28 — no_sponsorship_jd: real refusals from live JDs must flag, and the two boilerplate
+# false positives that hid whole companies (Cloudflare export-control clause, Wispr Flow hedge)
+# must not. Phrases are verbatim from the 2026-09-28 sponsorship research.
+def test_no_sponsorship_jd_flags_real_refusals():
+    refusals = [
+        "We're not able to sponsor US visas right now, though that may change down the line.",   # Firecrawl
+        "However, we are currently unable to sponsor employment visas.",                           # Runpod
+        "We are not able to provide visa sponsorship for this position at this time.",             # Lightning AI
+        "we do not sponsor visas or transfers for new hires",                                      # Voltus
+        "We are unable to sponsor or take over sponsorship of an employment visa for this role.",  # Verkada IT
+        "The company can support visa transfers but will not sponsor individuals for H-1B CAP applications.",  # Adyen
+        "Is role eligible for Immigration Sponsorship? No. Please note that we will not sponsor applicants for work visas for this position.",  # PANW
+    ]
+    for text in refusals:
+        assert scoring.no_sponsorship_jd(text), text
+
+
+def test_no_sponsorship_jd_ignores_export_control_and_hedges():
+    not_refusals = [
+        # Cloudflare: every US JD carries this export-law clause; it is not about visas.
+        "you must be eligible to receive software or technology controlled under these U.S. export laws "
+        "without sponsorship for an export license. Cloudflare is proud to be an equal opportunity employer.",
+        # Wispr Flow / Exa: sponsors hedging, not refusing.
+        "We sponsor H1B, O1, EB1, L1, STEM OPT, and more. We can't guarantee sponsorship for every role, "
+        "but if we make you an offer we'll make every reasonable effort.",
+        "Visas: We're happy to sponsor international candidates (e.g., STEM OPT, OPT, H1B, O1, E3). "
+        "While we cannot guarantee your visa, we have historically been successful.",
+        "We provide visa sponsorship support and assess each circumstance on a case-by-case basis.",   # Cartesia
+    ]
+    for text in not_refusals:
+        assert not scoring.no_sponsorship_jd(text), text

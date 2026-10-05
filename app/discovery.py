@@ -46,14 +46,14 @@ def _rows(conn) -> list[dict]:
     in_review test that can be evaluated in aggregate — see `_IN_REVIEW_CAVEAT`."""
     return [dict(r) for r in conn.execute(
         "SELECT r.job_id, r.company, r.company_norm, r.first_seen, r.verdict,"
-        "       COALESCE(s.status, 'new') AS status"
+        "       COALESCE(s.status, 'new') AS status, s.duplicate_of"
         "  FROM jobs.roles r LEFT JOIN role_state s ON s.job_id = r.job_id"
     )]
 
 
-_IN_REVIEW_CAVEAT = ("reviewable = status new, verdict not drop, company not already applied to "
-                     "and not in cooldown. Excludes the signature-dedup hide, so it reads a "
-                     "little high.")
+_IN_REVIEW_CAVEAT = ("reviewable = status new, verdict not drop, not a linked li: duplicate, "
+                     "company not already applied to and not in cooldown. Excludes the "
+                     "signature-dedup hide, so it reads a little high.")
 
 
 def collect(conn, cfg: dict, days: int) -> dict:
@@ -62,10 +62,11 @@ def collect(conn, cfg: dict, days: int) -> dict:
     start = (datetime.date.fromisoformat(today) - datetime.timedelta(days=days - 1)).isoformat()
 
     applied_cos = {r["name_norm"] for r in conn.execute("SELECT name_norm FROM applied_companies")}
-    cooldown_cos = set(cfgmod.active_cooldowns(cfg))
+    cooldown_cos = set(store.active_cooldowns(conn, cfg))      # config.yaml ∪ UI-set
 
     def reviewable(r: dict) -> bool:
         return (r["status"] == "new" and r["verdict"] != "drop"
+                and not r.get("duplicate_of")
                 and r["company_norm"] not in applied_cos
                 and r["company_norm"] not in cooldown_cos)
 

@@ -8,6 +8,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 import time
 
 import yaml
@@ -51,6 +53,15 @@ def _demote(conn, yf, tally: dict) -> None:
         print(f"   ↳ {jid}: tailor_status ready → invalid (was still offering the old PDF)")
 
 
+def _requeued(conn, yf: Path, mtime: float) -> bool:
+    jid = _job_id_of(yf)
+    role = store.get_role(conn, jid) if jid else None
+    if not role or role.get("tailor_status") != "queued":
+        return False
+    pp = role.get("prompt_path")
+    return bool(pp and Path(pp).exists() and Path(pp).stat().st_mtime > mtime)
+
+
 def _scan_once(cfg: dict, seen: dict[str, float], force: bool = False,
                dry_run: bool = False, tally: dict | None = None) -> int:
     """Returns the number of files processed. `tally` (optional, filled in place) carries the
@@ -65,6 +76,13 @@ def _scan_once(cfg: dict, seen: dict[str, float], force: bool = False,
         for yf in sorted(resumes_dir.glob("*.yaml")):
             mtime = yf.stat().st_mtime
             if not force and seen.get(str(yf)) == mtime:
+                continue
+            # A role queued for RE-tailoring keeps its old YAML on disk until the worker
+            # rewrites it. Re-ingesting that old file would flip queued → ready and silently
+            # cancel the re-tailor (2026-09-23: the owner's 24 low-score redo vanished this way
+            # when a batch's closing ingest swept the whole library). Skip while the prompt is
+            # newer than the YAML; the worker's rewrite makes the YAML newer and it ingests then.
+            if _requeued(conn, yf, mtime):
                 continue
             try:
                 if dry_run:
@@ -127,7 +145,17 @@ def main(argv: list[str] | None = None) -> None:
                     help="validate only — no PDFs rendered, no DB writes, no demotions")
     args = ap.parse_args(argv)
     cfg = cfgmod.load_config()
+    # Persisted per workspace (output/<ws>/.ingest_seen.json) since 2026-09-23: with an
+    # in-memory map every one-shot run was a FULL pass — the owner's 7,000-file library took
+    # ~10 minutes to re-render after every batch. `--all` still forces a full pass (that is how
+    # a scorer/validator change is rolled over the whole corpus).
+    seen_path = cfgmod.resolve_path(cfg["output_dirs"]["resumes"]).parent / ".ingest_seen.json"
     seen: dict[str, float] = {}
+    if not args.all:
+        try:
+            seen = {k: float(v) for k, v in json.loads(seen_path.read_text()).items()}
+        except Exception:  # noqa: BLE001 — missing/corrupt map just means a full pass
+            seen = {}
 
     if args.watch:
         print("watching output/resumes/ … (Ctrl+C to stop)")
@@ -142,6 +170,11 @@ def main(argv: list[str] | None = None) -> None:
         n = _scan_once(cfg, seen, force=args.all, dry_run=args.dry_run, tally=tally)
         print(f"ingested {n} file(s)." if n else "nothing new to ingest.")
         _report(tally, args.dry_run)
+        if not args.dry_run:
+            try:
+                seen_path.write_text(json.dumps(seen))
+            except Exception as exc:  # noqa: BLE001
+                print(f"(could not save the seen-map: {exc})")
 
 
 if __name__ == "__main__":
