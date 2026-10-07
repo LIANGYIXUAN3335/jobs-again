@@ -1,12 +1,14 @@
-"""Read + reply to email for the authorized job-search mailbox (sample-5fbfd918@example.com),
-using the same Gmail App Password as mailcode (jobscan/secrets.yaml). IMAP to read/search,
-SMTP to send. Replies thread correctly (Re: subject + In-Reply-To/References headers).
+"""Read + reply to email for the workspace's job-search mailbox (the owner's is
+sample-5fbfd918@example.com), using the same credential as mailcode (jobscan/secrets.yaml app
+password, or the workspace's Google OAuth token from /settings). IMAP to read/search, SMTP to
+send. Replies thread correctly (Re: subject + In-Reply-To/References headers).
 
 SAFETY: sending is never automatic. The intended flow is draft -> user reviews -> user
 confirms -> send_reply() is called. Nothing here sends without an explicit call.
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import email
 import imaplib
@@ -20,7 +22,55 @@ from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate, make_msgid, parseaddr
 
-from . import mailcode
+from . import google_auth, mailcode
+
+
+def imap_login(M, addr: str, secret) -> None:
+    """Log in to an IMAP connection with whatever secret the workspace has: a Gmail app
+    password (`str` → M.login, the original path, unchanged) or a mailcode.OAuthSecret
+    (→ SASL XOAUTH2 with a live access token). Every IMAP site in app/ and tools/ calls this
+    instead of M.login so one workspace token lights up all of them."""
+    if not isinstance(secret, mailcode.OAuthSecret):
+        M.login(addr, secret)
+        return
+    rounds: list[bytes] = []
+
+    def _xoauth2(challenge):
+        # Round 1: the server's empty "+" → send the SASL string. A round 2 only happens on
+        # failure — Gmail then sends a base64 JSON error and waits; returning None makes
+        # imaplib answer "*" (abort) so we get a clean NO instead of re-sending the token.
+        rounds.append(challenge or b"")
+        if len(rounds) > 1:
+            return None
+        return google_auth.xoauth2_string(addr, secret.token()).encode()
+
+    try:
+        M.authenticate("XOAUTH2", _xoauth2)
+    except imaplib.IMAP4.error as e:
+        detail = rounds[1].decode("utf-8", "replace") if len(rounds) > 1 else ""   # Google's JSON, no secrets in it
+        raise imaplib.IMAP4.error(f"XOAUTH2 login failed for {addr}: {e} {detail}".strip()) from e
+
+
+def smtp_login(s, addr: str, secret) -> None:
+    """SMTP twin of imap_login: `str` → s.login (unchanged); OAuthSecret → AUTH XOAUTH2."""
+    if not isinstance(secret, mailcode.OAuthSecret):
+        s.login(addr, secret)
+        return
+    s.ehlo()
+    auth = base64.b64encode(google_auth.xoauth2_string(addr, secret.token()).encode()).decode()
+    code, resp = s.docmd("AUTH", "XOAUTH2 " + auth)
+    if code == 334:
+        # Gmail answers a bad token with 334 + a base64 JSON error and waits for an empty line
+        # before the final 535; send it so the connection is left in a sane state, and keep
+        # the decoded JSON for the error (it names the failure, never the token).
+        try:
+            detail = base64.b64decode(resp).decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            detail = resp.decode("utf-8", "replace") if isinstance(resp, bytes) else str(resp)
+        code, resp = s.docmd("")
+        raise smtplib.SMTPAuthenticationError(code, f"{detail} {resp!r}".encode())
+    if code != 235:
+        raise smtplib.SMTPAuthenticationError(code, resp)
 
 
 def _imap_connect(mc: dict, attempts: int = 3):
@@ -46,7 +96,8 @@ def _dec(s: str) -> str:
 def _creds(cfg: dict):
     mc, addr, pw = mailcode._cfg(cfg)
     if not (addr and pw):
-        raise RuntimeError("no Gmail app password / address (jobscan/secrets.yaml + config mailcode.email)")
+        raise RuntimeError("no mailbox credential / address (jobscan/secrets.yaml app password or a "
+                           "Google OAuth token from /settings + config mailcode.email)")
     return mc, addr, pw
 
 
@@ -79,7 +130,7 @@ def search_recent(cfg: dict, query: str = "", days: int = 14, limit: int = 25) -
     mc, addr, pw = _creds(cfg)
     M = _imap_connect(mc)
     try:
-        M.login(addr, pw)
+        imap_login(M, addr, pw)
         M.select("INBOX")
         since = (datetime.datetime.now(datetime.timezone.utc)
                  - datetime.timedelta(days=days)).strftime("%d-%b-%Y")
@@ -110,7 +161,7 @@ def get_message(cfg: dict, uid: str) -> dict:
     mc, addr, pw = _creds(cfg)
     M = _imap_connect(mc)
     try:
-        M.login(addr, pw)
+        imap_login(M, addr, pw)
         M.select("INBOX")
         typ, d = M.fetch(str(uid).encode(), "(RFC822)")
         if not d or not d[0]:
@@ -147,12 +198,15 @@ def _re_subject(subject: str) -> str:
 
 def send_reply(cfg: dict, to_addr: str, subject: str, body: str,
                in_reply_to: str | None = None, references: str | None = None,
-               from_name: str = "Casey Example", attachments: list[str] | None = None,
+               from_name: str | None = None, attachments: list[str] | None = None,
                new_thread: bool = False) -> dict:
     """Send a reply via SMTP. Threads via In-Reply-To/References when the original headers
     are passed (unless new_thread). Optional `attachments` = list of file paths to attach (e.g. a
     résumé PDF). NEVER call this without the user having reviewed and approved the draft."""
     mc, addr, pw = _creds(cfg)
+    if not from_name:                       # the workspace's own name (owner 2026-09-23), never a hardcoded one
+        from . import tailoring
+        from_name = tailoring.candidate_name(cfg)
     msg = EmailMessage()
     msg["From"] = formataddr((from_name, addr))
     msg["To"] = _hdr(to_addr)
@@ -174,7 +228,7 @@ def send_reply(cfg: dict, to_addr: str, subject: str, body: str,
         attached.append(p.name)
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL(mc.get("smtp_host", "smtp.gmail.com"), int(mc.get("smtp_port", 465)), context=ctx) as s:
-        s.login(addr, pw)
+        smtp_login(s, addr, pw)
         s.send_message(msg)
     return {"sent": True, "to": to_addr, "subject": msg["Subject"], "attachments": attached}
 
@@ -184,5 +238,5 @@ def smtp_check(cfg: dict) -> bool:
     mc, addr, pw = _creds(cfg)
     ctx = ssl.create_default_context()
     with smtplib.SMTP_SSL(mc.get("smtp_host", "smtp.gmail.com"), int(mc.get("smtp_port", 465)), context=ctx) as s:
-        s.login(addr, pw)
+        smtp_login(s, addr, pw)
     return True
