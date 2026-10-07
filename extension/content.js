@@ -34,8 +34,26 @@
   // almost every field, so throwing there stops the fill promptly at the next field boundary.
   let abortFill = false;
   const ABORT = "__jobscan_abort__";
+  // Owner 2026-09-25 「切到别的标签页就不填了」: Chrome throttles a background tab's timers to
+  // one tick per second (and to once a minute after ~5 min), so every 80 ms poll here — waiting
+  // for a dropdown menu, a typeahead's suggestions, a Workday step — runs out of its window and
+  // the field is reported "pick manually". Rather than fail silently, PAUSE at the next field
+  // boundary while the tab is hidden and resume the moment it is visible again.
+  let panelLog = null;                                          // set by panel(); humanPause reports through it
+  let pausedNotice = false;
+  const waitVisible = async () => {
+    if (document.visibilityState === "visible") return;
+    if (!pausedNotice && panelLog) { panelLog("⏸ 标签页在后台，Chrome 会把计时器降速——已暂停，切回来自动继续", "warn"); pausedNotice = true; }
+    while (document.visibilityState !== "visible") {
+      if (abortFill) throw new Error(ABORT);
+      await sleep(400);
+    }
+    if (panelLog) panelLog("▶ 回到前台，继续填", "good");
+    pausedNotice = false;
+  };
   const humanPause = async () => {
     if (abortFill) throw new Error(ABORT);
+    await waitVisible();
     await sleep(180 + Math.floor(Math.random() * 140));         // ~0.18–0.32s
     if (abortFill) throw new Error(ABORT);
   };
@@ -101,7 +119,11 @@
   ];
 
   // NEVER auto-fill sensitive, legal, voluntary, or user-choice fields.
-  const EXCLUDE = /gender|ethnic|hispanic|latin|\brace\b|racial|veteran|disab|pronoun|sexual orientation|lgbt|demographic|self.?identif|equal employment|\beeo\b|salary|compensation|desired pay|referr|referral|source of|how did you hear|sponsor|visa|authoriz|work permit|right to work|eligible to work|felony|conviction|criminal|background check|signature|sign your name|certif|attest|acknowledg|consent|privacy|terms|gdpr/i;
+  // 2026-09-09 owner rescope: legal/eligibility/EEO fields now auto-fill from recorded facts
+  // (she reviews every form before submit). Machine-blank only comp + referral/source.
+  // 2026-09-23 owner: the bare `referr` used to match "Preferred Name" too, so preferred-name boxes
+  // were never filled; and "how did you hear" is no longer manual — the answer is always "Job board".
+  const EXCLUDE = /salary|compensation|desired pay|\breferral\b|\breferred by\b|who referred/i;
 
   function classify(el) {
     const t = fieldText(el);
@@ -167,9 +189,9 @@
   }
 
   // ---- common logistics answers (deterministic, from the profile) ----
-  // Sensitive/legal/user-choice questions return null above and stay manual. This block only
-  // handles lower-risk logistics like residency/location, onsite/remote/relocate, and
-  // "have you worked here before".
+  // Only compensation and referral/source (SENSITIVE) stay manual. This block answers work
+  // authorization / sponsorship from the recorded facts, plus lower-risk logistics like
+  // residency/location, onsite/remote/relocate, and "have you worked here before".
   const clean = (s) => (s || "").replace(/\s+/g, " ").trim().slice(0, 300);
   const short = (s) => clean(s).slice(0, 52);
 
@@ -177,9 +199,71 @@
   // confirm them on the live form because they are sensitive, legal, voluntary, or irreversible.
   const SENSITIVE = EXCLUDE;
 
+  function cityOnly(p) { return ((p.location || "").split(",")[0] || "").trim(); }
+  // Profile `state` may be a full name ("Texas") or a code ("TX"); forms want either.
+  function stateFull(p) { const raw = (p.state || (p.location || "").split(",")[1] || "California").trim(); return US_STATES[raw.toUpperCase()] || raw; }
+  function stateAbbr(p) { const full = stateFull(p); return Object.keys(US_STATES).find((k) => US_STATES[k] === full) || (full.length === 2 ? full.toUpperCase() : ""); }
   function fullLoc(p) {
-    const city = ((p.location || "").split(",")[0] || "San Jose").trim();
-    return `${city}, California, United States`;
+    const city = ((p.location || "").split(",")[0] || "").trim();
+    const state = p.state || "California";
+    return city ? `${city}, ${state}, United States` : `${state}, United States`;
+  }
+
+  // ---- work authorization / sponsorship (deterministic, from the recorded facts) ----
+  // Owner 2026-09-09: legal/eligibility answers auto-fill from config; she reviews before
+  // submit. The 2026-08-20 "safety" commit (658c20d) deleted these rules, so every such
+  // question fell to the AI picker — whose prompt still refused them → blank — and on Workday
+  // the required-field default then answered "authorized to work?" as No. Restored 2026-09-22.
+  // Free-text boxes get the canonical spoken sentence (owner 2026-08-07 定稿); it never
+  // volunteers the visa type, EAD, I-485 or green card — a form has to ask for the status.
+  const LEGAL_CANON = "I'm authorized to work in the US and I don't require sponsorship.";
+  const legalText = (p, yn) => (yn === "yes" ? "Yes. " : "No. ") + ((p && p.work_authorization_answer) || LEGAL_CANON);
+
+  // Sentence-style options for those two questions ("I am authorized to work for Lyft and do
+  // not require sponsorship" / "I require, or in the future will require, sponsorship…" /
+  // "Yes, I have US work authorization but will require sponsorship in the future"): SCORED,
+  // not regex-matched, so the option that both affirms authorization and denies a sponsorship
+  // need wins, and a plain /^yes/ can never grab the wrong "Yes, … but will require" twin.
+  // Plain "Yes"/"No" options score too. Returns the winning index, or -1 when nothing fits
+  // (a visa-STATUS list with no EAD option, say) so the caller can fall through to the AI.
+  function pickLegalOption(texts, ans) {
+    // `ans` is the commonAnswer() legal object: legal = 'auth' | 'spon', wa / ns = the workspace's
+    // two facts, okTerms / wrongTerms = status words that are right / wrong for THIS candidate.
+    const kind = typeof ans === "string" ? "auth" : (ans.legal === "spon" ? "spon" : "auth");
+    const wa = typeof ans === "string" ? true : ans.wa !== false;
+    const ns = typeof ans === "string" ? false : ans.ns === true;
+    const esc = (x) => String(x).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const mk = (arr, dflt) => new RegExp("\\b(?:" + (arr && arr.length ? arr : dflt).map(esc).join("|") + ")\\b", "i");
+    const okRe = mk(ans.okTerms, ["EAD", "employment authorization document", "adjustment of status", "pending"]);
+    const wrongRe = mk(ans.wrongTerms, ["citizen", "permanent resident", "green card holder", "LPR", "H-1B", "TN", "OPT", "CPT", "L-1", "O-1", "non-immigrant visa", "student visa", "F-1"]);
+    const score = (raw) => {
+      const t = (raw || "").replace(/\s+/g, " ").trim();
+      if (!t) return -9;
+      let s = 0;
+      const authYes = /^yes\b|^i am (legally |currently )?(authori[sz]ed|eligible|permitted)|\b(i am |i'm )?(legally |currently )?authori[sz]ed to work|\bhave (us |u\.s\. )?work authori[sz]ation|\bright to work\b/i.test(t);
+      const authNo = /^no\b|\bnot (currently |legally )?(authori[sz]ed|eligible|permitted)|\bno (us |u\.s\. )?work authori[sz]ation|\bunauthori[sz]ed\b/i.test(t);
+      const needDenied = /\b(do|does|will|would|should) not (currently |ever )?(need|require)\b|\b(don'?t|won'?t|doesn'?t) (currently |ever )?(need|require)\b|\bnot (need|require|going to (need|require))\b|\bno (visa |employment |immigration )?sponsorship\b|\bwithout (visa |any )?sponsorship\b|\bnever (need|require)\b/i.test(t);
+      const needStated = /\b(will|may|might|do|does|would|currently) (need|require)\b|\b(i|we) (need|require)\b|\brequire,? or\b|\bsponsorship (is|will be) (needed|required)\b|\bneeds? (visa )?sponsorship\b|\brequires? (visa |employment |immigration )?sponsorship\b/i.test(t);
+      // a status this candidate does NOT hold — never pick it, even when it also says "authorized";
+      // an option naming the real basis (EAD / F-1 OPT …) is exempt and earns a point
+      const namesOk = okRe.test(t);
+      if (wrongRe.test(t) && !namesOk) s -= 3;
+      if (namesOk) s += 1;
+      if (kind === "auth") {                   // authorization question
+        if (authYes) s += wa ? 2 : -3;
+        if (authNo) s += wa ? -3 : 2;
+        if (needDenied) s += ns ? -2 : 1; else if (needStated) s += ns ? 1 : -2;
+      } else {                                 // sponsorship question
+        if (needDenied) s += ns ? -3 : 2; else if (needStated) s += ns ? 2 : -3;
+        if (/^no\b/i.test(t)) s += ns ? -3 : 2;
+        if (/^yes\b/i.test(t)) s += ns ? 2 : -3;
+        if (authYes && !needStated && !ns) s += 1;
+      }
+      return s;
+    };
+    let best = -1, bestScore = 0;
+    texts.forEach((t, i) => { const sc = score(t); if (sc > bestScore) { best = i; bestScore = sc; } });
+    return best;
   }
 
   // Returns {yesno:"yes"|"no"} for a Yes/No question, {text, choice} for a value question,
@@ -188,6 +272,38 @@
     const t = clean(label).toLowerCase();
     if (!t) return null;
     if (SENSITIVE.test(t)) return null;
+    // Work authorization / sponsorship — BEFORE the essay/length guard: Flexport's sponsorship
+    // question runs 260+ chars and Workday's box text past 120, and both used to fall through
+    // to the AI (→ blank) or to the required-field default (→ No). Authorization is checked
+    // first so a combined "authorized to work WITHOUT sponsorship?" reads as Yes; any other
+    // "sponsor" then means "do you need it?" → No. `legal` routes the answer through
+    // pickLegalOption when the options are sentences instead of Yes/No.
+    // (attestations about the answer — "I understand my response regarding work authorization
+    // must be accurate" — are not the question; the acknowledgement rule below handles them)
+    const legalQ = !/\b(i understand|i confirm|i acknowledge|i certify|must be accurate|most recent citizenship|become a permanent resident|dual citizen|country of citizenship)\b/.test(t);
+    if (legalQ) {
+      // Two facts per workspace (config profile.work_authorized / needs_sponsorship): the owner
+      // is authorized and needs none; a candidate on F-1 OPT is authorized and WILL need it.
+      const wa = profile.work_authorized !== false;
+      const ns = profile.needs_sponsorship === true;
+      const L = (yn, kind) => ({ yesno: yn, text: legalText(profile, yn), legal: kind, wa, ns,
+                                 okTerms: profile.status_terms_ok, wrongTerms: profile.status_terms_wrong });
+      const NO_L = L("no", "spon"), YES_L = L("yes", "spon");
+      const AUTH_YES = L("yes", "auth"), AUTH_NO = L("no", "auth");
+      // What is the question ABOUT? "Will you require sponsorship … to maintain your work
+      // authorization?" asks whether she NEEDS sponsorship (No) even though it contains the
+      // authorization wording; "are you authorized to work … without requiring sponsorship?"
+      // asks whether she is AUTHORIZED (Yes) even though it mentions sponsorship. The old
+      // "authorization first" order got the first kind wrong (18 of 74 logged phrasings), so
+      // a require/need-sponsorship construction is recognised first, unless it is negated by
+      // "without". "Require our assistance with work authorization" is the same question.
+      const withoutSpon = /\bwithout\b[^?]{0,30}\bsponsor/.test(t);
+      const asksNeed = /\b(will|would|do|does|might|may|could|are)\s+you\b[^?]{0,60}?\b(require|need|going to need)\b[^?]{0,90}?\bsponsor|\brequire\b[^?]{0,20}\bsponsor|\bsponsor(ship)?\b[^?]{0,30}\b(required|needed)\b|(require|need)\b.{0,40}\b(assistance|support|help)\b.{0,25}(work authori|visa|immigration)|(require|need)\b.{0,30}(work authori[sz]ation|visa|immigration) (assistance|support|help)|(require|need)\b[^?]{0,40}\b(work permit|a visa|visa sponsorship|right to work support)\b/.test(t);
+      if (asksNeed && !withoutSpon) return ns ? YES_L : NO_L;          // "do you need sponsorship?"
+      if (/authori[sz]ed to (lawfully |legally )?work|authori[sz]ation to work|legally (authorized|allowed|entitled|eligible|able to|permitted)\b.{0,20}\bwork|(legally|lawfully) work|legally eligible|(right|eligible|permitted|permission) to work|work authoriz|eligib(le|ility) to (work|begin|start)|work (permit|eligibility)/.test(t))
+        return (withoutSpon ? (wa && !ns) : wa) ? AUTH_YES : AUTH_NO;   // "authorized (without sponsorship)?"
+      if (/\bsponsor/.test(t)) return ns ? YES_L : NO_L;
+    }
     // OPEN-ENDED essay questions must NEVER get a Yes/No or canned value — they go to the AI.
     // "Tell us about your experience working remote…" contains "remote", which used to trigger a
     // stray "Yes". A prompt that asks you to narrate is not an eligibility toggle.
@@ -229,14 +345,19 @@
     if (/\b18\b.*(older|age)|at least 18|over 18|of legal age|legally an adult/.test(t)) return YES;
     // acknowledgements / confirmations the form needs a Yes on
     if (/\b(do you |please |i )?(accept|confirm|acknowledge|agree|certif(y|ies)|consent)\b/.test(t) && !/decline/.test(t)) return YES;
-    // "how/where did you hear about this job" — answer LinkedIn (owner's pick)
+    // "how/where did you hear about this job" — answer "Job board" (owner's pick, 2026-09-23; was LinkedIn)
     if (/(how|where) did you (hear|learn|find)|hear about (us|this)|source of (this )?(job|opportunity|application)/.test(t))
-      return { text: "LinkedIn", choice: "LinkedIn" };
+      return { text: "Job board", choice: "Job board" };
     // residency / country / location (value)
     if (/(which )?country.*(resid|live|based|located|from|in)|(resid|live|based).*country|country of (residence|origin)/.test(t)) return { text: US, choice: US };
     if (/\bcountry\b/.test(t)) return { text: US, choice: US };
     if (/current (city|location)|city\/state|where are you (based|located|currently)|your (current )?location|based in|current residence/.test(t)) return { text: fullLoc(profile) };
-    if ((/^\s*state\b|\bstate\/province|\bprovince\b/.test(t)) && !/united states|statement/.test(t)) return { text: "California", choice: "California" };
+    if ((/^\s*state\b|\bstate\/province|\bprovince\b/.test(t)) && !/united states|statement/.test(t)) {
+      // owner 2026-09-23: the state comes from the profile (Texas for Taylor, California for her),
+      // and a dropdown may list either the full name or the two-letter code — match both.
+      const st = stateFull(profile), ab = stateAbbr(profile);
+      return { text: st, choice: st, choiceAlt: ab };
+    }
     if (/able to work (at|in|from)|can you work (at|in|from)|position is (located|based)|role is (in|located|based)|work (at|from) (this|the) (location|office)/.test(t)) return YES;
     return null;
   }
@@ -256,13 +377,18 @@
   function fillSelect(sel, want) {
     const opts = [...sel.options];
     let target;
-    if (want.yesno) {
+    if (want.legal) {                                   // sentence options: score, don't regex
+      const i = pickLegalOption(opts.map((o) => o.text), want);
+      if (i >= 0) target = opts[i];
+    }
+    if (!target && want.yesno) {
       const yn = want.yesno === "yes" ? /^\s*y(es)?\b/i : /^\s*no?\b/i;
       target = opts.find((o) => yn.test(o.text));
     }
     if (!target && want.choice) {
-      const c = want.choice.toLowerCase();
+      const c = want.choice.toLowerCase(), alt = (want.choiceAlt || "").toLowerCase();
       target = opts.find((o) => o.text.trim().toLowerCase() === c)
+        || (alt && opts.find((o) => o.text.trim().toLowerCase() === alt || o.text.trim().toLowerCase().startsWith(alt + " ")))
         || opts.find((o) => o.text.toLowerCase().includes(c))
         || (/united states/.test(c) && opts.find((o) => /united states|\bu\.?s\.?a?\.?\b/i.test(o.text)));
     }
@@ -279,13 +405,18 @@
   }
   function fillRadio(radios, want) {
     let target;
-    if (want.yesno) {
+    if (want.legal) {
+      const i = pickLegalOption(radios.map(radioLabel), want);
+      if (i >= 0) target = radios[i];
+    }
+    if (!target && want.yesno) {
       const yn = want.yesno === "yes" ? /^\s*y(es)?\b/i : /^\s*no?\b/i;
       target = radios.find((r) => yn.test(radioLabel(r)));
     }
     if (!target && want.choice) {
-      const c = want.choice.toLowerCase();
-      target = radios.find((r) => radioLabel(r).toLowerCase().includes(c));
+      const c = want.choice.toLowerCase(), alt = (want.choiceAlt || "").toLowerCase();
+      target = radios.find((r) => radioLabel(r).toLowerCase().includes(c))
+        || (alt && radios.find((r) => radioLabel(r).trim().toLowerCase() === alt));
     }
     if (!target) return false;
     target.click();                                     // click drives framework onChange handlers
@@ -363,9 +494,15 @@
     for (let i = 0; i < 10 && !opt; i++) {                            // menu renders async — poll ITS listbox
       await sleep(80);
       const menu = document.getElementById(input.getAttribute("aria-controls") || "");
-      if (menu) { options = [...menu.querySelectorAll("[role=option]")]; opt = options.find((o) => want.test(o.textContent)); }
+      if (menu) {
+        options = [...menu.querySelectorAll("[role=option]")];
+        // a FUNCTION fallback is a scorer over the rendered options (pickLegalOption) — it
+        // knows the sentence twins apart, so it gets first pick; the plain regex still follows
+        if (options.length && typeof fallback === "function") opt = fallback(options) || null;
+        if (!opt) opt = options.find((o) => want.test(o.textContent));
+      }
     }
-    if (!opt && fallback) opt = options.find((o) => fallback.test(o.textContent));
+    if (!opt && fallback && typeof fallback !== "function") opt = options.find((o) => fallback.test(o.textContent));
     if (!opt) { input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); return { ok: false, picked: cur }; }
     coordSeq(opt);                                                    // select
     for (let i = 0; i < 10 && now() === cur; i++) await sleep(40);    // leave as soon as it commits
@@ -466,11 +603,32 @@
     return did;
   }
 
+  // 2026-09-15 restore: an 08-20 "safety" commit stubbed this out to warn-only, which
+  // contradicted the 2026-09-09 owner rescope (EEO/self-ID auto-fills from her recorded
+  // `eeo` config; she reviews before submit). Restored verbatim from pre-stub version.
   async function fillDemographics(prefs, log) {
-    const hasDemo = [...document.querySelectorAll("input[role=combobox],input[type=radio]")]
-      .some((el) => DEMOGRAPHIC.test(comboLabel(el) || controlLabel(el) || fieldText(el)));
-    if (hasDemo) log("self-ID / demographic questions left for your confirmation", "warn");
-    return 0;
+    prefs = prefs || {};
+    let acted = false;
+    let did = 0;                    // count for untilSettled — some forms reveal race only
+    const seen = new Set();         // after Hispanic/Latino is answered
+    did += fillEeoRadios(prefs, log);   // radio-based EEO (Ashby et al.) — combobox EEO below
+    for (const input of document.querySelectorAll("input[role=combobox]")) {
+      const label = comboLabel(input);
+      if (!label || !DEMOGRAPHIC.test(label) || seen.has(label)) continue;
+      seen.add(label);
+      const key = eeoKey(label);
+      const wanted = key && prefs[key] != null ? String(prefs[key]).trim() : "";  // "" → decline
+      const control = input.closest('[class*="control"]') || input.parentElement;
+      if (!control) continue;
+      if (acted) await humanPause();                             // pace + let react settle between fields
+      acted = true;
+      const r = await selectEeoOption(control, input, wanted);
+      if (r.ok) did++;
+      log(r.ok ? `${short(label)} → ${short(r.picked)}` : `${short(label)} — set manually`, r.ok ? "good" : "warn");
+    }
+    // every consent / agreement box on the page (demographic consent, terms, privacy…)
+    did += tickConsents(log);
+    return did;
   }
 
   // Deterministic pass over selects / radio groups / custom dropdowns / value text-fields.
@@ -543,20 +701,24 @@
 
       const ans = commonAnswer(label, profile);
       let done = false;
-      // "How did you hear about us?" — prefer LinkedIn, but many forms don't list it. Owner's
-      // rule: if LinkedIn isn't there, just pick any option. Try LinkedIn → common sources →
-      // the FIRST real option, so a required field never blocks on a missing LinkedIn.
+      // "How did you hear about us?" — prefer "Job board" (owner 2026-09-23), then LinkedIn and the
+      // other common sources, then the FIRST real option, so a required field never blocks.
       if (!done && /how (did|do) you hear|where did you (hear|learn|find)|hear about (us|this)|source of (this )?(job|opportunity|application)|referral source/.test(label.toLowerCase())) {
         await pace();
-        let r = await pickReactSelect(control, input, /linkedin/i, /online|internet|company (web)?site|job board|social media|search engine|google|other/i);
+        let r = await pickReactSelect(control, input, /job\s?board/i, /linkedin|online|internet|company (web)?site|social media|search engine|google|other/i);
         if (!r.ok) r = await pickAnyOption(control, input);   // still nothing → first real option
         if (r.ok) { log("how did you hear → " + short(r.picked), "good"); done = true; }
       }
       if (!done && ans && (ans.choice || ans.yesno)) {
         const want = ans.yesno ? (ans.yesno === "yes" ? /^\s*yes\b/i : /^\s*no\b/i)
-          : new RegExp(escapeRe(ans.choice), "i");
+          : new RegExp(escapeRe(ans.choice) + (ans.choiceAlt ? "|^\\s*" + escapeRe(ans.choiceAlt) + "\\b" : ""), "i");
+        // legal Yes/No: score the real option texts (a "Yes, … but will require sponsorship"
+        // twin must lose to "Yes, … and do not require"); the plain regex stays as fallback
+        const legalPick = ans.legal
+          ? (els) => { const i = pickLegalOption(els.map((o) => o.textContent), ans); return i >= 0 ? els[i] : null; }
+          : null;
         await pace();
-        const r = await pickReactSelect(control, input, want, null);
+        const r = await pickReactSelect(control, input, want, legalPick);
         if (r.ok) { log("selected: " + short(label) + " → " + short(r.picked), "good"); done = true; }
       }
       // Deterministic rule missed (or the options are full sentences like Work Authorization /
@@ -592,6 +754,24 @@
 
   // Fills one standard field at a time with a human-like pause between each, so the form's
   // anti-spam heuristics don't flag an instant burst. `onField(key)` reports progress.
+  // 「旧身份残值」判定（2026-09-09）：框里已有的值若正好是某张投递名片的已知值（名字/
+  // 全名/邮箱/电话 —— Chrome 自带 autofill 或切换身份前的一次 Fill 留下的），且不等于
+  // 本次要填的值，就允许改写。除名片值以外的任何已有内容（用户手填的）照旧不碰。
+  function staleIdentityValue(key, cur, want, profile) {
+    const cards = profile._cards;
+    if (!cards) return false;
+    const norm = (s) => String(s || "").trim().toLowerCase();
+    const digits = (s) => String(s || "").replace(/\D/g, "").replace(/^1(?=\d{10}$)/, "");
+    if (norm(cur) === norm(want)) return false;               // 已经是目标值，不用动
+    for (const c of Object.values(cards)) {
+      if (/^(first_name|preferred_first_name)$/.test(key) && norm(cur) === norm(c.first_name)) return true;
+      if (/^(full_name|preferred_name|legal_name)$/.test(key) && norm(cur) === norm(c.display_name)) return true;
+      if (key === "email" && norm(cur) === norm(c.email)) return true;
+      if (key === "phone" && digits(cur) && digits(cur) === digits(c.phone_national)) return true;
+    }
+    return false;
+  }
+
   async function fillFields(profile, onField) {
     const filled = [];
     const skipped = [];
@@ -608,7 +788,16 @@
       if (key === "phone") val = nationalPhone(profile);
       // the one field we DO correct when it's already filled — a pre-filled "+1 …" is wrong
       if (key === "phone" && fixPhoneCountryCode(el, profile, (m, c) => skipped.push(m))) continue;
-      if ((el.value || "").trim()) { skipped.push(key + " (already filled)"); continue; }
+      if ((el.value || "").trim()) {
+        // 旧身份的名字/邮箱/电话残值 → 改写成当前名片的（其他已填内容一律不碰）
+        if (staleIdentityValue(key, el.value, val, profile)) {
+          el.focus(); setNativeValue(el, val); el.blur();
+          filled.push(key + " ⇄");
+          if (onField) onField(key + " ⇄");
+          continue;
+        }
+        skipped.push(key + " (already filled)"); continue;
+      }
       if (filled.length) await humanPause();          // pace between fields (skip before the first)
       // A dropdown disguised as a text input (location typeaheads, country pickers…) must be
       // SELECTED, not typed into — otherwise the value looks filled but never registers.
@@ -621,8 +810,10 @@
         const want = key === "name_pronunciation"
           ? new RegExp(escapeRe(profile.preferred_name || profile.first_name || "Casey"), "i")
           : new RegExp(escapeRe(val), "i");
+        // owner 2026-09-23: for a location picker type just the city ("Dallas") and take the first
+        // suggestion — the full "City, State, Country" string often matches nothing (no "TX" option).
         const r = /^(location|country)$/.test(key)
-          ? await pickTypeahead(control, el, val)
+          ? await pickTypeahead(control, el, key === "location" ? cityOnly(profile) || val : val)
           : await pickReactSelect(control, el, want, null);
         if (r.ok) { filled.push(key + " ▾"); if (onField) onField(key); }
         else skipped.push(key + " (dropdown — pick manually)");
@@ -734,7 +925,14 @@
       if (!document.getElementById(`school--${i}`)) break;
       await ghSetTypeahead(`school--${i}`, e.school);
       await ghSetCombo(`degree--${i}`, e.degree, degreeRegex(e.degree));   // matches "B Tech", "B.S.", etc.
-      await ghSetTypeahead(`discipline--${i}`, e.discipline);
+      // Discipline lists often lack the exact major ("Mechanical Engineering" missing is the
+      // norm, not the exception) — owner 2026-09-15: fall back to the broad one instead of
+      // leaving it for her to hunt every time.
+      if (!(await ghSetTypeahead(`discipline--${i}`, e.discipline))) {
+        const fb = (role.profile || {}).discipline_fallback;
+        if (fb && await ghSetTypeahead(`discipline--${i}`, fb))
+          log(`discipline: no "${e.discipline}" in the list → ${fb}`, "good");
+      }
       ghSetText(`start-date-year--${i}`, e.start_year);   // present on some tenants
       ghSetText(`end-date-year--${i}`, e.end_year);
       log("education: " + e.school, "good");
@@ -1037,6 +1235,23 @@
       const el = srInner(id);
       if (el && v && !(el.value || "").trim() && srNativeSet(el, v)) filled.push(name);
     }
+    // "Confirm your email" (owner 2026-09-23, ServiceNow): it must equal whatever the Email box
+    // holds — including an address the résumé-autofill or the owner typed — and the spl-input
+    // sometimes re-renders after the first pass, so verify and retry once before giving up.
+    {
+      const emailEl = srInner("email-input");
+      const want = ((emailEl && emailEl.value) || profile.email || "").trim();
+      for (let attempt = 0; attempt < 2 && want; attempt++) {
+        const c = srInner("confirm-email-input");
+        if (!c) break;
+        if ((c.value || "").trim() === want) break;
+        srNativeSet(c, want);
+        await sleep(300);
+        const c2 = srInner("confirm-email-input");
+        if (c2 && (c2.value || "").trim() === want) { if (!filled.includes("confirm email")) filled.push("confirm email"); break; }
+        if (attempt === 1) log("Confirm email did not stick — type it yourself", "warn");
+      }
+    }
     // phone: national number, no +1 (there's a separate country selector)
     const phone = deepAll('input[type=tel]').find(srVis);
     if (phone && !(phone.value || "").trim() && srNativeSet(phone, nationalPhone(profile))) filled.push("phone");
@@ -1130,6 +1345,13 @@
       else if (/riseup|nextgen/.test(label)) { want = /^no/i; seeds = ["N"]; }
       else if (/authorized to work/.test(label)) { want = /^yes/i; seeds = ["Y"]; }
       else if (/sponsor/.test(label)) { want = /^no/i; seeds = ["N"]; }
+      else if (/how (did|do) you (hear|learn|find)|hear about|source/.test(label + " " + ph)) {
+        // owner 2026-09-23: "Job board" first; if this tenant does not list it, LinkedIn / online / other
+        if (await srPickSelect(cb, /job\s?board/i, ["J", "B"]) || await srPickSelect(cb, /linkedin|online|internet|other/i, ["L", "O"])) {
+          n++; log("how did you hear → " + (cb.value || "").slice(0, 26), "good");
+        }
+        continue;
+      }
       if (!want) continue;
       if (await srPickSelect(cb, want, seeds)) { n++; log("selected: " + (label || ph || "question").slice(0, 40) + " → " + (cb.value || "").slice(0, 26), "good"); }
     }
@@ -1143,6 +1365,12 @@
       if (/signature/.test(q)) {
         const nm = ((role.profile || {}).preferred_name || (role.profile || {}).first_name || "") + " " + ((role.profile || {}).last_name || "");
         if (srNativeSet(inp, nm.trim())) { n++; log("signed: " + nm.trim(), "good"); }
+      } else if (/preferred.*name|nickname|goes by|what should we call you/.test(q)) {
+        // owner 2026-09-23: a bare "Preferred name" question gets the preferred full name
+        const nm = ((role.profile || {}).preferred_name || (role.profile || {}).first_name || "") + " " + ((role.profile || {}).last_name || "");
+        if (srNativeSet(inp, nm.trim())) { n++; log("preferred name: " + nm.trim(), "good"); }
+      } else if (/how (did|do) you (hear|learn|find)|hear about|source of/.test(q)) {
+        if (srNativeSet(inp, "Job board")) { n++; log("how did you hear → Job board", "good"); }
       } else if (/today'?s date|^date\b|\bdate\b/.test(q)) {
         const d = new Date();
         const mm = String(d.getMonth() + 1).padStart(2, "0"), dd = String(d.getDate()).padStart(2, "0");
@@ -1160,7 +1388,7 @@
     for (let i = 0; i < 7 && n; i++) {
       const txt = (n.textContent || "").replace(/\s+/g, " ").trim();
       if (txt.length > 12 && txt.length < 220 &&
-          /\?|worked|relocat|employ|citizen|gender|ethnic|race|pwc|sponsor|riseup|nextgen|authorized/i.test(txt)) return txt;
+          /\?|worked|relocat|employ|citizen|gender|ethnic|race|pwc|sponsor|riseup|nextgen|authorized|hear|source|preferred/i.test(txt)) return txt;
       n = n.parentElement || (n.getRootNode && n.getRootNode().host);
     }
     return inp.placeholder || "";
@@ -1269,16 +1497,21 @@
   const CONSENT_RE = /consent|acknowledg|i agree|i accept|i certify|i confirm|i have read|terms|privacy|gdpr|understand and agree|authoriz/i;
 
   function tickConsents(log) {
-    const hasConsent = [...document.querySelectorAll('input[type=checkbox]')].some((c) => {
-      if (c.disabled || c.checked || !c.offsetParent) return false;
+    let n = 0;
+    for (const c of document.querySelectorAll('input[type=checkbox]')) {
+      if (c.disabled || c.checked || !c.offsetParent) continue;
+      const group = c.closest('fieldset,[role=group],[data-automation-id*="CheckboxGroup"]');
+      if (group && group.querySelectorAll('input[type=checkbox]').length > 1) continue;   // an answer
       let t = `${c.name || ""} ${c.id || ""}`;
       if (c.id) { const l = document.querySelector(`label[for="${CSS.escape(c.id)}"]`); if (l) t += " " + l.innerText; }
       let p = c;
       for (let i = 0; i < 4 && p; i++, p = p.parentElement) t += " " + (p.innerText || "");
-      return CONSENT_RE.test(t);
-    });
-    if (hasConsent) log("consent / acknowledgement checkbox left for your confirmation", "warn");
-    return 0;
+      if (!CONSENT_RE.test(t)) continue;
+      c.click();
+      if (c.checked) n++;
+    }
+    if (n) log(`checked ${n} consent box(es)`, "good");
+    return n;
   }
 
   function wdBlur() {                                  // rule 1 — never leave a prompt open
@@ -1440,7 +1673,7 @@
   // works is type-to-filter, then ArrowDown + Enter. And not every tenant lists LinkedIn —
   // Mastercard's choices are Employee Referral / Internet Search / Job Board / … — so walk a
   // preference chain down to whatever this form actually offers.
-  const HEARD_CHAIN = ["LinkedIn", "Job Board", "Internet Search", "Online", "Other"];
+  const HEARD_CHAIN = ["Job Board", "LinkedIn", "Internet Search", "Online", "Other"];   // owner 2026-09-23: Job Board first
 
   async function wdHowDidYouHear(log) {
     const box = wdBox(/how did you (hear|learn)|where did you (hear|learn)/i);
@@ -1722,8 +1955,8 @@
   }
 
   async function wdQuestions(role, log) {
-    // Fill only non-sensitive required questions. Sensitive/legal/user-choice questions are
-    // skipped and logged for manual confirmation.
+    // Fill required questions from the recorded facts (work auth / sponsorship included);
+    // only compensation and referral/source (SENSITIVE) are skipped for manual confirmation.
     const YES = /^\s*yes\b/i, NO = /^\s*no\b/i;
     const profile = role.profile || {};
     const rules = [
@@ -1802,6 +2035,12 @@
     log("drafting a cover-letter paragraph…");
     const r = await send({ type: "coverLetter", jobId: role.job_id, words: 180 });
     if (isContextDead(r)) { log("JobScan was reloaded — refresh this page (⌘R), then click Fill again.", "warn"); return; }
+    if (r && !r.ok && /^MISMATCH:/i.test(r.error || "")) {
+      // mismatch fuse: different-field specialist role — no letter is better than a letter
+      // that opens with what she lacks. Box stays empty on purpose.
+      log("⚠️ " + (r.error || "").replace(/^MISMATCH:\s*/i, "mismatch fuse: ") + " — box left empty on purpose", "warn");
+      return;
+    }
     if (!r || !r.ok || !r.text) { log("cover letter failed: " + ((r && r.error) || "no text"), "warn"); return; }
     box.focus();
     setNativeValue(box, r.text);
@@ -1841,9 +2080,63 @@
     return n;
   }
 
+  // 2026-09-15 restore: same 08-20 stub-out as fillDemographics — see note there.
   async function wdSelfIdentify(profile, eeo, log) {
-    log("self-ID / voluntary disclosure step left for your confirmation", "warn");
-    return 0;
+    let did = 0;                                   // how many fields this pass actually changed
+    const decline = /prefer not|don'?t wish|do not wish|decline|not to self.?identify|do not want to answer/i;
+    const want = (key, fallback) => {
+      const v = (eeo || {})[key];
+      if (!v || decline.test(v)) return decline;
+      const yn = /^(yes|no)\b/i.exec(v.trim());
+      return yn ? new RegExp("^\\s*" + yn[1], "i") : new RegExp(escapeRe(v), "i");
+    };
+    for (const [q, w, name] of [
+      [/what is your gender/i, want("gender"), "Gender"],
+      [/hispanic or latino/i, want("hispanic_latino"), "Hispanic/Latino"],
+      [/served in the military|veteran/i, /^i am not a veteran$|not a protected veteran/i, "Veteran"],
+    ]) {
+      const r = await wdPrompt(q, w);
+      if (r === "ok") { did++; log("self-ID: " + name, "good"); }
+      else if (r === "no-option") log(name + " — pick manually", "warn");
+    }
+    // Race/ethnicity: a checkbox GROUP on Workday, and on many forms it only APPEARS once
+    // "Hispanic or Latino?" is answered — untilSettled() re-runs us so we catch it then.
+    const fs = document.querySelector('[data-automation-id="ethnicityMulti-CheckboxGroup"]');
+    if (fs) {
+      const boxes = [...fs.querySelectorAll("input[type=checkbox]")];
+      const eth = (eeo || {}).race;
+      const re = !eth || decline.test(eth) ? decline : new RegExp(escapeRe(eth), "i");
+      const hit = boxes.find((c) => re.test(labelFor(c)));
+      if (hit && !hit.checked) { hit.scrollIntoView({ block: "center" }); hit.click(); did++; log("self-ID: Ethnicity", "good"); }
+    } else if (!wdBox(/ethnicity|\brace\b/i)) {
+      // not on the page (yet) — a later pass will pick it up if answering Hispanic reveals it
+    }
+    // a plain prompt-style race question (some tenants use a dropdown, not a checkbox group)
+    const raceBox = wdBox(/what is your (race|ethnicity)/i);
+    if (raceBox && /select one/i.test(raceBox.innerText)) {
+      const eth = (eeo || {}).race;
+      const w = !eth || decline.test(eth) ? decline : new RegExp(escapeRe(eth), "i");
+      if (await wdPrompt(/what is your (race|ethnicity)/i, w) === "ok") { did++; log("self-ID: Race", "good"); }
+    }
+    // CC-305 disability form: choice + signature name + today's date
+    const dis = wdBoxes().find((b) => /check one of the boxes/i.test(b.innerText));
+    if (dis) {
+      const v = (eeo || {}).disability || "";
+      const re = /^no\b/i.test(v) ? /^no, i do not have a disability/i : decline.test(v) ? /do not want to answer/i : /^no, i do not have a disability/i;
+      const hit = [...dis.querySelectorAll("input[type=checkbox]")].find((c) => re.test(labelFor(c)));
+      if (hit && !hit.checked) { hit.scrollIntoView({ block: "center" }); hit.click(); did++; log("self-ID: Disability", "good"); }
+    }
+    if (wdSignName(profile, log)) did++;
+    const now = new Date();
+    if (wdById("SignedOn-dateSectionMonth-input")) {
+      await wdDate("SignedOn", {
+        Month: String(now.getMonth() + 1).padStart(2, "0"),
+        Day: String(now.getDate()).padStart(2, "0"),
+        Year: String(now.getFullYear()),
+      });
+    }
+    did += tickConsents(log);          // every consent/acknowledgement box on this page
+    return did;
   }
 
   // Every unresolved validation error on the page, each tied to the field it belongs to. This
@@ -1987,6 +2280,8 @@
         .chip.applied-warn{ display:block; background:#fde2e1; color:#b42318; font-weight:600; margin-bottom:6px; }
         .chip.company-warn{ display:block; background:#fff3cd; color:#7a5c00; margin-bottom:6px; cursor:help; }
         .chip.pin{ display:block; background:#e8eefb; color:#1e3a8a; margin-bottom:6px; cursor:help; }
+        .chip.idcard{ display:block; background:#f1f5f9; color:#475569; margin-bottom:6px; cursor:help; }
+        .chip.idcard.alt{ background:#1a73e8; color:#fff; }
         button{ display:flex; align-items:center; justify-content:center; gap:7px; font:inherit; font-weight:600;
           cursor:pointer; border:1px solid #e2e8f0; border-radius:9px; background:#f8fafc; color:#0f172a;
           padding:9px 12px; margin-top:9px; width:100%; transition:filter .12s, background .12s; }
@@ -2073,7 +2368,16 @@
     const resumeChip = role.has_tailored_pdf
       ? '<span class="chip ready">tailored résumé ready</span>'
       : `<span class="chip none" title="No tailored PDF exists for this role, so nothing role-specific will be attached. Tailor it in JobScan first if this application matters.">⚠ no tailored résumé for this role — base/profile fields only</span>`;
-    $(".status").innerHTML = pinNote + rejectedNote + appliedWarn + resumeChip;
+    // 投递身份行：这份表单会用哪张名片填 —— 名字/邮箱/电话/简历抬头全跟着它走。
+    // 默认名片灰底；小号（法名 Alex）蓝底，一眼能看出"这份不是常规身份"。
+    const ap = role.apply_profiles || {};
+    const apKeys = Object.keys(ap.profiles || {});
+    const apKey = role.apply_profile || ap.default;
+    const apCard = (ap.profiles || {})[apKey];
+    const idChip = apCard
+      ? `<div class="chip idcard${apKey !== ap.default ? " alt" : ""}" title="自动填表用这张名片：first name、email、电话都按它填，附的简历 PDF 抬头也是它。想换身份用下面的 ⇄ 按钮。">📇 ${apCard.label} ${apCard.display_name} · ${apCard.email}</div>`
+      : "";
+    $(".status").innerHTML = pinNote + rejectedNote + appliedWarn + idChip + resumeChip;
     // One-click override for each rejected pin, when this panel has no résumé of its own.
     // The guard's DEFAULT stands (never silently attach across a company mismatch); the
     // override is an explicit human statement — a click on a button that names the role —
@@ -2103,6 +2407,123 @@
       }
     }
     const log = (m, cls) => { const d = document.createElement("div"); if (cls) d.className = cls; d.textContent = m; $(".log").appendChild(d); };
+    panelLog = log;                                              // let humanPause's pause/resume notices reach this panel
+
+    // ⇄ 身份切换按钮：已投/面试中的岗位不显示（服务端也会 409 拒绝 —— 申请已经用旧抬头
+    // 发出去了，事后换名片只会让记录和事实对不上）。切换成功后整个面板用新数据重建，
+    // 下面的 Fill 就会按新名片填。
+    const idLocked = role.this_status === "applied" || role.this_status === "interviewing";
+    if (apCard && apKeys.length > 1 && role.job_id && !idLocked) {
+      const next = apKeys[(apKeys.indexOf(apKey) + 1) % apKeys.length];
+      const nc = ap.profiles[next];
+      const sb = document.createElement("button");
+      sb.type = "button";
+      sb.style.cssText = "display:block;width:100%;text-align:left;cursor:pointer;" +
+        "margin-top:0;margin-bottom:6px;border:1px dashed #64748b;background:#f8fafc;font-weight:600;";
+      sb.textContent = `⇄ 这份改用 ${nc.label} ${nc.display_name} 投（${nc.email}）`;
+      sb.title = "切换这个岗位的投递身份：简历立刻换抬头重打（内容不变），自动填表也换成这张名片的名字/邮箱/电话。";
+      sb.onclick = async () => {
+        sb.disabled = true; sb.textContent = "切换中…";
+        const res = await send({ type: "setProfile", jobId: role.job_id, profile: next, url: location.href });
+        if (res && res.ok) {
+          let updated;
+          if (res.role) {
+            updated = { ...role, ...res.role };          // 保留 from_pin/pin_override 等本地标记
+          } else {
+            // URL 认不出角色（pin/LinkedIn 中转页）拿不到服务端全量 —— 就地覆盖名片字段
+            updated = { ...role, apply_profile: next, profile: { ...role.profile } };
+            for (const [src, dst] of [["first_name", "first_name"], ["preferred_name", "preferred_name"],
+                                      ["email", "email"], ["phone_national", "phone"]]) {
+              if (nc[src]) updated.profile[dst] = nc[src];
+            }
+          }
+          const cur = document.getElementById("jobscan-panel");
+          if (cur) cur.remove();
+          panel(updated);
+          sparkleStart(updated);
+        } else {
+          sb.disabled = false;
+          sb.textContent = `⇄ 这份改用 ${nc.label} ${nc.display_name} 投（${nc.email}）`;
+          log(`身份切换失败：${(res && res.error) || "unknown"}`, "warn");
+        }
+      };
+      $(".status").appendChild(sb);
+    }
+
+    // 🚫 这家不让投了 (owner 2026-09-25): she learns about an application limit ON the form, so
+    // the cooldown is set right here — no trip back to the review page. Company-level, per
+    // workspace (same table the review page's 🚫 writes), expires by itself; also marks the
+    // role on screen skip (never an applied/interviewing one). Shows the current cooldown first.
+    if (role.company) {
+      // Owner 2026-09-25: one line, tiny pills — the panel's generic `button` rule (flex, full
+      // width, bold, big padding) must be overridden property by property here.
+      const CD_BTN = "display:inline-block;width:auto;flex:0 0 auto;margin:0;padding:0 6px;height:18px;line-height:16px;" +
+        "font-size:11px;font-weight:500;border:1px solid #cbd5e1;border-radius:999px;background:#fff;color:#334155;cursor:pointer;";
+      const cdRow = document.createElement("div");
+      cdRow.style.cssText = "margin:4px 0 6px;";
+      const canSkip = role.job_id && !(role.this_status === "applied" || role.this_status === "interviewing");
+      const renderActive = (cd) => {
+        cdRow.innerHTML = "";
+        const chip = document.createElement("div");
+        chip.className = "chip company-warn";
+        chip.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:6px;";
+        const left = (cd.days_left != null) ? `（还剩 ${cd.days_left} 天）` : "";
+        chip.innerHTML = `<span>❄️ ${role.company} 冷却中 → 到 ${cd.until}${left}${cd.reason ? " · " + cd.reason : ""}</span>`;
+        chip.title = "这家公司在冷却期：扫描跳过、review 页隐藏、自动排队不排。到期自动解除。";
+        if (cd.source !== "config") {
+          const undo = document.createElement("button"); undo.type = "button"; undo.textContent = "撤销";
+          undo.style.cssText = CD_BTN;
+          undo.onclick = async () => {
+            undo.disabled = true;
+            const res = await send({ type: "cooldownClear", company: role.company });
+            if (res && res.ok) { log(`已解除 ${role.company} 的冷却`, "good"); renderPicker(); }
+            else { undo.disabled = false; log(`解除失败：${(res && res.error) || "unknown"}`, "warn"); }
+          };
+          chip.appendChild(undo);
+        } else {
+          const note = document.createElement("span"); note.style.cssText = "font-size:11px;color:#6b7280;"; note.textContent = "（写在 config.yaml 里）"; chip.appendChild(note);
+        }
+        cdRow.appendChild(chip);
+      };
+      const renderPicker = () => {
+        cdRow.innerHTML = "";
+        const line = document.createElement("div");
+        line.style.cssText = "display:flex;flex-wrap:nowrap;align-items:center;gap:3px;font-size:11.5px;white-space:nowrap;overflow-x:auto;";
+        const lab = document.createElement("span"); lab.textContent = "不让投了？冷却："; lab.style.cssText = "color:#6b7280;font-size:11px;"; lab.title = "ATS 说投递次数到上限 / 一次只能投一个？点天数把这家公司整体冷却，不用回 review 页找。"; line.appendChild(lab);
+        const setIt = async (days, until, label) => {
+          for (const b of line.querySelectorAll("button")) b.disabled = true;
+          const today = new Date().toISOString().slice(0, 10);
+          const res = await send({ type: "cooldown", company: role.company, days, until,
+            reason: `ATS 投递上限，${today} 在申请页发现（${label}）`, skipJobId: canSkip ? role.job_id : null });
+          if (res && res.ok) {
+            log(`${role.company} 已冷却到 ${res.until}` + (res.hidden_roles ? `，review 里 ${res.hidden_roles} 个岗位隐藏` : "") + (res.skipped_role ? "，这个岗位已标 skip" : ""), "good");
+            renderActive({ until: res.until, days_left: res.days_left, reason: res.reason, source: "manual" });
+          } else {
+            for (const b of line.querySelectorAll("button")) b.disabled = false;
+            log(`冷却失败：${(res && res.error) || "unknown"}`, "warn");
+          }
+        };
+        for (const d of [30, 60, 90, 180]) {
+          const b = document.createElement("button"); b.type = "button"; b.textContent = `${d}天`;
+          b.style.cssText = CD_BTN;
+          b.onclick = () => setIt(d, null, `${d} 天`);
+          line.appendChild(b);
+        }
+        const c = document.createElement("button"); c.type = "button"; c.textContent = "自定义";
+        c.style.cssText = CD_BTN;
+        c.onclick = () => {
+          const v = (prompt(`冷却 ${role.company} 多久？填天数（如 45）或日期（如 2027-01-01）`, "") || "").trim();
+          if (!v) return;
+          if (/^\d{1,3}$/.test(v)) setIt(Number(v), null, `${v} 天`);
+          else if (/^\d{4}-\d{2}-\d{2}$/.test(v)) setIt(null, v, `到 ${v}`);
+          else log("没听懂：请填 45 这样的天数，或 2027-01-01 这样的日期", "warn");
+        };
+        line.appendChild(c);
+        cdRow.appendChild(line);
+      };
+      if (role.cooldown && role.cooldown.until) renderActive(role.cooldown); else renderPicker();
+      $(".status").appendChild(cdRow);
+    }
 
     $(".x").onclick = () => { abortFill = true; host.remove(); };   // closing the panel also stops a fill
 
@@ -2148,6 +2569,25 @@
       fillBtn.textContent = "■ Stop";
       $(".log").textContent = "";
       const profile = role.profile || {};
+      profile._cards = (role.apply_profiles || {}).profiles;   // staleIdentityValue 用来认旧身份残值
+      // 2026-09-15: the panel caches the role payload from INJECTION time. A tab opened while
+      // the server was serving an empty profile (the stale-config incident) fills everything
+      // EXCEPT identity fields — silently, because valueFor("") skips without a log line. So
+      // a nameless card is refreshed from the live server at CLICK time, never filled from.
+      if (!profile.first_name && !profile.email) {
+        const fresh = await send({ type: "profile" });
+        if (isContextDead(fresh)) {
+          log("JobScan was reloaded — refresh this page (⌘R), then click Fill again.", "warn");
+        } else if (fresh && fresh.ok !== false && fresh.profile
+                   && (fresh.profile.first_name || fresh.profile.email)) {
+          Object.assign(profile, fresh.profile);
+          if (!(role.eeo && Object.keys(role.eeo).length) && fresh.eeo) role.eeo = fresh.eeo;
+          log("profile was empty in this tab — refreshed from the server ✓", "good");
+        } else {
+          log("profile is EMPTY — name/email can't fill. Refresh this page (⌘R); if it "
+              + "persists, restart the JobScan web server.", "warn");
+        }
+      }
       try {
       // Workday is a different animal (multi-step wizard, its own widgets) — own filler,
       // fills the CURRENT step only; you click Save and Continue / Submit yourself.
@@ -2560,7 +3000,18 @@
     busy = true;
     try {
       const res = await send({ type: "lookup", url: location.href });
-      if (!res) { console.warn("[JobScan] no response — is JobScan running on http://127.0.0.1:8787 ?"); return; }
+      if (!res) { console.warn("[JobScan] no response — is JobScan running? (pick a workspace in the extension popup)"); return; }
+      // Owner 2026-09-23: no workspace chosen in this Chrome profile → say so and fill NOTHING.
+      if (res.ok === false && res.error === "NO_WORKSPACE") {
+        if (!document.getElementById("jobscan-ws-gate")) {
+          const g = document.createElement("div");
+          g.id = "jobscan-ws-gate";
+          g.style.cssText = "position:fixed;top:12px;right:12px;z-index:2147483647;max-width:320px;padding:10px 12px;border-radius:10px;background:#12314f;color:#fff;font:13px/1.45 -apple-system,Segoe UI,sans-serif;box-shadow:0 6px 24px rgba(0,0,0,.25)";
+          g.innerHTML = "<b>JobScan：还没选工作台</b><div style='margin-top:4px;opacity:.9'>点浏览器右上角的 JobScan 图标 → 选这个 Chrome profile 是谁的资料 → 刷新这页。选之前不会填任何内容。</div>";
+          document.documentElement.appendChild(g);
+        }
+        return;
+      }
       let role = res.found ? res.role : null;
       // Careers sites whose URLs carry no matchable job id. Owner's rule: default to the
       // company's TOP-scored role (she applies high-score-first, so the first is the best
