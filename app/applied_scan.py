@@ -77,12 +77,19 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
 
 
+def _co_eq(a: str, b: str) -> bool:
+    """Company-name match on normalized keys: equal, or one a PREFIX of the other
+    ("scale"~"scaleai", "box"~"boxinc"). Bare containment is banned — it credited
+    Juicebox mail to Box and scale.com mail to Tailscale (2026-09-16 incident)."""
+    return a == b or a.startswith(b) or b.startswith(a)
+
+
 def _match_roles(conn, company_hint: str, title_hint: str, roles_by_co: dict) -> list[dict]:
     """Best DB roles for an email. Company by normalized-name containment; title narrows it."""
     cn = _norm(company_hint)
     if not cn:
         return []
-    hits = [r for co, rs in roles_by_co.items() if cn and (cn in co or co in cn) for r in rs]
+    hits = [r for co, rs in roles_by_co.items() if cn and _co_eq(cn, co) for r in rs]
     if not hits:
         return []
     if title_hint:
@@ -94,11 +101,31 @@ def _match_roles(conn, company_hint: str, title_hint: str, roles_by_co: dict) ->
     return hits[:4]
 
 
-def scan(cfg: dict, days: int = 90, max_emails: int = 400) -> dict:
+def scan_all(cfg: dict, days: int = 90, max_emails: int = 400) -> dict:
+    """scan() over every configured mailbox (小号 included), results merged. A box that
+    errors is skipped so one bad login doesn't blank the other box's confirmations."""
+    from . import mailcode
+    merged: dict | None = None
+    for account in mailcode._accounts(cfg):
+        try:
+            res = scan(cfg, days=days, max_emails=max_emails, account=account)
+        except Exception:  # noqa: BLE001
+            continue
+        if merged is None:
+            merged = res
+        else:
+            merged["scanned"] += res["scanned"]
+            merged["matched"] += res.get("matched", 0)
+            merged["candidates"] += res["candidates"]
+    return merged or {"candidates": [], "scanned": 0, "matched": 0}
+
+
+def scan(cfg: dict, days: int = 90, max_emails: int = 400,
+         account: tuple[dict, str, str] | None = None) -> dict:
     """Return {candidates: [...], scanned, matched} — a review queue, nothing written."""
-    mc, addr, pw = mail._creds(cfg)
+    mc, addr, pw = account or mail._creds(cfg)
     M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"))
-    M.login(addr, pw)
+    mail.imap_login(M, addr, pw)
     try:
         M.select("INBOX", readonly=True)
         since = (datetime.utcnow() - timedelta(days=days)).strftime("%d-%b-%Y")

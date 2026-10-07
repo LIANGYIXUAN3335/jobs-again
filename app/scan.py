@@ -33,14 +33,17 @@ def run_scan(cfg: dict, only: set[str] | None = None, mode: str = "local") -> di
     totals = Counter()
     rows_out: list[dict] = []
 
-    cooldowns = cfgmod.active_cooldowns(cfg)
+    # config.yaml `cooldowns:` plus the ones she set from the UI (company_cooldowns) — read
+    # READ-ONLY: user_state.db has exactly one writer, and it is not the scanner.
+    cooldowns = store.active_cooldowns_readonly(cfg, today)
     for c in cfg.get("companies", []):
         name, ats, slug = c["name"], c["ats"], str(c.get("slug", ""))
         if only and slug.lower() not in only and name.lower() not in only:
             continue
         cd = cooldowns.get(cfgmod.norm_key(name))
         if cd:
-            details[name] = {"skipped": f"cooldown until {cd['until']} ({cd['reason']})"}
+            why = cd.get("reason") or ("set from the UI" if cd.get("source") == "manual" else "")
+            details[name] = {"skipped": f"cooldown until {cd['until']} ({why})"}
             print(f"{name:<16} skipped — cooldown until {cd['until']}")
             continue
         if ats not in FETCHERS:

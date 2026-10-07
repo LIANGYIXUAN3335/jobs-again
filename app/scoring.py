@@ -36,7 +36,7 @@ def config_hash(cfg: dict) -> str:
     # applied at rank time. Tuning it must not trigger a pointless rescore of every role.
     if isinstance(payload.get("scoring"), dict):
         payload["scoring"] = {k: v for k, v in payload["scoring"].items()
-                              if k not in ("freshness", "diversify")}   # rank-time knobs — no rescore needed
+                              if k not in ("freshness", "diversify", "location_pref")}   # rank-time knobs — no rescore needed
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -99,7 +99,9 @@ _FOREIGN = re.compile(
     r"Austria|Greece|Turkey|Egypt|Argentina|Chile|Colombia|Philippines|Indonesia|Thailand|"
     r"Malaysia|Hong Kong|New Zealand|South Africa|Costa Rica|Bulgaria|Serbia|Ukraine|"
     r"Lithuania|Estonia|Latvia|Slovakia|Slovenia|Croatia|Luxembourg|Bengaluru|Bangalore|"
-    r"Hyderabad|Gurgaon|Noida|Tel Aviv|Yokneam|Herzliya|Shenzhen|Hsinchu|Ho Chi Minh|Hanoi)\b",
+    r"Hyderabad|Gurgaon|Noida|Tel Aviv|Yokneam|Herzliya|Shenzhen|Hsinchu|Ho Chi Minh|Hanoi|"
+    # Gulf states were missing entirely (found 2026-09-10: a Doha posting reached 'applied')
+    r"Qatar|Doha|United Arab Emirates|UAE|Dubai|Abu Dhabi|Saudi Arabia|Riyadh)\b",
     re.I)
 
 
@@ -361,3 +363,76 @@ def freshness(posted_at: str | None, first_seen: str | None, cfg: dict,
         raw *= t["inferred_factor"]
     out["bonus"] = round(max(0.0, raw), 1)
     return out
+
+
+# ── Location preference (owner 2026-09-22: 优先远程或湾区) ─────────────────────────────────
+# Rank-only, like freshness: weighted_score / verdict never move. A remote role, or one in the
+# SF Bay Area, gets `bonus` on rank_score, so it leads its company's pool and the company ring.
+# Anything else — including Workday's opaque "3 Locations" — gets nothing and is never
+# penalised. The same classifier drives the review page's "remote or Bay Area" filter.
+_BAY_PLAIN = (
+    r"san francisco|\bsf\b|silicon valley|san jose|santa clara|sunnyvale|mountain view|"
+    r"palo alto|menlo park|redwood city|san mateo|foster city|burlingame|san bruno|"
+    r"south san francisco|daly city|cupertino|milpitas|los altos|los gatos|campbell|saratoga|"
+    r"oakland|berkeley|emeryville|walnut creek|pleasanton|san ramon|hayward|san carlos|"
+    r"stanford|sausalito|mill valley|san rafael|novato|larkspur|fremont|livermore|"
+    r"san leandro|petaluma|half moon bay|pacifica|millbrae|redwood shores"
+)
+# names that exist elsewhere too (Newark NJ, Richmond VA, Dublin IE, Belmont MA…) — only with
+# a California marker within a few words
+_BAY_NEEDS_CA = r"newark|richmond|dublin|concord|alameda|brisbane|albany|martinez|vallejo|belmont|union city"
+_BAY_RE = re.compile(rf"\b(?:{_BAY_PLAIN})\b", re.I)
+_BAY_CA_RE = re.compile(rf"\b(?:{_BAY_NEEDS_CA})\b[^;|·/]{{0,25}}\b(?:CA|Calif\w*)\b", re.I)
+_BAY_AREA_RE = re.compile(r"\bbay area\b", re.I)
+_NOT_SF_BAY = re.compile(r"tampa|monterey|chesapeake|green bay|bay city|back bay", re.I)
+_REMOTE_RE = re.compile(r"\bremote\b|work from home|\bwfh\b|anywhere in the (?:us|u\.s\.|united states)", re.I)
+
+
+def location_kind(location: str | None, is_remote) -> str | None:
+    """'remote' | 'bay' | None for a posting's location string (+ the board's remote flag)."""
+    loc = location or ""
+    # "Remote - Canada" is remote for Canadians: a foreign country named without any US marker
+    # is not a location this candidate can take (found 2026-09-23 on a Twilio row in the
+    # Bay-Area/remote queue).
+    if _FOREIGN.search(loc) and not _US_HINT.search(loc):
+        return None
+    if is_remote or _REMOTE_RE.search(loc):
+        return "remote"
+    if _BAY_RE.search(loc) or _BAY_CA_RE.search(loc):
+        return "bay"
+    if _BAY_AREA_RE.search(loc) and not _NOT_SF_BAY.search(loc):
+        return "bay"
+    return None
+
+
+def location_pref(location: str | None, is_remote, cfg: dict) -> dict:
+    """{kind, bonus}: the rank lift a remote / Bay Area role earns under scoring.location_pref."""
+    lp = (cfg.get("scoring") or {}).get("location_pref") or {}
+    kind = location_kind(location, is_remote)
+    if not kind or not lp.get("enabled", True):
+        return {"kind": kind, "bonus": 0.0}
+    wanted = {"remote": bool(lp.get("remote", True)), "bay": bool(lp.get("bay_area", True))}
+    return {"kind": kind, "bonus": float(lp.get("bonus", 8)) if wanted[kind] else 0.0}
+
+
+# ── Sponsorship dead-ends (workspace knob, owner 2026-09-23) ──────────────────────────────
+# A candidate who NEEDS visa sponsorship (F-1 OPT → H-1B) should never see a posting whose JD
+# says the employer will not sponsor. Read at view time from roles.jd_text, so the shared
+# jobs.db keeps one score per role and each workspace applies its own eligibility.
+_NO_SPONSOR = re.compile(
+    # "(?!\s+(?:always\s+)?guarantee)": "We can't guarantee sponsorship for every role, but…" (Wispr Flow,
+    # Exa) is a sponsor hedging, not a refusal — without the lookahead it hid every Wispr Flow role.
+    r"\b(?:not|no|never|unable|cannot|can't|won't|will not|does not|do not|isn't|is not|are not)\b(?!\s+(?:always\s+)?guarantee)"
+    r"[^.;\n]{0,40}?\b(?:sponsor(?:ship)?|visa sponsorship|h-?1b|immigration (?:support|sponsorship))"
+    # 2026-09-28: "without sponsorship for an export license" is Cloudflare's export-control boilerplate
+    # (every one of its ~100 US JDs), not a visa statement — it hid the whole company from any
+    # needs_sponsorship workspace. Palo Alto Networks carries a similar clause.
+    r"|\bwithout (?:the need for |requiring |any )?(?:visa |employment |immigration )?sponsorship\b(?! for an? export)"
+    r"|\bsponsorship (?:is )?not (?:available|offered|provided)\b"
+    r"|\bmust be (?:legally )?authori[sz]ed to work[^.;\n]{0,60}\bwithout\b"
+    r"|\bno visa sponsorship\b|\bnot eligible for sponsorship\b", re.I)
+
+
+def no_sponsorship_jd(jd_text: str | None) -> bool:
+    """True when the JD states the employer will not sponsor a work visa."""
+    return bool(jd_text) and bool(_NO_SPONSOR.search(jd_text))

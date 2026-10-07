@@ -23,4 +23,31 @@ else
     echo "$(date) !! scan exited non-zero — tailoring what landed anyway" >>"$LOG"
 fi
 bash tools/auto_tailor.sh || echo "$(date) !! auto_tailor failed" >>"$LOG"
+# Other workspaces (owner 2026-09-23): every config.<name>.yaml gets its own tailoring pass AFTER
+# the owner's — sequential on purpose (one Max subscription, never 8 claude sessions at once).
+# Scanning stays shared: one jobs.db for everyone.
+for WSCFG in config.*.yaml; do
+    [ -f "$WSCFG" ] || continue
+    WSNAME="${WSCFG#config.}"; WSNAME="${WSNAME%.yaml}"
+    case "$WSNAME" in example|*.bak*|yaml) continue ;; esac
+    echo "$(date) auto_tailor for workspace $WSNAME" >>"$LOG"
+    JOBSCAN_CONFIG="$WSCFG" JOBSCAN_WS="$WSNAME" bash tools/auto_tailor.sh \
+        || echo "$(date) !! auto_tailor($WSNAME) failed" >>"$LOG"
+done
 echo "===== $(date) daily scan done =====" >>"$LOG"
+# 鸭先知每日快照（2026-09-09）：把当天的主题份额/挂龄/新词落成 JSON，攒趋势历史。
+# 纯本地统计几秒钟，失败不拦路。
+.venv/bin/python -m app.trends --snapshot >>"$LOG" 2>&1 || echo "$(date) !! trends snapshot failed" >>"$LOG"
+
+# 每周日死链大扫除（owner 2026-09-16 拍板：并进扫描任务，不另立 launchd 单元）。
+# 跟在当天扫描后面跑是刻意的——prune_delisted 的判据就是「今天扫完还在不在」，此刻最新鲜。
+# 两步都只删「确定死了」的岗位（板子上消失≥2天 / 链接明确 404 或写着已关闭），删前全量
+# 备份到 data/purged_*_backup.json；拿不准的（机器人墙/登录墙）一律不动。放在最后是因为
+# 逐条点链接要一两个小时，别挡住上面几步的产出。hb_run 打卡名 deadlinks，/health 有灯。
+if [ "$(date +%u)" = "7" ]; then
+    echo "$(date) weekly dead-link sweep start" >>"$LOG"
+    bash tools/hb_run.sh deadlinks 192 10800 -- bash -c \
+        '.venv/bin/python tools/prune_delisted.py --apply --min-lag-days 2 && .venv/bin/python tools/check_dead_links.py --apply --delay 2' \
+        >>"$LOG" 2>&1 || echo "$(date) !! weekly dead-link sweep failed" >>"$LOG"
+    echo "$(date) weekly dead-link sweep done" >>"$LOG"
+fi

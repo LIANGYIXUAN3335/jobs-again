@@ -232,7 +232,10 @@ def _files(cfg: dict) -> list[tuple[Path, str]]:
     central = {base / fname for fname in names.values()}
     out = [(base / fname, kind) for kind, fname in names.items() if (base / fname).exists()]
     for p in sorted(base.rglob("*.md")):
-        if p in central or "_archive" in p.parts or p.name == "README.md":
+        # 2026-09-24: _format-backups 是改排版前的安全副本（同 marker，扫了会把每场算两遍）；
+        # 标杆场 golden.md 只进跟读不进看板（user 拍板）。两个都跳过。
+        if (p in central or "_archive" in p.parts or "_format-backups" in p.parts
+                or "标杆场" in p.parts or p.name == "README.md"):
             continue
         try:
             # A real marker, not the words "atoms-source" in prose — _atoms-coverage-triage.md
