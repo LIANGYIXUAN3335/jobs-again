@@ -92,8 +92,10 @@ def find_pdf(cfg: dict, company: str | None, title: str | None, job_id: str,
     if not company:
         return None
     d = cfgmod.resolve_path(cfg["output_dirs"]["resumes"])
-    prefix = tailoring.friendly_pdf_prefix(company, title or "", job_id)
-    hits = [d / n for n in names if n.startswith(prefix)]
+    # every configured apply-profile name, not just the default — a role switched to the
+    # 法名 identity renders as "Alex Example - …" and must still be found here
+    prefixes = tailoring._pdf_prefixes_all_names(cfg, company, title or "", job_id)
+    hits = [d / n for n in names if any(n.startswith(p) for p in prefixes)]
     hits = [p for p in hits if _file_ok(p)]
     if hits:
         return str(max(hits, key=lambda p: p.stat().st_mtime))

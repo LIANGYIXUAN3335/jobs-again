@@ -518,3 +518,68 @@ def score_resume(jd_text: str, merged: dict, cfg: dict, base_text: str | None = 
         matched_soft=matched_soft, missing_soft=missing_soft,
         coverable=coverable, true_gaps=true_gaps, family=fam,
     )
+
+
+# ── JD hard-skill sets, cached by jd_hash (owner 2026-09-23, for the per-workspace fit rank) ──
+# _present() over one JD costs ~6 ms; the review view walks ~8000 rows, so without a cache the
+# first page load would take a minute. The set depends only on the JD text, never on the
+# candidate, so one file serves every workspace: data/jd_hard_skills_cache.json.
+import json as _json
+from pathlib import Path as _Path
+from . import config as _cfgmod
+
+_JD_CACHE_REL = "data/jd_hard_skills_cache.json"
+_jd_cache: dict[str, list[str]] | None = None
+_jd_cache_dirty = 0
+
+
+def _load_jd_cache() -> dict[str, list[str]]:
+    global _jd_cache
+    if _jd_cache is None:
+        p = _cfgmod.resolve_path(_JD_CACHE_REL)
+        try:
+            _jd_cache = _json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+        except Exception:      # noqa: BLE001 — a corrupt cache is just recomputed
+            _jd_cache = {}
+    return _jd_cache
+
+
+def save_jd_cache() -> None:
+    global _jd_cache_dirty
+    if _jd_cache is None or not _jd_cache_dirty:
+        return
+    p = _cfgmod.resolve_path(_JD_CACHE_REL)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(_json.dumps(_jd_cache), encoding="utf-8")
+    tmp.replace(p)
+    _jd_cache_dirty = 0
+
+
+def jd_hard_skills(jd_hash: str | None, jd_text: str | None) -> set[str]:
+    """Hard-skill canon terms the JD names (cached by jd_hash). Empty set for an empty JD."""
+    global _jd_cache_dirty
+    if not jd_text:
+        return set()
+    cache = _load_jd_cache()
+    key = jd_hash or str(hash(jd_text))
+    hit = cache.get(key)
+    if hit is None:
+        hit = sorted(_present(jd_text, _HARD_SKILLS))
+        cache[key] = hit
+        _jd_cache_dirty += 1
+        if _jd_cache_dirty >= 200:
+            save_jd_cache()
+    return set(hit)
+
+
+def base_hard_skills(base_text: str) -> set[str]:
+    return _present(base_text or "", _HARD_SKILLS)
+
+
+def fit_coverage(jd_hard: set[str], base_hard: set[str]) -> float | None:
+    """Share of the JD's hard skills the candidate's base already names; None when the JD names
+    fewer than 3 (too little evidence to rank on)."""
+    if len(jd_hard) < 3:
+        return None
+    return len(jd_hard & base_hard) / len(jd_hard)

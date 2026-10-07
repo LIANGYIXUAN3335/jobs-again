@@ -24,7 +24,16 @@
     // Display the clean short form, but point the hyperlink at the canonical www + trailing-slash
     // URL — the bare/no-slash form gets rejected as "invalid" by some validators. Assumes
     // contact.linkedin is stored as "linkedin.com/in/<handle>" (no scheme/www/slash).
-    #c.phone #h(5pt) · #h(5pt) #link("mailto:" + c.email)[#c.email] #h(5pt) · #h(5pt) #c.location #h(5pt) · #h(5pt) #link("https://www." + c.linkedin + "/")[#c.linkedin]
+    // github is optional (owner 2026-09-23: a candidate whose projects live on GitHub keeps the
+    // link). With two profile links the line no longer fits, so the links move to a second
+    // centered line instead of wrapping mid-URL.
+    #let gh = c.at("github", default: "")
+    #if gh != none and gh != "" [
+      #c.phone #h(5pt) · #h(5pt) #link("mailto:" + c.email)[#c.email] #h(5pt) · #h(5pt) #c.location \
+      #link("https://www." + c.linkedin + "/")[#c.linkedin] #h(5pt) · #h(5pt) #link("https://" + gh)[#gh]
+    ] else [
+      #c.phone #h(5pt) · #h(5pt) #link("mailto:" + c.email)[#c.email] #h(5pt) · #h(5pt) #c.location #h(5pt) · #h(5pt) #link("https://www." + c.linkedin + "/")[#c.linkedin]
+    ]
   ]
 ]
 #v(3pt)
@@ -68,6 +77,23 @@
   #set list(marker: text(fill: navy)[•], indent: 2pt, body-indent: 6pt, spacing: 3.5pt)
   #list(..job.bullets.map(b => [#b]))
   #v(5pt)                      // gap between experience entries (≈ font-size 5)
+]
+
+// --- projects (optional; only when merge() put them in — base `render_projects: true`) ---
+// Each: name + link, stack in italics, 1-3 bullets. GitHub links stay: they are the evidence.
+#let projects = data.at("projects", default: ())
+#if projects.len() > 0 [
+  #section("Projects")
+  #for pr in projects [
+    #grid(columns: (1fr, auto),
+      [#text(weight: "bold")[#pr.name] #if pr.at("link", default: "") != "" [ #h(5pt) #text(size: 9pt)[#link(pr.link)[#pr.at("link_label", default: pr.link)]] ]],
+      text(weight: "bold")[#pr.at("year", default: "")])
+    #if pr.at("stack", default: "") != "" [ #v(2pt) #text(style: "italic", size: 9.5pt)[#pr.stack] ]
+    #v(4pt)
+    #set list(marker: text(fill: navy)[•], indent: 2pt, body-indent: 6pt, spacing: 3.5pt)
+    #list(..pr.bullets.map(b => [#b]))
+    #v(5pt)
+  ]
 ]
 
 // --- education (last, by design) ---
