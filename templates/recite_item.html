@@ -18,9 +18,16 @@ a{color:var(--accent)}
 .top .nav a{font-size:12.5px;text-decoration:none;border:1px solid var(--line);background:#fff;
      border-radius:7px;padding:3px 9px;margin-left:5px;white-space:nowrap}
 .q{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px}
+.q .lab{font-size:12px;color:var(--dim);font-weight:600;margin-bottom:2px;text-transform:uppercase}
 .q .qt{font-size:16px;font-weight:600}
 .q .qz{color:var(--dim);font-size:13.5px;margin-top:3px}
 .q .hint{color:var(--warn);font-size:13px;margin-top:5px}
+.fups{margin-top:11px;border-top:1px dashed var(--line);padding-top:9px}
+.fups .intro{font-size:12.5px;color:var(--dim);margin-bottom:6px}
+.fup{display:grid;grid-template-columns:94px 1fr;gap:8px;padding:7px 0;border-top:1px solid #f3f4f6}
+.fup:first-of-type{border-top:0}
+.fup b{color:var(--accent);font-size:12.5px;white-space:nowrap}
+.fup span{font-size:13.5px;min-width:0}
 .cols{display:grid;grid-template-columns:1.25fr 1fr;gap:16px;align-items:start}
 @media (max-width:900px){.cols{grid-template-columns:1fr}}
 .panel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:13px 15px;margin-bottom:12px}
@@ -71,6 +78,19 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .tr{font-size:13.5px;white-space:pre-wrap;background:#f7f8f9;border-radius:8px;padding:10px}
 .crit{font-size:13.5px;background:#f7f8f9;border-radius:8px;padding:10px;white-space:pre-wrap}
 .small{font-size:12.5px;color:var(--dim)}
+.refbadge{background:#eef2ff;border:1px solid #c7d2fe;color:#3730a3;border-radius:7px;
+     padding:2px 9px;font-size:12.5px;white-space:nowrap}
+.dlg{max-height:440px;overflow-y:auto;border-top:1px dashed var(--line);padding-top:8px}
+.dturn{display:flex;gap:9px;padding:5px 6px;border-radius:8px;cursor:pointer;font-size:13.5px}
+.dturn:hover{background:#f3f4f6}
+.dturn .ts{color:var(--dim);font-size:12px;font-variant-numeric:tabular-nums;
+     white-space:nowrap;padding-top:2px;min-width:38px}
+.dturn .who{font-weight:600;white-space:nowrap;padding-top:0}
+.dturn.iv{background:#f0f7f6}
+.dturn.iv:hover{background:#e2efed}
+.dturn.iv .who{color:var(--accent)}
+.dturn.me .who{color:var(--dim);font-weight:400}
+.dturn .tx{flex:1;min-width:0}
 .hide{display:none !important}
 textarea{width:100%;min-height:52px;font:inherit;padding:8px;border:1px solid var(--line);border-radius:8px}
 </style>
@@ -81,6 +101,9 @@ textarea{width:100%;min-height:52px;font:inherit;padding:8px;border:1px solid va
 <div class="top">
   <a class="back" href="/recite">← 总库</a>
   <h1>{{ it.interview or it.company }}{% if sib_pos[1] %} · 第 {{ sib_pos[0] }}/{{ sib_pos[1] }} 条{% endif %}</h1>
+  {% if it.source == 'reference' %}
+  <span class="refbadge">🎧 他人实录{% if it.speaker_name %}·{{ it.speaker_name }}{% endif %} — 参考件，听打法用</span>
+  {% endif %}
   <div class="meta">目标 {{ variant.sec }}s · box {{ st.box or 1 }} · 录过 {{ n_recorded }} 次</div>
   <div class="nav">
     {% if prev_item %}<a href="/recite/{{ prev_item.item_id }}" title="{{ prev_item.question }}">← 上一条</a>{% endif %}
@@ -89,10 +112,27 @@ textarea{width:100%;min-height:52px;font:inherit;padding:8px;border:1px solid va
 </div>
 
 <div class="q">
+  <div class="lab">Main question</div>
   <div class="qt">{{ variant.q or it.question }}</div>
   {% if it.question_zh %}<div class="qz">{{ it.question_zh }}</div>{% endif %}
   {% if variant.type != 'original' %}
     <div class="hint">🔀 今天这条也可以换个说法练 —— {{ variant.type }}：{{ variant.hint }}</div>
+  {% endif %}
+  {% if it.dialog_followups %}
+    <div class="fups">
+      <div class="intro">这不是新题，是同一段对话里接在这个问题下面的追问。</div>
+      {% for f in it.dialog_followups %}
+      <div class="fup">
+        <b>Follow-up {{ loop.index }}</b>
+        <span>{{ f.x }}</span>
+      </div>
+      {% endfor %}
+    </div>
+  {% elif it.followup_q %}
+    <div class="fups">
+      <div class="intro">这不是新题，是同一段对话里接在这个问题下面的追问。</div>
+      <div class="fup"><b>Follow-up 1</b><span>{{ it.followup_q }}</span></div>
+    </div>
   {% endif %}
 </div>
 
@@ -152,7 +192,7 @@ textarea{width:100%;min-height:52px;font:inherit;padding:8px;border:1px solid va
       <div style="font-size:13.5px;margin-top:6px">{{ it.orig_text }}</div>
     </details>
     {% endif %}
-    {% if it.followup_q %}
+    {% if it.followup_q and not (it.dialog and it.dialog.turns) %}
     <details>
       <summary>↪ 他接着追问的</summary>
       <div style="font-size:13.5px;margin-top:6px">{{ it.followup_q }}</div>
@@ -163,6 +203,34 @@ textarea{width:100%;min-height:52px;font:inherit;padding:8px;border:1px solid va
       <summary>❓ 他随时可能插的一句</summary>
       <div style="font-size:13.5px;margin-top:6px">{{ it.why_q }}</div>
     </details>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if it.dialog and it.dialog.turns %}
+  <div class="panel">
+    <h3>🎙 完整对话（提问 → 回答 → 追问全往返）
+      <span class="rt small">{{ (it.dialog.t1 - it.dialog.t0)//60 }}分{{ '%02d'|format((it.dialog.t1 - it.dialog.t0)%60) }}秒</span>
+    </h3>
+    {% if it.has_dialog %}
+    <div class="track">
+      <div class="lb">🎧 这一段的完整原声 —— 点下面任意一句直接跳播</div>
+      <audio id="a_dlg" controls preload="none" src="/recite/audio/{{ it.item_id }}/dialog"></audio>
+    </div>
+    {% endif %}
+    <div class="small" style="margin-bottom:6px">绿底 = 面试官。他在哪里插话、追问了什么，就是上一段哪里没讲清楚。</div>
+    <div class="dlg" id="dlgturns">
+      {% for t in it.dialog.turns %}
+      {% set off = (t.s - it.dialog.t0) if t.s > it.dialog.t0 else 0 %}
+      <div class="dturn {{ t.sp }}" data-s="{{ off }}" title="点击跳到 {{ off//60 }}:{{ '%02d'|format(off%60) }}">
+        <span class="ts">{{ off//60 }}:{{ '%02d'|format(off%60) }}</span>
+        <span class="who">{{ '面试官' if t.sp == 'iv' else ((it.speaker_name or '受访者') if it.source == 'reference' else '我') }}</span>
+        <span class="tx">{{ t.x }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% if it.dialog.truncated %}
+      <div class="small" style="margin-top:6px">✂️ 离下一题还很远，这里截断在回答结束后 5 分钟处（中间多是与本题无关的推进）。</div>
     {% endif %}
   </div>
   {% endif %}
@@ -266,5 +334,19 @@ textarea{width:100%;min-height:52px;font:inherit;padding:8px;border:1px solid va
 } | tojson }}
 </script>
 <script src="/static/recite.js"></script>
+<script>
+// 完整对话：点句跳播。放模板里不放 recite.js —— 只有这页有 #a_dlg。
+(function () {
+  var au = document.getElementById('a_dlg');
+  var box = document.getElementById('dlgturns');
+  if (!au || !box) return;
+  box.addEventListener('click', function (e) {
+    var row = e.target.closest('.dturn');
+    if (!row) return;
+    au.currentTime = parseInt(row.dataset.s || '0', 10);
+    au.play();
+  });
+})();
+</script>
 </body>
 </html>

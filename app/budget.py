@@ -103,6 +103,13 @@ def stock_status(rows: list[dict], cfg: dict, today: str | None = None) -> dict[
     to keep the old lifetime behaviour.
     """
     b = _cfg(cfg).get("stock") or {}
+    # Owner 2026-09-22: `enabled: false` switches the cap OFF. After the 9/3–9/16 application
+    # burst it had retired 62 companies and hidden 484 candidate roles, and none of those
+    # companies had actually refused an application — the ones that do go in `cooldowns`.
+    # An empty map is what every consumer already reads as "nobody is capped"; pace and
+    # blocked are separate knobs and keep working.
+    if not b.get("enabled", True):
+        return {}
     default = int(b.get("default", 8))
     overrides = {k.lower(): int(v) for k, v in (b.get("overrides") or {}).items()}
     counts_as = set(b.get("counts") or ["applied", "interviewing", "rejected"])

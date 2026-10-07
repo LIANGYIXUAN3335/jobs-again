@@ -355,3 +355,165 @@ def test_twins_link_across_divergent_title_norms(cfg):
     store.upsert_roles(jobs, [a, b])
     view = store.connect_view(cfg)
     assert store.find_twin(view, "li:5") == "ab:atticus:y"
+
+
+# ── 手动 cooldown（owner 2026-09-22）──────────────────────────────────────────────────────
+# "这家不让投了" from the review page: same effect as a config.yaml `cooldowns:` entry
+# (scanner skips, review hides) without editing YAML; expires by itself.
+
+def test_manual_cooldown_hides_the_company_and_expires_by_itself(cfg):
+    cfg = {**cfg, "application_budget": {"enabled": False}, "cooldowns": {}}
+    jobs = store.connect_jobs(cfg)
+    store.upsert_roles(jobs, [role_row("gh:x:1", company="X"), role_row("gh:y:1", company="Y")])
+    view = store.connect_view(cfg)
+    row = store.set_company_cooldown(view, "X", days=30, reason="Ashby 5/180")
+    assert row["source"] == "manual" and row["company_norm"] == "x"
+    d = store.fetch_view(view, cfg, status="new")
+    assert {r["company"] for r in d["rows"]} == {"Y"}
+    assert d["cooldowns"]["x"]["reason"] == "Ashby 5/180"
+    allv = {r["job_id"]: r for r in store.fetch_view(view, cfg, status="all")["rows"]}
+    assert allv["gh:x:1"]["cooldown"]["source"] == "manual" and not allv["gh:x:1"]["in_review"]
+    # expired rows stop applying on their own — no cleanup job needed
+    view.execute("UPDATE company_cooldowns SET until='2020-01-01'")
+    view.commit()
+    assert {r["company"] for r in store.fetch_view(view, cfg, status="new")["rows"]} == {"X", "Y"}
+    # clearing removes the row; clearing again reports nothing to clear
+    store.set_company_cooldown(view, "X", days=7)
+    assert store.clear_company_cooldown(view, "x") is True
+    assert store.clear_company_cooldown(view, "X") is False
+    assert {r["company"] for r in store.fetch_view(view, cfg, status="new")["rows"]} == {"X", "Y"}
+
+
+def test_manual_and_config_cooldowns_merge_with_the_later_date_winning(cfg):
+    view = store.connect_view(cfg)
+    today = store.la_today()
+    cfg = {**cfg, "companies": [{"name": "Plaid Inc", "ats": "ashby", "slug": "plaid"}],
+           "cooldowns": {"Plaid Inc": {"until": "2099-01-01", "reason": "config"}}}
+    store.set_company_cooldown(view, "plaid inc", days=10, reason="manual, earlier")
+    merged = store.active_cooldowns(view, cfg, today)
+    assert merged["plaidinc"]["source"] == "config" and merged["plaidinc"]["company"] == "Plaid Inc"
+    store.set_company_cooldown(view, "Plaid Inc", until="2099-06-01", reason="manual, later")
+    merged = store.active_cooldowns(view, cfg, today)
+    assert merged["plaidinc"]["source"] == "manual" and merged["plaidinc"]["until"] == "2099-06-01"
+    # validation: garbage, past, out-of-range
+    import pytest
+    for bad in ({"until": "not-a-date"}, {"until": "2000-01-01"}, {"days": 0}, {"days": 999}):
+        with pytest.raises(ValueError):
+            store.set_company_cooldown(view, "Z", **bad)
+    with pytest.raises(ValueError):
+        store.set_company_cooldown(view, "   ", days=30)
+
+
+def test_scanner_reads_manual_cooldowns_read_only_and_never_creates_the_user_db(cfg, tmp_path):
+    cfg = {**cfg, "cooldowns": {"Cfgco": {"until": "2099-01-01", "reason": "cfg"}}}
+    # no user DB yet → config only, and the file must NOT appear (the scanner is not a writer)
+    ro = store.active_cooldowns_readonly(cfg)
+    assert set(ro) == {"cfgco"} and not Path(cfg["user_db_path"]).exists()
+    view = store.connect_view(cfg)
+    store.set_company_cooldown(view, "Manualco", days=30, reason="board refused")
+    ro = store.active_cooldowns_readonly(cfg)
+    assert ro["manualco"]["source"] == "manual" and ro["manualco"]["reason"] == "board refused"
+    assert ro["cfgco"]["source"] == "config"
+    # an old user DB without the table → config only, no exception
+    old = tmp_path / "old_user.db"
+    import sqlite3
+    sqlite3.connect(old).execute("CREATE TABLE role_state (job_id TEXT)").connection.commit()
+    ro = store.active_cooldowns_readonly({**cfg, "user_db_path": str(old)})
+    assert set(ro) == {"cfgco"}
+
+
+def test_location_pref_reorders_the_queue_and_powers_the_bay_filter(cfg):
+    """优先远程或湾区 (owner 2026-09-22): a Bay Area / remote role outranks a slightly higher-
+    scored Austin role; weighted_score is untouched; the 'bay' filter keeps remote + Bay Area."""
+    cfg = {**cfg, "application_budget": {"enabled": False},
+           "scoring": {**cfg["scoring"], "location_pref": {"enabled": True, "bonus": 8},
+                       "freshness": {"enabled": False}, "diversify": {"enabled": False}}}
+    jobs = store.connect_jobs(cfg)
+    a = role_row("gh:a:1", company="A", score=72.0); a["location"] = "Austin, TX"; a["is_remote"] = 0
+    b = role_row("gh:b:1", company="B", score=70.0); b["location"] = "Palo Alto, CA"; b["is_remote"] = 0
+    c = role_row("gh:c:1", company="C", score=69.0); c["location"] = "New York, NY"; c["is_remote"] = 1
+    store.upsert_roles(jobs, [a, b, c])
+    view = store.connect_view(cfg)
+    d = store.fetch_view(view, cfg, status="new", sort="score")
+    by = {r["job_id"]: r for r in d["rows"]}
+    assert by["gh:b:1"]["rank_score"] == 78.0 and by["gh:b:1"]["weighted_score"] == 70.0
+    assert by["gh:c:1"]["loc_pref"] == {"kind": "remote", "bonus": 8.0}
+    assert by["gh:a:1"]["loc_pref"] == {"kind": None, "bonus": 0.0}
+    assert [r["job_id"] for r in d["rows"]][0] == "gh:b:1"       # 78 > 77 > 72
+    bay = store.fetch_view(view, cfg, status="new", remote="bay")
+    assert {r["job_id"] for r in bay["rows"]} == {"gh:b:1", "gh:c:1"}
+    only_remote = store.fetch_view(view, cfg, status="new", remote="remote")
+    assert {r["job_id"] for r in only_remote["rows"]} == {"gh:c:1"}
+
+
+def test_workspace_eligibility_hides_no_sponsorship_jds_and_outside_area_roles(cfg):
+    """Second workspace (owner 2026-09-23): a candidate who needs sponsorship never sees a JD that
+    says 'we do not sponsor'; with location_pref.review_only the review tab shows only remote and
+    Bay Area roles. Both are view-time rules — the shared jobs.db keeps one score per role."""
+    cfg = {**cfg, "application_budget": {"enabled": False},
+           "profile": {**cfg["profile"], "needs_sponsorship": True},
+           "scoring": {**cfg["scoring"], "location_pref": {"enabled": True, "bonus": 8, "review_only": True},
+                       "freshness": {"enabled": False}, "diversify": {"enabled": False}}}
+    jobs = store.connect_jobs(cfg)
+    a = role_row("gh:a:1", company="A"); a.update(location="Palo Alto, CA", is_remote=0, jd_text="Great team. We are unable to sponsor visas for this role.")
+    b = role_row("gh:b:1", company="B"); b.update(location="Palo Alto, CA", is_remote=0, jd_text="We sponsor H-1B visas.")
+    c = role_row("gh:c:1", company="C"); c.update(location="Austin, TX", is_remote=0, jd_text="Anything.")
+    d = role_row("gh:d:1", company="D"); d.update(location="Remote - US", is_remote=1, jd_text="Anything.")
+    store.upsert_roles(jobs, [a, b, c, d])
+    view = store.connect_view(cfg)
+    shown = {r["job_id"] for r in store.fetch_view(view, cfg, status="new")["rows"]}
+    assert shown == {"gh:b:1", "gh:d:1"}
+    allv = {r["job_id"]: r for r in store.fetch_view(view, cfg, status="all")["rows"]}
+    assert allv["gh:a:1"]["no_sponsor"] and allv["gh:c:1"]["loc_excluded"] and not allv["gh:b:1"]["no_sponsor"]
+    # the owner's config (no sponsorship needed, no review_only) shows all four
+    plain = {**cfg, "profile": {**cfg["profile"], "needs_sponsorship": False},
+             "scoring": {**cfg["scoring"], "location_pref": {"enabled": True, "bonus": 8}}}
+    assert len(store.fetch_view(view, plain, status="new")["rows"]) == 4
+
+
+def test_config_extends_merges_dicts_and_replaces_lists(tmp_path):
+    from app import config as cfgmod
+    import yaml
+    parent = tmp_path / "parent.yaml"; child = tmp_path / "child.yaml"
+    parent.write_text(yaml.safe_dump({"a": {"x": 1, "y": 2}, "l": [1, 2], "keep": "p"}), encoding="utf-8")
+    child.write_text(yaml.safe_dump({"extends": str(parent), "a": {"y": 20, "z": 3}, "l": [9]}), encoding="utf-8")
+    c = cfgmod.load_config(child)
+    # a derived config carries the parent path under EXTENDS_KEY (mailcode uses it to keep the
+    # owner's shared app password out of another candidate's workspace); the merge itself is exact
+    assert c.pop(cfgmod.EXTENDS_KEY) == str(parent)
+    assert c == {"a": {"x": 1, "y": 20, "z": 3}, "l": [9], "keep": "p"}
+    assert cfgmod.EXTENDS_KEY not in cfgmod.load_config(parent)
+    assert cfgmod.workspace_name({"workspace": {"name": "Taylor"}}) == "Taylor" and cfgmod.workspace_name({}) == ""
+
+
+def test_fit_pref_ranks_by_base_coverage_and_hides_poor_fits(cfg, tmp_path, monkeypatch):
+    """Per-workspace fit rank (owner 2026-09-23): the shared jobs.db scores roles with the owner's
+    weights, so a second candidate re-ranks by how many of the JD's hard skills HIS base names;
+    under review_min the role leaves review (still under 'all'). JDs naming <3 skills are neutral."""
+    import yaml
+    from app import resume_score as rs
+    monkeypatch.setattr(rs, "_JD_CACHE_REL", str(tmp_path / "jdcache.json"))
+    monkeypatch.setattr(rs, "_jd_cache", None)
+    base = {"name": "T", "contact": {"email": "t@x"}, "education": [], "skills_master": {"L": ["Java", "Spring Boot", "MySQL", "Kafka"]},
+            "experience": [{"company": "A", "title": "SWE", "location": "x", "dates": "2020", "bullets_master": ["Built Java Spring Boot services on MySQL with Kafka."]}]}
+    bp = tmp_path / "base.yaml"; bp.write_text(yaml.safe_dump(base), encoding="utf-8")
+    cfg = {**cfg, "resume_base": str(bp), "application_budget": {"enabled": False},
+           "scoring": {**cfg["scoring"], "fit_pref": {"enabled": True, "bonus": 15, "review_min": 0.30},
+                       "freshness": {"enabled": False}, "diversify": {"enabled": False}}}
+    jobs = store.connect_jobs(cfg)
+    # distinct jd_hash per role: the cache is keyed by it (role_row's default "h" would collide)
+    good = role_row("gh:g:1", company="Good", score=70.0); good.update(jd_text="We need Java, Spring Boot, MySQL and Kafka experience.", jd_hash="hg", is_remote=0, location="Austin, TX")
+    poor = role_row("gh:p:1", company="Poor", score=72.0); poor.update(jd_text="Go, Kubernetes, Terraform, Prometheus, GCP and Rust required.", jd_hash="hp", is_remote=0, location="Austin, TX")
+    thin = role_row("gh:t:1", company="Thin", score=71.0); thin.update(jd_text="Nice people. Python.", jd_hash="ht", is_remote=0, location="Austin, TX")
+    store.upsert_roles(jobs, [good, poor, thin])
+    view = store.connect_view(cfg)
+    d = store.fetch_view(view, cfg, status="new", sort="score")
+    ids = [r["job_id"] for r in d["rows"]]
+    assert "gh:p:1" not in ids and ids[0] == "gh:g:1"                      # poor fit hidden, good fit leads
+    by = {r["job_id"]: r for r in store.fetch_view(view, cfg, status="all")["rows"]}
+    assert by["gh:g:1"]["fit"]["coverage"] == 1.0 and by["gh:g:1"]["rank_score"] == 85.0
+    assert by["gh:p:1"]["fit_excluded"] and by["gh:p:1"]["fit"]["coverage"] == 0.0
+    assert by["gh:t:1"]["fit"] is None and not by["gh:t:1"]["fit_excluded"]   # <3 skills → neutral
+    assert (tmp_path / "jdcache.json").exists()                                # cache persisted
+    off = {**cfg, "scoring": {**cfg["scoring"], "fit_pref": {"enabled": False}}}
+    assert len(store.fetch_view(view, off, status="new")["rows"]) == 3

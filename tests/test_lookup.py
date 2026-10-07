@@ -300,3 +300,65 @@ def test_pins_endpoint_returns_every_live_pin(cfg, monkeypatch):
     # the frame that claimed Precisely releases only Precisely
     assert client.delete("/api/pin", params={"job_id": "li:4437046992"}).status_code == 200
     assert [p["company"] for p in client.get("/api/pins").json()["pins"]] == ["Temporal"]
+
+
+def test_cooldown_endpoints_round_trip(cfg, monkeypatch):
+    """「这家不让投了」(owner 2026-09-22): POST hides the company from review at once, GET lists
+    config + manual merged, DELETE clears a manual one, refuses a config one (409) and 404s
+    on nothing. Against the throwaway DBs — app.web binds `cfg` at import time."""
+    from fastapi.testclient import TestClient
+    from app import web as webmod
+
+    cfg = {**cfg, "application_budget": {"enabled": False},
+           "cooldowns": {"Cfgco": {"until": "2099-01-01", "reason": "in yaml"}}}
+    monkeypatch.setattr(webmod, "cfg", cfg)
+    jobs = store.connect_jobs(cfg)
+    store.upsert_roles(jobs, [role_row("gh:a:1", company="Acme"), role_row("gh:a:2", company="Acme"),
+                              role_row("gh:b:1", company="Bravo")])
+    client = TestClient(webmod.app)
+
+    r = client.post("/api/companies/cooldown", json={"company": "Acme", "days": 60, "reason": "one at a time"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["source"] == "manual" and body["hidden_roles"] == 2 and body["reason"] == "one at a time"
+    rows = client.get("/api/companies/cooldowns").json()["rows"]
+    assert [(x["company"], x["source"]) for x in rows] == [("Acme", "manual"), ("Cfgco", "config")]
+
+    view = store.connect_view(cfg)
+    assert {x["company"] for x in store.fetch_view(view, cfg, status="new")["rows"]} == {"Bravo"}
+
+    assert client.post("/api/companies/cooldown", json={"company": "Acme", "days": 0}).status_code == 422
+    assert client.post("/api/companies/cooldown", json={"company": "Acme", "until": "garbage"}).status_code == 422
+    assert client.delete("/api/companies/cooldown/Cfgco").status_code == 409     # lives in config.yaml
+    assert client.delete("/api/companies/cooldown/Acme").status_code == 200
+    assert client.delete("/api/companies/cooldown/Acme").status_code == 404
+    assert {x["company"] for x in store.fetch_view(view, cfg, status="new")["rows"]} == {"Acme", "Bravo"}
+
+
+def test_cooldown_from_the_panel_skips_the_role_and_shows_in_lookup(cfg, monkeypatch):
+    """Owner 2026-09-25: the application page is where she learns a company won't take more
+    applications, so the panel sets the cooldown itself. It may also mark THIS role skip
+    (never an applied one), and the lookup payload reports the active cooldown so the panel
+    shows it first the next time any posting of that company opens."""
+    from fastapi.testclient import TestClient
+    from app import web as webmod
+
+    cfg = {**cfg, "application_budget": {"enabled": False}, "cooldowns": {}}
+    monkeypatch.setattr(webmod, "cfg", cfg)
+    jobs = store.connect_jobs(cfg)
+    a = role_row("gh:acme:1", company="Acme"); a["apply_url"] = "https://job-boards.greenhouse.io/acme/jobs/1"
+    b = role_row("gh:acme:2", company="Acme"); b["apply_url"] = "https://job-boards.greenhouse.io/acme/jobs/2"
+    store.upsert_roles(jobs, [a, b])
+    view = store.connect_view(cfg)
+    store.set_status(view, "gh:acme:2", "applied", "base")
+    client = TestClient(webmod.app)
+
+    assert client.get("/api/lookup", params={"url": a["apply_url"]}).json()["cooldown"] is None
+    r = client.post("/api/companies/cooldown", json={"company": "Acme", "days": 90, "reason": "limit", "skip_job_id": "gh:acme:1"}).json()
+    assert r["ok"] and r["skipped_role"] is True
+    assert store.get_role(view, "gh:acme:1")["status"] == "skip"
+    cd = client.get("/api/lookup", params={"url": b["apply_url"]}).json()["cooldown"]
+    assert cd["until"] == r["until"] and cd["source"] == "manual" and 88 <= cd["days_left"] <= 90 and cd["reason"] == "limit"
+    # an applied role is never flipped to skip by the panel's cooldown
+    r2 = client.post("/api/companies/cooldown", json={"company": "Acme", "days": 30, "skip_job_id": "gh:acme:2"}).json()
+    assert r2["skipped_role"] is False and store.get_role(view, "gh:acme:2")["status"] == "applied"

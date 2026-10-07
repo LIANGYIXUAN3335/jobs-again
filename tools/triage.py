@@ -6,6 +6,7 @@ Read-only on the mailbox except starring; sends only through the armed/undo-wind
 """
 import subprocess
 import sys
+import imaplib
 
 sys.path.insert(0, ".")
 from app import config as cfgmod, heartbeats, inbox, store  # noqa: E402
@@ -37,7 +38,11 @@ def main():
     sent = inbox.send_due(cfg)                      # send anything past its undo window first
     for s in sent:
         print(f"auto-sent → {s['to']}: {s['subject']}")
-    summary = inbox.triage(cfg)
+    try:
+        summary = inbox.triage(cfg)
+    except (imaplib.IMAP4.abort, OSError, TimeoutError) as e:
+        print(f"triage skipped: mailbox temporarily unavailable: {e}")
+        return
     print(f"triage: {summary}")
 
     conn = store.connect_user(cfg)

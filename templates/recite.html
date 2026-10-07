@@ -124,6 +124,7 @@ code{background:#f1f3f5;padding:1px 5px;border-radius:4px;font-size:12.5px}
           {% if d.target_sec %}<span class="tag">{{ d.target_sec }}s</span>{% endif %}
           {% if d.has_orig %}<span class="tag v">🎧 原声</span>{% else %}<span class="tag">无原声</span>{% endif %}
           {% if not d.has_script %}<span class="tag w">无念稿 · 听+看点评</span>{% endif %}
+          {% if d.followup_count %}<span class="tag v">追问 {{ d.followup_count }}</span>{% endif %}
           {% if d.item_id in queue_ids %}<span class="tag n">今日</span>{% endif %}
           {% if d.item_id in dupes %}<span class="tag w" title="和另一条共用同一个项目">🟡 撞车</span>{% endif %}
           {% if d.quality == 'rough' or d.deferred %}<span class="tag w">稿要改</span>{% endif %}

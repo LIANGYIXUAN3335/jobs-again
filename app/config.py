@@ -1,6 +1,7 @@
 """Config + company-notes loading. All relative paths resolve against the repo root."""
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -8,13 +9,64 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# Which config a process runs under. Every entry point calls load_config() with no argument,
+# so a second WORKSPACE (a second candidate: own user_state.db, own résumé base, own profile,
+# same scanned jobs.db) is just `JOBSCAN_CONFIG=config.<name>.yaml` in that process's
+# environment — the launchd plist for its web server / tailoring job sets it. Owner 2026-09-23.
+ENV_CONFIG = "JOBSCAN_CONFIG"
 
-def load_config(path: str | Path = "config.yaml") -> dict:
-    p = Path(path)
+
+REPLACE_MARK = "__replace__"
+# Set on a loaded config that came through `extends:` (value = the parent path). Lets code tell
+# a DERIVED workspace from the owner's base config: secrets.yaml is one shared file whose
+# `gmail_app_password` is the owner's, and mailcode._cfg must not pair it with another
+# candidate's address just because mailcode.* was inherited dict-by-dict.
+EXTENDS_KEY = "_extends"
+
+
+def _strip_marks(v):
+    if isinstance(v, dict):
+        return {k: _strip_marks(x) for k, x in v.items() if k != REPLACE_MARK}
+    return v
+
+
+def _deep_merge(base: dict, over: dict) -> dict:
+    """`over` wins; dicts merge recursively, lists and scalars are replaced whole.
+
+    A child dict carrying `__replace__: true` REPLACES the parent's dict instead of merging into
+    it. Needed for per-person maps that must not leak between workspaces: apply_profiles
+    (the owner's company→identity map put HER name on the second candidate's Nvidia résumés,
+    2026-09-23), cooldowns, blocked companies, mailcode extra accounts, the whole profile."""
+    out = dict(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and v.get(REPLACE_MARK):
+            out[k] = _strip_marks(v)
+        elif isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = _strip_marks(v)
+    return out
+
+
+def load_config(path: str | Path | None = None) -> dict:
+    """Load a config file. `extends: <path>` inherits another config (chains allowed): the
+    child's keys override the parent's, dict-by-dict, so a workspace config lists only what
+    differs — its DB, dirs, profile, résumé base — and keeps the shared companies/scoring."""
+    p = Path(path or os.environ.get(ENV_CONFIG) or "config.yaml")
     if not p.is_absolute():
         p = ROOT / p
     with open(p, encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
+    parent = cfg.pop("extends", None)
+    if parent:
+        cfg = _deep_merge(load_config(parent), cfg)
+        cfg[EXTENDS_KEY] = str(parent)
+    return cfg
+
+
+def workspace_name(cfg: dict) -> str:
+    """Display name of the candidate this config serves ('' for the owner's default)."""
+    return str((cfg.get("workspace") or {}).get("name") or "")
 
 
 def resolve_path(rel: str | Path) -> Path:

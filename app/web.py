@@ -2,16 +2,22 @@
 Usage: python -m app.web  →  http://127.0.0.1:8787"""
 from __future__ import annotations
 
+import datetime
 import json
+import os
 import re
 import sqlite3
+import subprocess
+import sys
+import threading
+import time
 import unicodedata
 from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -21,22 +27,47 @@ from . import company_board as boardmod
 from . import config as cfgmod
 from . import followup as followupmod
 from . import gcal as gcalmod
+from . import google_auth as gauthmod
 from . import heartbeats as hbmod
 from . import ideas as ideasmod
 from . import ingest as ingestmod
+from . import pace as pacemod
 from . import mail as sendmail
 from . import mailcode as mailmod
+from . import outreach as outreachmod
 from . import recite as recitemod
 from . import recite_asr
 from . import store, tailoring
+from .platform import router as platform_router
 
 cfg = cfgmod.load_config()
+# A workspace keeps its own autofill answer log (config `answers_log`); the owner's default
+# stays data/logs/answers.jsonl. answer_log has no cfg in hand, so the path is set here once.
+if cfg.get("answers_log"):
+    from . import answer_log as _alog
+    _alog.LOG_REL = cfg["answers_log"]
 app = FastAPI(title="JobScan")
 # The browser extension's service worker calls this local API. Server binds 127.0.0.1
 # only, so a permissive CORS policy here is not remotely reachable.
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
 )
+app.include_router(platform_router)
+
+
+@app.middleware("http")
+async def cloud_pilot_surface(request: Request, call_next):
+    """Cloud pilot exposes only the tenant control plane.
+
+    The legacy owner UI remains available locally, but its routes were designed for a trusted
+    loopback process and must never become an accidental public API on Cloud Run.
+    """
+    if os.environ.get("JOBSCAN_SAAS_ONLY") == "1":
+        path = request.url.path
+        allowed = path.startswith("/portal") or path.startswith("/static/") or path == "/api/platform/health"
+        if not allowed:
+            return RedirectResponse("/portal", status_code=307)
+    return await call_next(request)
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
 
@@ -159,7 +190,23 @@ def profile_experience(role: dict | None = None) -> list[dict]:
 app.mount("/static", StaticFiles(directory=str(cfgmod.ROOT / "static")), name="static")
 templates = Jinja2Templates(directory=str(cfgmod.ROOT / "templates"))
 
+
+def _asset_v() -> int:
+    """Cache-buster for /static assets: newest mtime of app.js/style.css. Chrome held a
+    long-lived tab's cached app.js across a deploy (2026-09-09: the 身份开关 rendered but its
+    click handler lived in the stale JS), so templates append ?v=<mtime> to every asset URL."""
+    d = cfgmod.ROOT / "static"
+    return int(max((d / f).stat().st_mtime for f in ("app.js", "style.css")))
+
+
+templates.env.globals["asset_v"] = _asset_v
+
 store.seed_applied_companies(cfg)  # one-way merge of config's applied_companies list
+
+_gcal_auth_lock = threading.Lock()
+_gcal_auth_proc: subprocess.Popen | None = None
+_gcal_auth_started = 0.0
+_gcal_auth_log = cfgmod.ROOT / "logs" / "gcal_auth_ui.log"
 
 
 _schema_ready: set[str] = set()   # user-DB paths whose schema + migrations have been applied
@@ -215,13 +262,23 @@ def index(
     seen: str = "all",
     remote: str = "",
     seniority: str = "",
+    tag: str = "",         # onsite / startup / onsite_or_startup — company flags from company_notes.yaml
+    tailored: str = "",    # '' all · 'ready' has a validated résumé PDF · 'none' needs one
+    ease: str = "",        # '' all · 'easy' one-page no-account boards · 'account' Workday/Avature wizards
+    # 投递身份「登录」：URL 显式给了就听 URL 的（?identity= 空串 = 明确要看全部）；
+    # 没给（None）就读 cookie —— 顶栏开关切一次全站生效、刷新不丢，像登录邮箱。
+    identity: str | None = None,
     # 'diversity' = keep select_daily's company interleave (each company's lead role first,
     # then everyone's #2, …). Default in the review tab because it is the order she works
     # top-down in; the other options re-sort those same rows.
     sort: str = "diversity",
     rot: str = "",
+    # 投递节奏（2026-09-28）：review 页默认只显示今天冻结的 N 家；?showall=1 = 这一次看全部
+    showall: str = "",
     conn=Depends(view_conn),
 ):
+    if identity is None:
+        identity = request.cookies.get("apply_identity", "")
     try:
         ms = float(min_score)
     except (TypeError, ValueError):
@@ -235,18 +292,25 @@ def index(
     data = store.fetch_view(
         conn, cfg, status=status, q=q, company=company, min_score=ms,
         verdict=verdict, seen=seen, remote=remote, seniority=seniority, sort=sort,
-        rot=rot_i,
+        rot=rot_i, tag=tag, identity=identity, tailored=tailored, ease=ease,
+        pace=not showall,
     )
+    if showall and status == "new":
+        # fetch_view skipped pace on purpose; the banner still needs the level so it can offer
+        # the way back to today's list
+        data["pace"] = {"pace": pacemod.effective(conn, cfg)}
     params = {
         "status": status, "q": q, "company": company, "min_score": min_score if ms else "",
         "verdict": verdict, "seen": seen, "remote": remote, "seniority": seniority,
-        "sort": sort, "rot": rot_i or "",
+        "tag": tag, "sort": sort, "rot": rot_i or "", "identity": identity,
+        "tailored": tailored, "ease": ease, "showall": "1" if showall else "",
     }
     return templates.TemplateResponse(request, "list.html", {
         **data,
         "params": params,
         "statuses": store.STATUSES,
         "resume_variants": resume_variants(),
+        "apply_profiles": cfg.get("apply_profiles") or {},
     })
 
 
@@ -271,10 +335,72 @@ class QueueIn(BaseModel):
 def api_set_status(job_id: str, body: StatusIn, conn=Depends(view_conn)):
     if body.status not in store.STATUSES:
         raise HTTPException(400, f"invalid status {body.status!r}")
-    if not store.get_role(conn, job_id):
+    role = store.get_role(conn, job_id)
+    if not role:
         raise HTTPException(404, "unknown job_id")
+    if body.status == "applied" and not role.get("apply_profile"):
+        # Freeze WHICH name card this application went out under (owner 2026-09-25). Until now
+        # the company-level 小号 map was only consulted while a role was still open — once it
+        # flipped to applied, effective_profile_key fell back to the default card and the record
+        # said "Casey" for applications that were filled as Alex. 672 applied rows carried no
+        # card at all. The effective card at the moment of applying is the historical truth.
+        store.upsert_state(conn, job_id, apply_profile=store.effective_profile_key(cfg, role))
     state = store.set_status(conn, job_id, body.status, body.resume_variant)
     return {"ok": True, "state": state}
+
+
+class IdentityIn(BaseModel):
+    identity: str
+
+
+@app.post("/api/identity")
+def api_set_identity(body: IdentityIn):
+    """全局身份开关（顶栏）：把当前投递身份写进 cookie，之后每个页面都按它过滤。
+    空串 = 退出登录、看全部。"""
+    profiles = (cfg.get("apply_profiles") or {}).get("profiles") or {}
+    if body.identity and body.identity not in profiles:
+        raise HTTPException(400, f"unknown identity {body.identity!r}")
+    resp = JSONResponse({"ok": True, "identity": body.identity})
+    if body.identity:
+        resp.set_cookie("apply_identity", body.identity, max_age=365 * 24 * 3600)
+    else:
+        resp.delete_cookie("apply_identity")
+    return resp
+
+
+class ApplyProfileIn(BaseModel):
+    profile: str
+
+
+@app.post("/api/roles/{job_id}/apply-profile")
+def api_set_apply_profile(job_id: str, body: ApplyProfileIn, conn=Depends(view_conn)):
+    """Switch which 投递身份 (name card) this role is applied with. If the résumé is already
+    tailored, re-ingest it on the spot: content untouched, but the PDF is re-rendered with
+    the new header name/email/phone and re-named accordingly (秒级, no LLM)."""
+    ap = cfg.get("apply_profiles") or {}
+    if body.profile not in (ap.get("profiles") or {}):
+        raise HTTPException(400, f"unknown apply profile {body.profile!r}")
+    role = store.get_role(conn, job_id)
+    if not role:
+        raise HTTPException(404, "unknown job_id")
+    # 已投出/流程中的岗位锁死：申请早已用当时的抬头发出，事后换身份只会让本地 PDF 和
+    # 真实提交对不上（发现于 2026-09-08：切换测试恰好撞上 owner 刚点 applied 的岗位）。
+    # 真要换：先把状态改回 new（显式动作，留下痕迹），再切。
+    if (role.get("status") or "new") in ("applied", "interviewing"):
+        raise HTTPException(409, f"role is {role['status']} — the application already went out "
+                            "under the old identity; set it back to 'new' first if you must")
+    state = store.upsert_state(conn, job_id, apply_profile=body.profile)
+    rerendered = False
+    ypath = tailoring.resume_yaml_path(cfg, role["company"], job_id)
+    if ypath.exists():
+        try:
+            tailoring.ingest_file(cfg, conn, ypath)
+            rerendered = True
+        except tailoring.TailorError as e:
+            # the identity switch is saved either way; a YAML that no longer validates
+            # will be regenerated by the daily autotailor and pick the new identity up then
+            return {"ok": True, "state": state, "rerendered": False, "note": str(e)}
+    return {"ok": True, "state": state, "rerendered": rerendered}
 
 
 @app.post("/api/roles/{job_id}/notes")
@@ -300,9 +426,12 @@ def api_queue_tailoring(job_id: str, body: QueueIn, conn=Depends(view_conn)):
     try:
         path = tailoring.write_prompt(cfg, conn, job_id, body.angle)
     except FileNotFoundError:
-        raise HTTPException(500, f"base résumé missing ({tailoring.BASE_PATH})")
-    return {"ok": True, "prompt_path": str(path),
-            "hint": "open this file in VS Code and run Claude Code, then click Ingest"}
+        raise HTTPException(500, f"base résumé missing ({tailoring.base_path(cfg)})")
+    run = _start_queued(conn, "✎ queue")
+    return {"ok": True, "prompt_path": str(path), **run,
+            "hint": ("生成已开始（后台 claude，约 2-3 分钟一份，完成自动入库）" if run.get("started")
+                     else "已排队；正在跑的批次结束后自动开始" if run.get("waiting")
+                     else "prompt written")}
 
 
 @app.post("/api/ingest")
@@ -310,6 +439,346 @@ def api_ingest(conn=Depends(view_conn)):
     seen: dict = {}
     n = ingestmod._scan_once(cfg, seen, force=True)
     return {"ok": True, "ingested": n}
+
+
+# ---------- one-click batch tailoring (owner 2026-09-23: 「不需要一个一个地去点」) ----------
+# Same engine as the nightly run — tools/auto_tailor.sh → 4 headless claude workers (Max
+# subscription, no API key) → ONE ingest pass — but the manifest is built HERE from the review
+# page's current filters, and the script is told to use it (env JOBSCAN_MANIFEST) instead of
+# running prep_autotailor.py. Lock / log / manifest are per workspace, same suffix rule as the
+# script, so two candidates' batches never collide.
+_AUTOTAILOR_LOGS = cfgmod.ROOT / "data" / "logs"   # module-level so tests can aim it at a tmp dir
+_AUTOTAILOR_DEFAULT_MANIFEST = "scratch_priors/autotailor_manifest.json"
+
+
+class _TailorBatchIn(BaseModel):
+    """Mirror of index()'s filter params: the button posts the page's query string as-is, so
+    the batch is exactly the rows she is looking at. Strings rather than numbers for the same
+    reason as index() — an empty <input type=number> submits ''."""
+    status: str = "new"
+    q: str = ""
+    company: str = ""
+    min_score: str = ""
+    verdict: str = ""
+    seen: str = "all"
+    remote: str = ""
+    seniority: str = ""
+    tag: str = ""
+    identity: str | None = None
+    tailored: str = ""
+    ease: str = ""
+    sort: str = "diversity"
+    rot: str = ""
+    showall: str = ""        # mirror of index(): '' = the pace-limited page, '1' = 看全部
+    dry_run: bool = False
+
+
+def _workspace_suffix() -> str:
+    """JOBSCAN_WS for this process: 'robin' under config.robin.yaml, '' for the owner.
+    Same rule as tools/daily_scan.sh, which derives it from the config FILENAME. The display
+    name (workspace.name: Taylor) is trusted only when config.<name>.yaml really exists — it
+    usually does not match the file stem — otherwise fall back to $JOBSCAN_CONFIG's name."""
+    name = cfgmod.workspace_name(cfg).lower()
+    if name and (cfgmod.ROOT / f"config.{name}.yaml").exists():
+        return name
+    m = re.fullmatch(r"config\.(.+)\.yaml", Path(os.environ.get(cfgmod.ENV_CONFIG) or "").name)
+    return m.group(1) if m else ""
+
+
+def _tailor_batch_paths() -> dict:
+    """Where a manual batch lives. The lock is THE SAME directory auto_tailor.sh takes, so a
+    manual batch and the nightly one can never run claude workers over the same YAMLs."""
+    ws = _workspace_suffix()
+    sfx = f".{ws}" if ws else ""
+    nightly = str((cfg.get("auto_tailor") or {}).get("manifest") or _AUTOTAILOR_DEFAULT_MANIFEST)
+    manual = nightly[:-5] + ".manual.json" if nightly.endswith(".json") else nightly + ".manual.json"
+    return {
+        "ws": ws,
+        "manifest": cfgmod.resolve_path(manual),
+        "lock": _AUTOTAILOR_LOGS / f".autotailor{sfx}.lock",
+        "log": _AUTOTAILOR_LOGS / f"autotailor{sfx}.manual.log",
+    }
+
+
+def _launch_manifest(manifest: list[dict], note: str) -> dict:
+    """Write `manifest` as this workspace's .manual.json and hand it to tools/auto_tailor.sh
+    detached (JOBSCAN_MANIFEST override; the child inherits JOBSCAN_CONFIG so it stays in this
+    workspace). Returns {manifest, started}. Callers check the lock BEFORE writing prompts."""
+    paths = _tailor_batch_paths()
+    paths["manifest"].parent.mkdir(parents=True, exist_ok=True)
+    paths["manifest"].write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+    res = {"manifest": str(paths["manifest"]), "started": False}
+    if not manifest or paths["lock"].exists():
+        return res
+    env = os.environ.copy()          # carries JOBSCAN_CONFIG → the child stays in THIS workspace
+    env["JOBSCAN_MANIFEST"] = str(paths["manifest"])
+    if paths["ws"]:
+        env["JOBSCAN_WS"] = paths["ws"]
+    else:
+        env.pop("JOBSCAN_WS", None)  # owner: no suffix, exactly like the launchd nightly
+    # launchd gives the web server a bare PATH; the script needs sed/env/bash from the usual places
+    env["PATH"] = env.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    paths["log"].parent.mkdir(parents=True, exist_ok=True)
+    with open(paths["log"], "ab") as lf:
+        lf.write(("\n===== %s %s (ws=%s) =====\n" % (
+            time.strftime("%Y-%m-%d %H:%M:%S"), note, paths["ws"] or "owner")).encode())
+        lf.flush()
+        subprocess.Popen(["bash", "tools/auto_tailor.sh"], cwd=str(cfgmod.ROOT), env=env,
+                         stdout=lf, stderr=lf, start_new_session=True)
+    res["started"] = True
+    return res
+
+
+_queue_attempts: dict[str, int] = {}
+
+
+def _queued_manifest(conn) -> list[dict]:
+    """Every role in this workspace at tailor_status=queued (prompt written, no résumé yet) as
+    manifest items — what the ✎ button and the queue runner hand to the workers."""
+    rows = conn.execute(
+        "SELECT s.job_id, s.prompt_path, r.company, r.title, r.weighted_score"
+        " FROM role_state s JOIN jobs.roles r ON r.job_id = s.job_id"
+        " WHERE s.tailor_status = 'queued' AND s.prompt_path IS NOT NULL").fetchall()
+    out = []
+    for r in rows:
+        if not Path(r["prompt_path"] or "").exists():
+            continue
+        if _queue_attempts.get(r["job_id"], 0) >= 2:
+            continue                 # tried twice this session and still queued → leave it to the nightly
+        out.append({"job_id": r["job_id"], "company": r["company"], "title": r["title"],
+                    "prompt": r["prompt_path"],
+                    "resume_out": str(tailoring.resume_yaml_path(cfg, r["company"], r["job_id"])),
+                    "score": r["weighted_score"]})
+    return out
+
+
+def _start_queued(conn, note: str) -> dict:
+    """Owner 2026-09-23: a role queued with ✎ starts tailoring NOW, not at the nightly run. If a
+    batch is already running (lock), the role stays queued and the queue runner picks it up as
+    soon as the lock clears."""
+    items = _queued_manifest(conn)
+    if not items:
+        return {"queued": 0, "started": False}
+    if _tailor_batch_paths()["lock"].exists():
+        return {"queued": len(items), "started": False, "waiting": True}
+    for it in items:
+        _queue_attempts[it["job_id"]] = _queue_attempts.get(it["job_id"], 0) + 1
+    return {"queued": len(items), **_launch_manifest(items, f"{note}: {len(items)} queued roles")}
+
+
+def _queue_runner() -> None:
+    """Background poller: every 60s, if no batch is running and roles are queued, launch them.
+    This is what makes 'queued while a batch was running' start by itself afterwards."""
+    while True:
+        time.sleep(60)
+        try:
+            conn = store.connect_view(cfg)
+            try:
+                _start_queued(conn, "queue runner")
+            finally:
+                conn.close()
+        except Exception:      # noqa: BLE001 — a poller must never die
+            pass
+
+
+if "pytest" not in sys.modules and os.environ.get("JOBSCAN_QUEUE_RUNNER", "1") == "1":
+    threading.Thread(target=_queue_runner, name="jobscan-queue-runner", daemon=True).start()
+
+
+@app.post("/api/tailor-batch")
+def api_tailor_batch(body: _TailorBatchIn, request: Request, conn=Depends(view_conn)):
+    """Queue a résumé for every role the review page is showing that has none yet.
+
+    Reads the list exactly as index() does (same fetch_view call, same identity-cookie
+    fallback), keeps rows that are neither `ready` nor `drop`, caps at
+    auto_tailor.manual_batch_cap by rank_score, writes their prompts + a .manual.json
+    manifest, and hands it to tools/auto_tailor.sh detached. dry_run only counts."""
+    identity = body.identity
+    if identity is None:
+        identity = request.cookies.get("apply_identity", "")
+    try:
+        ms = float(body.min_score)
+    except (TypeError, ValueError):
+        ms = 0.0
+    try:
+        rot_i = max(0, int(body.rot))
+    except (TypeError, ValueError):
+        rot_i = 0
+    data = store.fetch_view(
+        conn, cfg, status=body.status, q=body.q, company=body.company, min_score=ms,
+        verdict=body.verdict, seen=body.seen, remote=body.remote, seniority=body.seniority,
+        sort=body.sort, rot=rot_i, tag=body.tag, identity=identity, tailored=body.tailored,
+        ease=body.ease, pace=not body.showall,
+    )
+    todo = [r for r in data["rows"]
+            if (r.get("tailor_status") or "") != "ready" and r.get("verdict") != "drop"]
+    # Highest rank first, so when the cap bites it drops the tail, not what she'd apply to next.
+    todo.sort(key=lambda r: -(r.get("rank_score") or r.get("weighted_score") or 0))
+    cap = int((cfg.get("auto_tailor") or {}).get("manual_batch_cap", 150))
+    capped = max(0, len(todo) - cap)
+    todo = todo[:cap]
+    if body.dry_run:
+        return {"queued": len(todo), "capped": capped,
+                "sample": [(r["company"], r["title"]) for r in todo[:5]]}
+
+    paths = _tailor_batch_paths()
+    # Checked BEFORE writing anything: write_prompt flips each role to tailor_status=queued,
+    # and a 409 after that would leave roles marked queued with nobody working them. The
+    # script re-checks the same lock itself, so a race here only makes it exit quietly.
+    if paths["lock"].exists():
+        raise HTTPException(409, "已有一批在跑（夜间或上一批），等它跑完")
+    manifest, skipped = [], []
+    for r in todo:
+        try:
+            p = tailoring.write_prompt(cfg, conn, r["job_id"])
+            out = tailoring.resume_yaml_path(cfg, r["company"], r["job_id"])
+        except Exception as e:  # noqa: BLE001 — one bad role must not sink the whole batch
+            skipped.append(f"{r['job_id']}: {e}")
+            continue
+        manifest.append({"job_id": r["job_id"], "company": r["company"], "title": r["title"],
+                         "prompt": str(p), "resume_out": str(out), "score": r["weighted_score"]})
+    res = {"queued": len(manifest), "capped": capped, "skipped": skipped}
+    res.update(_launch_manifest(manifest, f"manual batch from review page: {len(manifest)} roles"))
+    return res
+
+
+@app.get("/api/tailor-batch/status")
+def api_tailor_batch_status(conn=Depends(view_conn)):
+    """Progress of the last manual batch. written = worker YAMLs on disk; ingested = of those,
+    how many role_state already says `ready` (the single ingest pass at the END of the script
+    flips them all at once, so ingested lags written until then); running = the shared lock."""
+    paths = _tailor_batch_paths()
+    items: list = []
+    mtime = None
+    if paths["manifest"].exists():
+        try:
+            items = json.loads(paths["manifest"].read_text(encoding="utf-8")) or []
+        except (OSError, ValueError):
+            items = []
+        mtime = time.strftime("%Y-%m-%d %H:%M:%S",
+                              time.localtime(paths["manifest"].stat().st_mtime))
+    written_ids = [it["job_id"] for it in items
+                   if it.get("resume_out") and Path(it["resume_out"]).exists()]
+    ingested = 0
+    for i in range(0, len(written_ids), 500):        # stay under SQLite's bound-variable cap
+        chunk = written_ids[i:i + 500]
+        ingested += conn.execute(
+            "SELECT COUNT(*) FROM role_state WHERE tailor_status='ready'"
+            f" AND job_id IN ({','.join('?' * len(chunk))})", chunk).fetchone()[0]
+    log_tail: list[str] = []
+    if paths["log"].exists():
+        try:
+            with open(paths["log"], "rb") as f:
+                f.seek(max(0, paths["log"].stat().st_size - 8192))   # tail, not the whole file
+                text = f.read().decode("utf-8", errors="replace")
+            log_tail = [ln for ln in text.splitlines() if ln.strip()][-3:]
+        except OSError:
+            pass
+    return {"running": paths["lock"].exists(), "total": len(items), "written": len(written_ids),
+            "ingested": ingested, "log_tail": log_tail, "manifest_mtime": mtime}
+
+
+def _profiles_summary() -> dict:
+    """名片夹摘要 for the extension panel: every card carries CONCRETE fill values. The
+    default card (config 里只有 label/display_name) is completed from cfg profile so the
+    panel can switch back to it purely client-side when the URL can't re-identify the role."""
+    ap = cfg.get("apply_profiles") or {}
+    base = cfg.get("profile") or {}
+    default = ap.get("default") or "casey"
+    out = {}
+    for k, c in (ap.get("profiles") or {}).items():
+        fallback = base if k == default else {}
+        out[k] = {
+            "label": c.get("label", k[:1].upper()),
+            "display_name": c.get("display_name", k),
+            "email": c.get("email") or base.get("email"),
+            "first_name": c.get("first_name") or fallback.get("first_name"),
+            "preferred_name": c.get("preferred_name") or fallback.get("preferred_name"),
+            "phone_national": c.get("phone_national") or fallback.get("phone"),
+        }
+    return {"default": default, "profiles": out}
+
+
+def _apply_identity(conn, role: dict, identity: str) -> dict:
+    """The extension's workspace selector can pin an apply profile (name card) for this Chrome
+    profile — e.g. the owner's 小号 `alex`. Same effect as clicking the card badge on the
+    review page: the role is switched to that identity (persisted, résumé re-lettered), so
+    everything downstream — header name, email, phone, PDF name — agrees. Roles already
+    applied/interviewing are left alone (the application went out under the old identity)."""
+    identity = (identity or "").strip()
+    profiles = (cfg.get("apply_profiles") or {}).get("profiles") or {}
+    if not identity or identity not in profiles or not role:
+        return role
+    if store.effective_profile_key(cfg, role) == identity:
+        return role
+    if (role.get("status") or "new") in ("applied", "interviewing"):
+        # The application already went out under another card: keep that history on the row,
+        # but the person at the keyboard picked THIS workspace, so the form she is filling now
+        # (a re-apply, or the same posting reached twice) gets this card — overlay, don't persist.
+        # 2026-09-25: returning the untouched role here is how a Alex-profile Chrome filled
+        # Casey + candidate on an applied Fluidstack posting.
+        r = dict(role); r["apply_profile"] = identity
+        return r
+    store.upsert_state(conn, role["job_id"], apply_profile=identity)
+    ypath = tailoring.resume_yaml_path(cfg, role["company"], role["job_id"])
+    if ypath.exists():
+        try:
+            tailoring.ingest_file(cfg, conn, ypath)
+        except tailoring.TailorError:
+            pass    # identity saved; the nightly autotailor will regenerate and pick it up
+    return store.get_role(conn, role["job_id"]) or role
+
+
+def _ensure_letterhead(conn, role: dict) -> dict:
+    """Make the on-disk PDF carry the name of this role's EFFECTIVE card before the extension
+    attaches it. Owner 2026-09-25: Nvidia/Nuro/Cohere were mapped to the 法名 card, the form
+    fields filled as Alex + candidate, but the attached résumé still said "Casey Example" —
+    the PDF had been rendered before the company was mapped, and nothing re-lettered it (ingest
+    only touches changed YAMLs). The ATS parsed the résumé name and the application landed as
+    Casey in Alex's mailbox. Re-render whenever the filename's name prefix disagrees."""
+    p = role.get("tailored_resume_path")
+    if not p or not Path(p).exists():
+        return role
+    card = tailoring.apply_profile_identity(cfg, store.effective_profile_key(cfg, role))
+    want = (card or {}).get("display_name") or tailoring.candidate_name(cfg)
+    if Path(p).name.startswith(want):
+        return role
+    ypath = tailoring.resume_yaml_path(cfg, role["company"], role["job_id"])
+    if not ypath.exists():
+        return role
+    try:
+        tailoring.ingest_file(cfg, conn, ypath)
+    except tailoring.TailorError:
+        return role
+    return store.get_role(conn, role["job_id"]) or role
+
+
+def _cooldown_for(conn, role: dict) -> dict | None:
+    """Active cooldown for this role's company, for the extension panel (owner 2026-09-25:
+    「投的时候才知道不让投」— the panel is where she learns it, so it shows and sets it there)."""
+    cd = store.active_cooldowns(conn, cfg).get((role.get("company_norm") or "").lower())
+    if not cd:
+        return None
+    try:
+        days_left = (datetime.date.fromisoformat(cd["until"]) - datetime.date.fromisoformat(store.la_today())).days
+    except (KeyError, ValueError):
+        days_left = None
+    return {"until": cd.get("until"), "days_left": days_left, "reason": cd.get("reason", ""),
+            "source": cd.get("source", "manual")}
+
+
+def _profile_for_role(role: dict) -> dict:
+    """The form-fill profile, with this role's 投递身份 (apply profile) overlaid. A role
+    switched to the 法名 card must autofill Alex + candidate — a form filled under one
+    name with the other's email is exactly the mix-up the feature exists to prevent."""
+    prof = dict(cfg.get("profile") or {})
+    card = tailoring.apply_profile_identity(cfg, store.effective_profile_key(cfg, role))
+    if card:
+        for src, dst in (("first_name", "first_name"), ("preferred_name", "preferred_name"),
+                         ("email", "email"), ("phone_national", "phone")):
+            if card.get(src):
+                prof[dst] = card[src]
+    return prof
 
 
 def _lookup_payload(conn, role: dict, top_role_default: bool = False) -> dict:
@@ -338,6 +807,7 @@ def _lookup_payload(conn, role: dict, top_role_default: bool = False) -> dict:
         "auto_cover_letter": bool(ai_cfg.get("auto_cover_letter", False)),
         "field_button": bool(ai_cfg.get("field_button", True)),   # ✨ per-field AI draft chips
         "this_status": role.get("status") or "new",     # THIS role's own status
+        "cooldown": _cooldown_for(conn, role),          # {until, days_left, reason, source} or None
         "company_applied": [                             # OTHER roles at this company already done
             {"title": r["title"], "status": r["status"], "date": r["applied_date"]}
             for r in prior[:6]
@@ -345,7 +815,10 @@ def _lookup_payload(conn, role: dict, top_role_default: bool = False) -> dict:
         "mailcode_enabled": mailmod.available(cfg),
         "eeo_decline": bool(cfg.get("eeo_decline", True)),
         "eeo": cfg.get("eeo") or {},          # per-field self-ID preference; unset → decline
-        "profile": cfg.get("profile") or {},
+        "profile": _profile_for_role(role),   # this role's apply profile overlaid (法名 roles fill 法名)
+        "apply_profile": store.effective_profile_key(cfg, role),
+        # 名片夹摘要：面板用来显示「这份要用哪个身份填」+ 渲染切换按钮，不用发第二个请求
+        "apply_profiles": _profiles_summary(),
         "experience": profile_experience(role),   # work history + bullets for Workday's My Experience
         "skills": profile_skills(role),           # for Workday's "Type to Add Skills" typeahead
         "top_role_default": top_role_default,      # true → chosen as the company's best guess
@@ -353,7 +826,7 @@ def _lookup_payload(conn, role: dict, top_role_default: bool = False) -> dict:
 
 
 @app.get("/api/lookup")
-def api_lookup(url: str, conn=Depends(view_conn)):
+def api_lookup(url: str, identity: str = "", conn=Depends(view_conn)):
     """The extension asks 'what role is this application page?' Returns role + profile.
 
     Two strategies: scanner-ATS URLs carry a job id (gh_jid=, /jobs/<n>, pid=, workday req) —
@@ -366,7 +839,7 @@ def api_lookup(url: str, conn=Depends(view_conn)):
             conn, [url, manualmod.canonical_capture_url(url)])
     if not role:
         raise HTTPException(404, "no matching role for this URL")
-    return _lookup_payload(conn, role)
+    return _lookup_payload(conn, _ensure_letterhead(conn, _apply_identity(conn, role, identity)))
 
 
 class PinIn(BaseModel):
@@ -488,7 +961,7 @@ def api_pick_option(body: PickIn, conn=Depends(view_conn)):
 
 
 @app.get("/api/top-role")
-def api_top_role(company: str, conn=Depends(view_conn)):
+def api_top_role(company: str, identity: str = "", conn=Depends(view_conn)):
     """For a form whose URL carries no job id (Google/Microsoft), pick the company's HIGHEST-
     scored role that has a tailored résumé — the owner applies top-score-first, so the top role
     is the best default. Returns the same shape as /api/lookup so the extension treats it
@@ -507,18 +980,26 @@ def api_top_role(company: str, conn=Depends(view_conn)):
     if not row:
         raise HTTPException(404, f"no un-applied tailored role for {company!r}")
     role = store.get_role(conn, row["job_id"])
-    return _lookup_payload(conn, role, top_role_default=True)
+    return _lookup_payload(conn, _apply_identity(conn, role, identity), top_role_default=True)
 
 
 @app.get("/api/profile")
-def api_profile():
+def api_profile(identity: str = ""):
     """Role-independent profile for forms whose URL carries no job id (Google/Microsoft careers).
     The extension fills name/email/phone/eligibility/consent from this — no résumé, no
-    role-specific questions, since we can't tell which posting it is."""
+    role-specific questions, since we can't tell which posting it is. `identity` (from the
+    extension's workspace selector) overlays that name card's name/email/phone."""
     ai_cfg = cfg.get("ai") or {}
+    prof = dict(cfg.get("profile") or {})
+    card = tailoring.apply_profile_identity(cfg, identity) if identity else None
+    if card:
+        for src, dst in (("first_name", "first_name"), ("preferred_name", "preferred_name"),
+                         ("email", "email"), ("phone_national", "phone")):
+            if card.get(src):
+                prof[dst] = card[src]
     return {
         "profile_only": True,
-        "profile": cfg.get("profile") or {},
+        "profile": prof,
         "eeo": cfg.get("eeo") or {},
         "eeo_decline": bool(cfg.get("eeo_decline", True)),
         "experience": profile_experience(),
@@ -533,9 +1014,9 @@ def api_applied_scan(days: int = 90, conn=Depends(view_conn)):
     changes status; the UI confirms each match one at a time via the status endpoint."""
     from . import applied_scan
     if not applied_scan.available(cfg):
-        raise HTTPException(503, "email scan disabled (set mailcode.email + gmail_app_password)")
+        raise HTTPException(503, "email scan disabled (set mailcode.email + gmail_app_password, or authorize Google on /settings)")
     try:
-        return applied_scan.scan(cfg, days=days)
+        return applied_scan.scan_all(cfg, days=days)
     except Exception as e:
         raise HTTPException(502, f"applied-scan failed: {type(e).__name__}: {e}")
 
@@ -555,6 +1036,11 @@ def api_cover_letter(job_id: str, words: int = 180, conn=Depends(view_conn)):
         raise HTTPException(502, f"cover letter failed: {type(e).__name__}: {e}")
     if not text:
         raise HTTPException(502, "model returned nothing")
+    if text.startswith("MISMATCH:"):
+        # mismatch fuse (owner 2026-09-09): the model judged this a different-field specialist
+        # role it cannot honestly sell. 409 (outside the try above, so it isn't re-wrapped as
+        # 502) — the extension shows the reason and leaves the box empty.
+        raise HTTPException(409, text)
     return {"text": text}
 
 
@@ -599,6 +1085,7 @@ def api_resume_pdf(job_id: str, conn=Depends(view_conn)):
     role = store.get_role(conn, job_id)
     if not role:
         raise HTTPException(404, "unknown job_id")
+    role = _ensure_letterhead(conn, role)         # the file the extension attaches must match the card
     p = role.get("tailored_resume_path")
     if not p or not Path(p).exists():
         raise HTTPException(404, "no tailored PDF yet")
@@ -632,9 +1119,9 @@ def api_answer(body: AnswerIn, conn=Depends(view_conn)):
 def api_email_code():
     """Fetch the newest email verification code (opt-in; reads inbox over IMAP)."""
     if not mailmod.available(cfg):
-        raise HTTPException(503, "email-code disabled (set mailcode.enabled + gmail_app_password)")
+        raise HTTPException(503, "email-code disabled (set mailcode.enabled + gmail_app_password, or authorize Google on /settings)")
     try:
-        return mailmod.fetch_latest_code(cfg)
+        return mailmod.fetch_latest_code_any(cfg)
     except Exception as e:
         raise HTTPException(502, f"email-code failed: {type(e).__name__}: {e}")
 
@@ -987,6 +1474,93 @@ def api_outcomes(days: int = 120, conn=Depends(view_conn)):
         return outcomesmod.scan(cfg, days=days)
     except Exception as e:
         raise HTTPException(502, f"outcome scan failed: {type(e).__name__}: {e}")
+
+
+_trends_cache: dict = {"at": 0.0, "html": ""}
+
+
+def _trends_details_html(conn, data: dict) -> str:
+    """落地层（owner 2026-09-10）：缺人主题 → 高频技能(✅有/📚缺) + 该补清单 + 具体岗位。"""
+    from html import escape as esc
+    from . import trends as trendsmod
+    blocks = []
+    for d in trendsmod.theme_details(cfg, conn, data):
+        chips = " · ".join(
+            f"{'✅' if s['have'] else '📚'}{esc(s['skill'])} <span class='muted'>{s['share_pct']}%({s['lift']}×)</span>"
+            for s in d["skills"])
+        roles = "".join(
+            f"<li>{'📄' if p['resume_ready'] else '⭘'} {esc(p['company'])} — {esc(p['title'])}"
+            f"（{p['score']} 分 · 挂 {p['age']} 天）</li>" for p in d["roles"]) or "<li class='muted'>暂无 title 命中的未投岗</li>"
+        blocks.append(f"<h3>▸ {esc(d['theme'])} <span class='muted small'>({d['n_jds']} 份 JD)</span></h3>"
+                      f"<p>{chips}</p><ul>{roles}</ul>")
+    gap_date, gaps = trendsmod.latest_gaps()
+    gap_html = (f"<h3>▸ 该补什么（模拟·快照 {esc(gap_date)}）</h3><ul>" + "".join(
+        f"<li><b>{esc(g['skill'])}</b> → +{g['jobs']} 岗 / {g['companies']} 家</li>" for g in gaps) + "</ul>") if gaps else ""
+    return f"<h2>落地：岗位与技能</h2>{''.join(blocks)}{gap_html}" if blocks else ""
+
+
+@app.get("/trends", response_class=HTMLResponse)
+def trends_page(conn=Depends(view_conn)):
+    """鸭先知：市场趋势页。纯本地统计（app/trends.py），15 分钟缓存 —— 9k 份 JD 的
+    正则扫描要几秒，不该每次刷新都付一遍。数据每日随扫描更新，周报周一另发邮箱。"""
+    import time as _time
+    from html import escape as esc
+    if _time.time() - _trends_cache["at"] < 900 and _trends_cache["html"]:
+        return _page("Trends", _trends_cache["html"])
+    from . import trends as trendsmod
+    data = trendsmod.compute(cfg, conn)
+    sug = trendsmod.suggestions(cfg, conn, data)
+    _conf = {"high": "高", "medium": "中", "low": "⚠低"}
+    _hn = (data.get("hn_hiring") or {}).get("shares", {})
+    rows_html = "".join(
+        f"<tr><td>{esc(n)}</td><td class='num'>{v['count']}</td><td class='num'>{v['companies']}</td>"
+        f"<td class='num'>{v['top3_share_pct']}%</td><td class='num'>{_conf[v.get('confidence','medium')]}</td>"
+        f"<td class='num'><b>{v['median_fill'] or '—'}</b>{'天(' + str(v['n_closed_cos']) + '家)' if v['median_fill'] else ''}</td>"
+        f"<td class='num'>{v['median_age']}天</td><td class='num'>{v['ghost_pct']}%</td>"
+        f"<td class='num'>{v['new7']}</td><td class='num'>{v['new_share_delta_pp']:+.1f}pp</td>"
+        f"<td class='num'>{str(_hn.get(n)) + '%' if _hn.get(n) is not None else '—'}</td></tr>"
+        for n, v in sorted(data["themes"].items(),
+                           key=lambda kv: -(kv[1]["median_fill"] or kv[1]["median_age"] or 0)))
+    novel = "".join(
+        f"<tr><td><code>{esc(t['term'])}</code></td><td class='num'>{t['new_docs']}</td>"
+        f"<td class='num'>{t['companies']}</td><td class='num'>{t['ratio'] or '∞'}×</td></tr>"
+        for t in data["novel_terms"]) or "<tr><td colspan=4 class='muted'>本期无达标新词</td></tr>"
+    velo = "".join(
+        f"<tr><td>{esc(c['company'])}</td><td class='num'>{c['new7']}</td><td class='num'>{c['weekly_avg']}</td></tr>"
+        for c in data["company_velocity"]) or "<tr><td colspan=3 class='muted'>无显著突增（新接入观察期公司不计）</td></tr>"
+    rank = "".join(
+        f"<li><b>{esc(r['theme'])}</b> · 指数 {r['undersupply_index']}（挂龄 {r['median_age']}天，"
+        f"环比 {r['delta_pp']:+.1f}pp）{('→ 主打 <b>' + esc(r['angle']) + '</b> angle') if r['angle'] else ''}</li>"
+        for r in sug["ranking"][:5])
+    sentinels = "".join(
+        f"<li><b>{esc(o['company'])}</b> 首招「{esc(o['title'])}」</li>"
+        for o in data.get("sentinels", [])) or "<li class='muted'>本周无</li>"
+    vendors = "".join(
+        f"<tr><td>{esc(x['vendor'])}</td><td class='num'>{x['mentions']}</td>"
+        f"<td class='num'>{x['companies']}</td><td class='num'>{x['new14']}</td></tr>"
+        for x in data.get("vendors", []))
+    hot = "".join(
+        f"<li>{'📄' if p['resume_ready'] else '⭘'} {esc(p['company'])} — {esc(p['title'])}（{p['score']} 分）</li>"
+        for p in sug["hot_roles"])
+    body = f"""<h1>🦆 鸭先知 · {data['date']}</h1>
+      <p class="tip">语料 {data['corpus']} 条在库岗位。<b>挂龄</b>越长越招不到人（供不应求）；
+      <b>环比</b> = 近14天新岗中该主题份额对比前14天。数据每日随 09:00 扫描更新；周报每周一寄邮箱。</p>
+      <h2>主题热度与供需</h2>
+      <table><tr><th>主题</th><th>在库</th><th>公司数</th><th>top3集中</th><th>置信度</th><th>完结耗时</th><th>挂龄中位</th><th>幽灵岗</th><th>近7新增</th><th>环比</th><th>HN帖</th></tr>{rows_html}</table>
+      <p class="muted small">完结耗时按公司平衡（每家先取中位再跨公司中位，大板子刷不动权重）；置信度 ⚠低 = &lt;15家公司或 top3&gt;60%，代表少数公司而非市场；HN帖 = 当月 Who is hiring 帖里该主题占招聘评论的比例（创业公司侧全市场对照）。</p>
+      <h2>新词雷达（近14天，≥4家公司）</h2>
+      <table><tr><th>词</th><th>新岗提及</th><th>公司数</th><th>倍率</th></tr>{novel}</table>
+      <h2>公司发岗突变（近7天 ≥3× 周均）</h2>
+      <table><tr><th>公司</th><th>近7天</th><th>此前周均</th></tr>{velo}</table>
+      <h2>哨兵岗位（公司首招此类 title）</h2><ul>{sentinels}</ul>
+      <h2>厂商提及榜（JD 点名 = 采用意图）</h2>
+      <table><tr><th>产品</th><th>提及</th><th>公司数</th><th>近14天新岗</th></tr>{vendors}</table>
+      <h2>行动建议</h2><ul>{rank}</ul>
+      {f'<p><b>最缺人主题「{esc(sug["hot_theme"])}」现成可投：</b></p><ul>{hot}</ul>' if hot else ''}
+      {_trends_details_html(conn, data)}
+      <p class="muted small">词典在 config.yaml trends.themes，手改即生效。</p>"""
+    _trends_cache.update(at=_time.time(), html=body)
+    return _page("Trends", body)
 
 
 @app.get("/outcomes", response_class=HTMLResponse)
@@ -1383,6 +1957,306 @@ def companies_override(inp: _OverrideIn, conn=Depends(view_conn)):
     return {"ok": True}
 
 
+class _CooldownIn(BaseModel):
+    company: str
+    days: int | None = None        # 30 / 60 / 90 / 180 … (1..365); ignored when `until` is given
+    until: str | None = None       # ISO date, inclusive
+    reason: str = ""
+    skip_job_id: str | None = None # extension panel (owner 2026-09-25): also mark THIS role skip
+
+
+@app.get("/api/companies/cooldowns")
+def api_cooldowns(conn=Depends(view_conn)):
+    """Active cooldowns — config.yaml ones and UI-set ones merged (store.active_cooldowns)."""
+    cds = store.active_cooldowns(conn, cfg)
+    rows = [{"company_norm": cn, **cd} for cn, cd in cds.items()]
+    rows.sort(key=lambda r: (r["until"], r["company"].lower()))
+    return {"today": store.la_today(), "rows": rows}
+
+
+@app.post("/api/companies/cooldown")
+def api_cooldown_set(inp: _CooldownIn, conn=Depends(view_conn)):
+    """「这家不让投了」(owner 2026-09-22). Same effect as a config.yaml `cooldowns:` entry —
+    the scanner skips the company and review hides its roles — without editing YAML, and it
+    expires by itself. Returns the row plus how many review-status roles just went hidden."""
+    try:
+        row = store.set_company_cooldown(conn, inp.company, days=inp.days, until=inp.until,
+                                         reason=inp.reason)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    hidden = conn.execute(
+        "SELECT COUNT(*) FROM jobs.roles r LEFT JOIN role_state s ON s.job_id=r.job_id"
+        " WHERE r.company_norm=? AND COALESCE(s.status,'new')='new'",
+        (row["company_norm"],)).fetchone()[0]
+    skipped = False
+    if inp.skip_job_id:
+        cur = store.get_role(conn, inp.skip_job_id)
+        if cur and (cur.get("status") or "new") == "new":     # never overwrite applied/interviewing history
+            store.set_status(conn, inp.skip_job_id, "skip")
+            skipped = True
+    return {"ok": True, **row, "hidden_roles": hidden, "skipped_role": skipped}
+
+
+@app.delete("/api/companies/cooldown/{company}")
+def api_cooldown_clear(company: str, conn=Depends(view_conn)):
+    if store.clear_company_cooldown(conn, company):
+        return {"ok": True}
+    if cfgmod.norm_key(company) in cfgmod.active_cooldowns(cfg):
+        raise HTTPException(409, f"{company} 的 cooldown 写在 config.yaml 里 — 要解除请改那里")
+    raise HTTPException(404, "no manual cooldown for that company")
+
+
+# ── Outreach 自荐信（owner 2026-09-23）：联系人 → 匹配岗位 → 草稿 → Gmail 草稿箱 ───────────────
+
+class _OutreachGen(BaseModel):
+    email: str
+
+
+class _OutreachEdit(BaseModel):
+    subject: str | None = None
+    body: str | None = None
+
+
+@app.get("/api/outreach")
+def api_outreach(all: bool = False, conn=Depends(view_conn)):
+    """Contacts (list A/B tiers + mailbox recruiters), each with the company's matching open roles
+    for this workspace and its draft (if any)."""
+    tiers = set((cfg.get("outreach") or {}).get("tiers") or ["A", "B"]) | {"mailbox"}
+    by = outreachmod.roles_by_company(conn, cfg)
+    drafts = {d["contact_email"]: d for d in store.outreach_list(conn)}
+    rows = []
+    for c in outreachmod.all_contacts(cfg):
+        if not all and c.get("tier") not in tiers:
+            continue
+        _, roles = outreachmod.match_company(by, c["company"])
+        d = drafts.get(c["email"])
+        rows.append({**c, "roles": [outreachmod.role_brief(r) for r in roles[:3]], "n_roles": len(roles),
+                     "draft": {k: d[k] for k in ("id", "status", "subject", "updated_at", "saved_at", "error")} if d else None})
+    rows.sort(key=lambda r: (r["source"] != "mailbox", -r["n_roles"], r.get("tier", ""), r["company"].lower()))
+    return {"workspace": cfgmod.workspace_name(cfg), "mailbox_on": mailmod.available(cfg),
+            "ai_on": aimod.available(cfg), "rows": rows}
+
+
+@app.get("/api/contacts")
+def api_contacts():
+    """A plain address book view of every saved hiring contact."""
+    rows = outreachmod.all_contacts(cfg)
+    rows.sort(key=lambda c: (c.get("company", "").lower(), c.get("name", "").lower(), c["email"]))
+    return {"workspace": cfgmod.workspace_name(cfg), "rows": rows}
+
+
+@app.post("/api/outreach/generate")
+def api_outreach_generate(inp: _OutreachGen, conn=Depends(view_conn)):
+    contact = next((c for c in outreachmod.all_contacts(cfg) if c["email"] == inp.email.strip().lower()), None)
+    if not contact:
+        raise HTTPException(404, "unknown contact")
+    if not aimod.available(cfg):
+        raise HTTPException(503, "AI disabled (ai.enabled + secrets.yaml key)")
+    rec = outreachmod.generate(conn, cfg, contact)
+    if rec["status"] == "error":
+        raise HTTPException(502, rec["error"])
+    return rec
+
+
+@app.get("/api/outreach/{draft_id}")
+def api_outreach_get(draft_id: int, conn=Depends(view_conn)):
+    rec = store.outreach_get(conn, draft_id)
+    if not rec:
+        raise HTTPException(404, "no such draft")
+    return rec
+
+
+@app.post("/api/outreach/{draft_id}")
+def api_outreach_edit(draft_id: int, inp: _OutreachEdit, conn=Depends(view_conn)):
+    rec = store.outreach_update(conn, draft_id, **{k: v for k, v in inp.model_dump().items() if v is not None})
+    if not rec:
+        raise HTTPException(404, "no such draft")
+    return rec
+
+
+@app.post("/api/outreach/{draft_id}/gmail")
+def api_outreach_gmail(draft_id: int, conn=Depends(view_conn)):
+    """Put the draft in the mailbox's Gmail Drafts folder (résumé attached). Never sends."""
+    rec = store.outreach_get(conn, draft_id)
+    if not rec:
+        raise HTTPException(404, "no such draft")
+    if not (rec.get("subject") and rec.get("body")):
+        raise HTTPException(400, "draft has no subject/body yet")
+    # Re-resolve the attachment now: tailored filenames change on re-score, and a stale stored
+    # path silently produced attachment-less drafts (2026-09-23).
+    fresh = outreachmod.current_resume(conn, cfg, rec)
+    if fresh:
+        rec["resume_path"] = fresh
+        store.outreach_update(conn, draft_id, resume_path=fresh)
+    try:
+        mid = outreachmod.save_gmail_draft(cfg, rec)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"could not save to Gmail Drafts: {type(e).__name__}: {e}")
+    return store.outreach_update(conn, draft_id, status="saved", saved_at=store.la_now_iso(), error="") | {"message_id": mid}
+
+
+@app.post("/api/outreach/{draft_id}/dismiss")
+def api_outreach_dismiss(draft_id: int, conn=Depends(view_conn)):
+    rec = store.outreach_update(conn, draft_id, status="dismissed")
+    if not rec:
+        raise HTTPException(404, "no such draft")
+    return rec
+
+
+@app.get("/outreach", response_class=HTMLResponse)
+def outreach_page():
+    return _page("Outreach", """<h1>✉️ 自荐信草稿</h1>
+      <p><a class="b" href="/contacts">👥 打开联系人通讯录</a></p>
+      <p class="tip">联系人来自两处：<b>邮箱里聊过的 recruiter</b>（/companies 看板里活着的线程）和
+      <b>outreach/contacts.yaml</b>（ex-Meta 名单，A = 500+ 人、B = 50-500 人）。每个人对应这家公司现在对我合格的岗位。
+      「生成」写一封四段式草稿（为什么是这家 · 我是谁 · 附简历+点名岗位 · 约 15 分钟），你改完点「存进 Gmail 草稿箱」，
+      然后<b>在 Gmail 里自己发</b>——这页永远不发信。</p>
+      <p><button onclick="load()">Load</button>
+         <button onclick="genAll()" id="genall">生成所有还没草稿的（勾选的）</button>
+         <button onclick="gmailAll()" id="gmailall">全部存进 Gmail 草稿箱</button>
+         <label class="small muted"><input type="checkbox" id="showall" onchange="load()"> 显示 skip 档（中介 / 非美国 / 只招 PM / 太小）</label>
+         <span class="small muted" id="prog"></span></p>
+      <div id="out"><p class="muted">loading…</p></div>
+      <script>
+      function esc(s){const e=document.createElement('div');e.textContent=s||'';return e.innerHTML}
+      async function load(){
+        const r=await fetch('/api/outreach?all='+(document.getElementById('showall').checked?'true':'false'));
+        if(!r.ok){document.getElementById('out').innerHTML='<p class="tip warn">'+esc(await r.text())+'</p>';return}
+        window._o=await r.json(); render();
+      }
+      function stBadge(d){ if(!d) return '<span class="muted">—</span>';
+        const zh={draft:'📝 草稿',saved:'📬 已在 Gmail 草稿箱',dismissed:'✕ 不发',error:'⚠ 失败'};
+        return '<span title="'+esc(d.error||'')+'">'+(zh[d.status]||d.status)+'</span>'; }
+      function render(){
+        const o=window._o; if(!o) return;
+        const head='<p class="small muted">工作台 <b>'+esc(o.workspace||'default')+'</b> · 邮箱 '+(o.mailbox_on?'✅':'关（存草稿箱不可用）')+' · AI '+(o.ai_on?'✅':'关')+' · '+o.rows.length+' 位联系人</p>';
+        const rows=o.rows.map((c,i)=>{
+          const roles=c.roles.length?c.roles.map(r=>'<div class="small">· <a href="'+esc(r.apply_url)+'" target="_blank">'+esc(r.title)+'</a> <span class="muted">'+esc(r.location||'')+(r.tailor_status==='ready'?' · 📄 有定制简历':'')+'</span></div>').join('')+(c.n_roles>3?'<div class="small muted">…共 '+c.n_roles+' 个</div>':'')
+                                     :'<div class="small muted">JobScan 里没有这家的合格岗位（草稿会改成问「现在开什么工程岗」）</div>';
+          const d=c.draft;
+          // data-email instead of a quoted literal: this template is a plain Python string, so a JS
+          // \' here reached the browser as '' and the whole script died with "Unexpected string" —
+          // the page sat on "loading…" forever, on both workspaces (2026-09-23 night).
+          const act=[ '<a href="#" data-email="'+esc(c.email)+'" onclick="return gen(this.dataset.email,'+i+')">'+(d?'重新生成':'生成')+'</a>' ];
+          if(d&&d.status!=='error'){ act.push('<a href="#" onclick="return openDraft('+d.id+')">查看/改</a>'); if(d.status!=='saved') act.push('<a href="#" onclick="return toGmail('+d.id+')">存进 Gmail 草稿箱</a>'); act.push('<a href="#" onclick="return dismiss('+d.id+')">不发</a>'); }
+          return '<div id="row'+i+'" style="border-bottom:1px solid #eef2f6;padding:10px 0">'+
+            '<label><input type="checkbox" class="pick" data-email="'+esc(c.email)+'" '+(d&&d.status!=='error'?'':'checked')+'> <b style="font-size:15px">'+esc(c.company)+'</b></label> '+
+            '<span class="pill '+(c.source==='mailbox'?'hi':(c.tier==='A'?'md':'lo'))+'">'+esc(c.source==='mailbox'?'邮箱聊过':'档 '+c.tier)+'</span> '+
+            '<span class="small muted">'+esc(c.name)+' &lt;'+esc(c.email)+'&gt;'+(c.size?' · '+esc(c.size):'')+(c.industry?' · '+esc(c.industry):'')+'</span>'+
+            '<div class="small muted" style="margin:3px 0 4px">'+esc((c.note||'').slice(0,220))+'</div>'+roles+
+            '<div class="small" style="margin-top:4px">'+stBadge(d)+' · '+act.join(' · ')+'</div>'+
+            '<div id="draft'+(d?d.id:'x')+'" class="draftbox"></div></div>';
+        }).join('');
+        document.getElementById('out').innerHTML=head+rows;
+      }
+      async function gen(email,i){
+        const row=document.getElementById('row'+i); if(row) row.style.opacity=.5;
+        const r=await fetch('/api/outreach/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})});
+        if(!r.ok) alert('生成失败：'+await r.text());
+        await load(); return false;
+      }
+      async function genAll(){
+        const picks=[...document.querySelectorAll('.pick:checked')].map(x=>x.dataset.email);
+        if(!picks.length){alert('没有勾选的联系人');return}
+        if(!confirm('给 '+picks.length+' 位联系人各写一封草稿？每封约 10-20 秒。')) return;
+        const b=document.getElementById('genall'); b.disabled=true; let ok=0,bad=0;
+        for(const [k,email] of picks.entries()){
+          document.getElementById('prog').textContent=(k+1)+'/'+picks.length+' '+email;
+          const r=await fetch('/api/outreach/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})});
+          if(r.ok) ok++; else bad++;
+        }
+        b.disabled=false; document.getElementById('prog').textContent='完成：'+ok+' 封草稿'+(bad?'，'+bad+' 封失败（行里有原因）':''); await load();
+      }
+      async function openDraft(id){
+        const r=await fetch('/api/outreach/'+id); if(!r.ok){alert(await r.text());return false}
+        const d=await r.json(); const box=document.getElementById('draft'+id); if(!box) return false;
+        box.innerHTML='<div style="margin:8px 0;padding:10px;border:1px solid #dde3ea;border-radius:8px;background:#fafbfc">'+
+          '<div class="small muted">To: '+esc(d.contact_name)+' &lt;'+esc(d.contact_email)+'&gt;'+(d.resume_path?' · 附件：'+esc(d.resume_path.split('/').pop()):' · 无附件')+'</div>'+
+          '<input id="sub'+id+'" value="'+esc(d.subject).replace(/"/g,'&quot;')+'" style="width:100%;margin:6px 0;font:inherit;padding:4px">'+
+          '<textarea id="body'+id+'" rows="14" style="width:100%;font:inherit;padding:6px">'+esc(d.body)+'</textarea>'+
+          '<div style="margin-top:6px"><button onclick="saveDraft('+id+')">保存修改</button> <button onclick="toGmail('+id+')">存进 Gmail 草稿箱</button> <button onclick="collapse('+id+')">收起</button></div></div>';
+        return false;
+      }
+      async function saveDraft(id){
+        const r=await fetch('/api/outreach/'+id,{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({subject:document.getElementById('sub'+id).value,body:document.getElementById('body'+id).value})});
+        if(!r.ok) alert(await r.text()); else document.getElementById('prog').textContent='已保存';
+      }
+      async function gmailAll(){
+        // owner 2026-09-23 night: one click puts every finished draft (status 草稿) in the mailbox's
+        // Gmail Drafts folder, one by one so a single IMAP hiccup fails one email, not the batch.
+        const o=window._o; if(!o) return;
+        const ids=o.rows.filter(c=>c.draft&&c.draft.status==='draft').map(c=>c.draft.id);
+        if(!ids.length){ document.getElementById('prog').textContent='没有待存的草稿'; return; }
+        if(!confirm('把 '+ids.length+' 封草稿全部放进 Gmail 草稿箱？（不会发送）')) return;
+        let ok=0,bad=0; const errs=[];
+        for(const id of ids){
+          document.getElementById('prog').textContent='存进草稿箱 '+(ok+bad+1)+'/'+ids.length+'…';
+          const r=await fetch('/api/outreach/'+id+'/gmail',{method:'POST'});
+          if(r.ok) ok++; else { bad++; errs.push(await r.text()); }
+        }
+        document.getElementById('prog').textContent='已进 Gmail 草稿箱 '+ok+' 封'+(bad?'，失败 '+bad+' 封：'+errs.slice(0,3).join(' | '):'')+'。去 Gmail 一封封点发送。';
+        await load();
+      }
+      async function toGmail(id){
+        const sub=document.getElementById('sub'+id); if(sub) await saveDraft(id);
+        const r=await fetch('/api/outreach/'+id+'/gmail',{method:'POST'});
+        if(!r.ok) alert('存草稿箱失败：'+await r.text()); else { document.getElementById('prog').textContent='已进 Gmail 草稿箱，去 Gmail 发'; await load(); }
+        return false;
+      }
+      function collapse(id){ const b=document.getElementById('draft'+id); if(b) b.innerHTML=''; }
+      async function dismiss(id){ await fetch('/api/outreach/'+id+'/dismiss',{method:'POST'}); await load(); return false; }
+      load();
+      </script>""")
+
+
+@app.get("/contacts", response_class=HTMLResponse)
+def contacts_page():
+    return _page("Contacts", """<h1>👥 Recruiter 联系人</h1>
+      <p class="tip">这里是单纯的联系人通讯录。数据保存在 <code>outreach/contacts.yaml</code>，
+      邮箱里已经聊过的 recruiter 也会自动合并进来。写信和生成草稿仍然去
+      <a href="/outreach">外联页面</a>。</p>
+      <p style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input id="q" placeholder="搜索姓名、邮箱或公司" oninput="render()"
+          style="min-width:280px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:6px;font:inherit">
+        <select id="company" onchange="render()"
+          style="padding:7px 9px;border:1px solid #cbd5e1;border-radius:6px;font:inherit">
+          <option value="">所有公司</option>
+        </select>
+        <span class="small muted" id="count"></span>
+      </p>
+      <div id="out"><p class="muted">loading…</p></div>
+      <script>
+      function esc(s){const e=document.createElement('div');e.textContent=s||'';return e.innerHTML}
+      function kind(c){
+        if(c.source==='mailbox') return '邮箱聊过';
+        if((c.hiring||'').toLowerCase().includes('event')) return 'Hiring event';
+        return 'Recruiter';
+      }
+      function render(){
+        const rows=window._contacts||[];
+        const q=(document.getElementById('q').value||'').trim().toLowerCase();
+        const co=document.getElementById('company').value;
+        const shown=rows.filter(c=>(!co||c.company===co)&&(!q||[c.name,c.email,c.company,c.note].join(' ').toLowerCase().includes(q)));
+        document.getElementById('count').textContent='显示 '+shown.length+' / '+rows.length+' 位';
+        const body=shown.map(c=>'<tr><td><b>'+esc(c.company)+'</b></td><td>'+esc(c.name||'—')+'</td>'+
+          '<td><a href="mailto:'+encodeURIComponent(c.email)+'">'+esc(c.email)+'</a></td>'+
+          '<td><span class="pill '+(c.source==='mailbox'?'hi':'lo')+'">'+esc(kind(c))+'</span></td>'+
+          '<td class="small muted">'+esc(c.note||'')+'</td></tr>').join('');
+        document.getElementById('out').innerHTML='<table><thead><tr><th>公司</th><th>姓名</th><th>Email</th><th>类型</th><th>备注</th></tr></thead><tbody>'+body+'</tbody></table>';
+      }
+      async function load(){
+        const r=await fetch('/api/contacts');
+        if(!r.ok){document.getElementById('out').innerHTML='<p class="tip warn">'+esc(await r.text())+'</p>';return}
+        const data=await r.json(); window._contacts=data.rows||[];
+        const companies=[...new Set(window._contacts.map(c=>c.company).filter(Boolean))].sort((a,b)=>a.localeCompare(b));
+        document.getElementById('company').innerHTML='<option value="">所有公司</option>'+companies.map(c=>'<option>'+esc(c)+'</option>').join('');
+        render();
+      }
+      load();
+      </script>""")
+
+
 @app.get("/companies", response_class=HTMLResponse)
 def companies_page():
     """Whose turn is it, per company. Companion to the Gmail `Interviews/<Company>` labels —
@@ -1398,19 +2272,64 @@ def companies_page():
          <button onclick="load(true)">Refresh from Gmail</button>
          <label class="small muted"><input type="checkbox" id="dead" onchange="render()">
            显示已冷 / 已挂（超过 45 天没动静的）</label></p>
+      <h2 id="cooldowns" style="margin-top:22px">⏳ Cooldown：不让投的公司</h2>
+      <p class="tip">ATS 说「投太多了」/「一次只能一份在跑」→ 在这里记一笔（review 页每行公司旁的 🚫 也是同一个入口）：
+      <b>扫描跳过这家、review 页隐藏它的岗位</b>，到期自动恢复。写在 config.yaml 里的也一并列出，那种只能改文件解除。</p>
+      <form onsubmit="return cdAdd()" style="margin:6px 0 10px">
+        <input id="cdco" placeholder="公司名（和 review 页写法一致）" style="width:230px">
+        <select id="cddays"><option value="30">30 天</option><option value="60">60 天</option><option value="90">90 天</option><option value="180">180 天</option></select>
+        <input id="cdwhy" placeholder="原因（可选）：Ashby 5/180、一次一份…" style="width:290px">
+        <button type="submit">加入 cooldown</button>
+      </form>
+      <div id="cdlist" class="small muted">loading…</div>
       <div id="sum"></div><div id="out"></div>
       <script>
       function esc(s){const e=document.createElement('div');e.textContent=s||'';return e.innerHTML}
+      async function cdList(){
+        const r=await fetch('/api/companies/cooldowns'); if(!r.ok) return;
+        const d=await r.json(); const el=document.getElementById('cdlist');
+        if(!d.rows.length){el.innerHTML='<span class="muted">目前没有 cooldown 中的公司</span>';return}
+        el.innerHTML=d.rows.map(c=>'<div style="padding:4px 0">⏳ <b>'+esc(c.company)+'</b> 到 '+esc(c.until)+
+          (c.reason?' · '+esc(c.reason):'')+' <span class="muted">['+(c.source==='config'?'config.yaml':'手动')+']</span> '+
+          (c.source==='manual'?'<a href="#" onclick="return cdClear(`'+encodeURIComponent(c.company)+'`)">解除</a>':'')+'</div>').join('');
+      }
+      async function cdPost(company,days,reason){
+        const r=await fetch('/api/companies/cooldown',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({company,days,reason})});
+        if(!r.ok){alert(await r.text());return null}
+        return r.json();
+      }
+      async function cdAdd(){
+        const co=document.getElementById('cdco').value.trim(); if(!co) return false;
+        const ok=await cdPost(co,+document.getElementById('cddays').value,document.getElementById('cdwhy').value);
+        if(ok){document.getElementById('cdco').value='';document.getElementById('cdwhy').value='';}
+        await cdList(); return false;
+      }
+      async function cdClear(co){
+        const r=await fetch('/api/companies/cooldown/'+co,{method:'DELETE'});
+        if(!r.ok) alert(await r.text()); await cdList(); return false;
+      }
+      async function cdPrompt(co){
+        const name=decodeURIComponent(co);
+        const d=prompt('「'+name+'」不让投了？冷却多少天？（30 / 60 / 90 / 180）','30');
+        if(!d) return false;
+        const why=prompt('原因（可选）','')||'';
+        const ok=await cdPost(name,parseInt(d,10),why);
+        if(ok) alert(name+' 已加入 cooldown，到 '+ok.until+'。扫描从下一次起跳过这家；review 里它的 '+ok.hidden_roles+' 个岗位已隐藏。');
+        await cdList(); return false;
+      }
+      cdList();
       function ovBtns(r){
         const co=encodeURIComponent(r.company),
               zh={closed:'手动结案',hidden:'隐藏',booked:'已排期',acked:'已处理'};
         const a=(act,label,tip)=>'<a href="#" title="'+tip+'" onclick="return ov(`'+co+'`,'+
           (act?'`'+act+'`':'null')+')">'+label+'</a>';
-        if(r.override) return '已手动标记：'+zh[r.override]+' '+a(null,'撤销','清除人工标记');
+        const cd=' · <a href="#" title="这家不让投了：扫描跳过 + review 隐藏，到期自动恢复" onclick="return cdPrompt(`'+co+'`)">⏳ 不让投了</a>';
+        if(r.override) return '已手动标记：'+zh[r.override]+' '+a(null,'撤销','清除人工标记')+cd;
         return a('acked','✓ 已处理','在邮件之外回过了（平台/电话/日历）——欠账清零，来新邮件会自动复活')+' · '+
                a('booked','📅 已排期','约面藏在正文/日历里，机器没读出来时点这个')+' · '+
                a('closed','✕ 结案','这条线结束了（含你拒了对方的情况）')+' · '+
-               a('hidden','🙈 隐藏','误认的公司/不想再看');
+               a('hidden','🙈 隐藏','误认的公司/不想再看')+cd;
       }
       async function ov(co,action){
         await fetch('/api/companies/override',{method:'POST',
@@ -1462,6 +2381,63 @@ def api_health():
     return {"ok": not hbmod.red(rows), "tasks": rows}
 
 
+def _gcal_auth_snapshot() -> dict:
+    with _gcal_auth_lock:
+        proc = _gcal_auth_proc
+        started = _gcal_auth_started
+    rc = proc.poll() if proc else None
+    try:
+        log_text = _gcal_auth_log.read_text(encoding="utf-8", errors="replace")[-6000:]
+    except OSError:
+        log_text = ""
+    m = re.search(r"https://accounts\.google\.com/o/oauth2/auth\?\S+", log_text)
+    return {
+        "running": bool(proc and rc is None),
+        "returncode": rc,
+        "started_epoch": started,
+        "started_ago_s": round(time.time() - started) if started else None,
+        "auth_url": m.group(0) if m else "",
+        "log_tail": log_text,
+    }
+
+
+@app.post("/api/bqautoprep/gcal-auth")
+def api_bqautoprep_gcal_auth():
+    """Start the local Google Calendar readonly OAuth flow for BQ AutoPrep.
+
+    This is deliberately a local-only helper: it just runs the same script the README tells the
+    user to run by hand, then the user grants Google Calendar readonly access in the browser.
+    """
+    global _gcal_auth_proc, _gcal_auth_started
+    already_running = False
+    with _gcal_auth_lock:
+        if _gcal_auth_proc and _gcal_auth_proc.poll() is None:
+            already_running = True
+        if not already_running:
+            _gcal_auth_log.parent.mkdir(parents=True, exist_ok=True)
+            env = os.environ.copy()
+            env["PATH"] = env.get("PATH", "") + ":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+            with open(_gcal_auth_log, "ab") as lf:
+                lf.write(("\n===== UI gcal auth %s =====\n" %
+                          time.strftime("%Y-%m-%d %H:%M:%S")).encode())
+                lf.flush()
+                _gcal_auth_proc = subprocess.Popen(
+                    [str(cfgmod.ROOT / ".venv/bin/python"), "tools/gcal_auth.py"],
+                    cwd=str(cfgmod.ROOT),
+                    env=env,
+                    stdout=lf,
+                    stderr=lf,
+                    start_new_session=True,
+                )
+                _gcal_auth_started = time.time()
+    return _gcal_auth_snapshot()
+
+
+@app.get("/api/bqautoprep/gcal-auth")
+def api_bqautoprep_gcal_auth_status():
+    return _gcal_auth_snapshot()
+
+
 @app.get("/health", response_class=HTMLResponse)
 def health_page():
     """体检表：每个定时任务经 tools/hb_run.sh 打卡，这里读卡画灯（app/heartbeats.py）。"""
@@ -1469,11 +2445,18 @@ def health_page():
     icon = {"ok": "🟢", "fail": "🔴", "stale": "🔴", "never": "⚪"}
     order = {"fail": 0, "stale": 1, "ok": 2, "never": 3}
     rows.sort(key=lambda r: order[r["status"]])
+
+    def action(r: dict) -> str:
+        if r["name"] != "bqautoprep" or r["status"] not in ("fail", "stale"):
+            return ""
+        return ("<button onclick='fixBQGcal(this)'>重新授权日历</button>"
+                "<div id='bq-gcal-auth' class='small muted'></div>")
+
     trs = "".join(
         f"<tr><td>{icon[r['status']]}</td><td><b>{r['zh']}</b> <span class='d'>{r['name']}</span></td>"
         f"<td>{r['cadence']}</td><td>{r['finished'] or '—'}</td>"
         f"<td>{('%ds' % r['duration_s']) if r['duration_s'] is not None else '—'}</td>"
-        f"<td>{r['detail']}</td></tr>"
+        f"<td>{r['detail']}</td><td>{action(r)}</td></tr>"
         for r in rows)
     n_red = len(hbmod.red(rows))
     verdict = (f'<p class="tip" style="background:#fef2f2;border-color:#fecaca;color:#991b1b">'
@@ -1484,7 +2467,337 @@ def health_page():
       <p class="tip">原理：每个任务干完活会打一张卡。太久没打卡 = 失联；打了卡但退出码非 0 = 上次失败；
       ⚪ = 新任务还没到运行时间。看板网页本身不用打卡 — 你能打开这页就说明它活着。
       值班员每天 5 次巡查，发现<b>新出现的</b>红灯会弹 Mac 通知。</p>
-      <table><tr><th></th><th>任务</th><th>节奏</th><th>上次打卡</th><th>用时</th><th>状态</th></tr>{trs}</table>""")
+      <table><tr><th></th><th>任务</th><th>节奏</th><th>上次打卡</th><th>用时</th><th>状态</th><th>操作</th></tr>{trs}</table>
+      <script>
+      async function fixBQGcal(btn){{
+        const box=document.getElementById('bq-gcal-auth');
+        btn.disabled=true; btn.textContent='正在打开授权…';
+        box.textContent='如果浏览器弹出 Google 页面，选 sample-5fbfd918@example.com，然后点 Allow。';
+        try {{
+          await fetch('/api/bqautoprep/gcal-auth', {{method:'POST'}});
+          pollBQGcal(btn, box);
+        }} catch(e) {{
+          btn.disabled=false; btn.textContent='重新授权日历';
+          box.textContent='启动失败：'+e;
+        }}
+      }}
+      async function pollBQGcal(btn, box){{
+        const r=await fetch('/api/bqautoprep/gcal-auth');
+        const s=await r.json();
+        if(s.running){{
+          box.textContent='等待你在浏览器里完成授权…';
+          if(s.auth_url) box.innerHTML+=' 没弹窗就打开：<a href="'+s.auth_url+'" target="_blank">授权链接</a>';
+          setTimeout(()=>pollBQGcal(btn, box), 2000);
+          return;
+        }}
+        if(s.returncode===0){{
+          btn.textContent='授权完成'; box.textContent='已连接日历。刷新页面后红灯会在下次打卡更新。';
+          return;
+        }}
+        btn.disabled=false; btn.textContent='重新授权日历';
+        box.textContent='授权没有完成。再点一次按钮重试；如果仍失败，看日志 jobscan/logs/gcal_auth_ui.log。';
+      }}
+      </script>""")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 工作台设置 + Google 授权（owner 2026-09-23）。一个候选人一个 token（app/google_auth.py），
+# 走他浏览器里的 Google 同意页 → 回调到本进程 /oauth/google/callback。为什么不像上面的
+# gcal-auth 那样起子进程：同意必须在候选人点按钮的那个 Chrome profile 里完成（他的 Google
+# 账号登在那里），子进程只会打开这台机器的默认浏览器 —— 那是 owner 的。
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _google_redirect_uri() -> str:
+    """Loopback redirect for the 'Desktop app' OAuth client: any http://127.0.0.1:<port>/… is
+    accepted without registration, and the port is this workspace's own web port."""
+    port = int((cfg.get("ui") or {}).get("port", 8787))
+    return f"http://127.0.0.1:{port}/oauth/google/callback"
+
+
+@app.get("/api/google/auth/status")
+def api_google_auth_status():
+    return gauthmod.status(cfg)
+
+
+@app.post("/api/google/auth/start")
+def api_google_auth_start():
+    client = gauthmod.client_secret_path(cfg)
+    if not client.exists():
+        raise HTTPException(503, f"缺 OAuth client 文件：{client} —— 去 Google Cloud Console → APIs & Services → "
+                                 f"Credentials 建一个「Desktop app」类型的 OAuth client，下载 JSON 放到这个路径"
+                                 f"（config.yaml 的 google.client_secret 可改）。")
+    try:
+        return {"url": gauthmod.start_flow(cfg, _google_redirect_uri())}
+    except Exception as e:  # noqa: BLE001 — surface the reason on the page (the message never carries the secret)
+        raise HTTPException(500, f"启动授权失败：{type(e).__name__}: {e}")
+
+
+@app.post("/api/google/auth/revoke")
+def api_google_auth_revoke():
+    return gauthmod.revoke(cfg)
+
+
+_RED_TIP = 'class="tip" style="background:#fef2f2;border-color:#fecaca;color:#991b1b"'
+
+
+@app.get("/oauth/google/callback", response_class=HTMLResponse)
+def oauth_google_callback(state: str = "", code: str = "", error: str = ""):
+    """Google sends the browser back here after consent. Exchanges the code, saves the
+    workspace token, and says WHICH account got authorized (the Chrome profile may have been
+    logged into the wrong one)."""
+    from html import escape as esc
+    back = '<p><a class="b" href="/settings">← 回到工作台设置</a></p>'
+    if error or not code:
+        return _page("Google 授权", f'<h1>❌ 授权没有完成</h1><p class="tip">Google 返回：'
+                     f'<code>{esc(error or "没有 code 参数")}</code>。回设置页再点一次「授权 Google」。</p>{back}')
+    try:
+        st = gauthmod.finish_flow(cfg, state, code)
+    except Exception as e:  # noqa: BLE001 — shown to the person; never includes the token
+        return _page("Google 授权", f'<h1>❌ 授权失败</h1><p {_RED_TIP}>{esc(type(e).__name__)}: {esc(str(e))}</p>'
+                     f'<p class="tip">常见原因：链接过期（超过 10 分钟）、这个 Google 账号还没加进 Cloud 项目的 '
+                     f'Test users、或者同意页上把 Gmail 那一项取消了。</p>{back}')
+    acct = esc(st.get("account") or "（没拿到账号邮箱）")
+    body = f"<h1>✅ 已授权 {acct}</h1>"
+    if st.get("account_matches") is False:
+        body += (f'<p {_RED_TIP}><b>⚠️ 账号不对。</b>这个工作台配置的邮箱是 <b>{esc(st.get("expected_account") or "")}</b>，'
+                 f'但刚授权的是 <b>{acct}</b> —— 多半是这个 Chrome profile 里登着别人的 Google 账号。'
+                 f'先在 Chrome 右上角切到正确的账号，再 <a href="/settings">回设置页重新授权</a>（会覆盖这次的 token）。</p>')
+    elif st.get("account_matches") is None:
+        body += '<p class="tip">没能核对账号邮箱（userinfo 没返回）。回设置页看状态里显示的账号是不是他的。</p>'
+    granted = [n for ok, n in ((st.get("mail_scope"), "Gmail（IMAP/SMTP）"),
+                               (st.get("calendar_scope"), "Calendar 只读")) if ok]
+    body += f'<p>拿到的权限：{esc("、".join(granted) or "—")}。token 存在 <code>{esc(st["token_path"])}</code>。</p>'
+    if not st.get("mail_scope"):
+        body += (f'<p {_RED_TIP}>没拿到 Gmail 权限 —— 同意页上 Gmail 那一项被取消了，邮箱功能不会亮。'
+                 f'回设置页重新授权时把它勾上。</p>')
+    body += back + '<p class="tip">这个标签页可以关了；设置页会自己刷新状态。</p>'
+    return _page("Google 授权", body)
+
+
+_SETTINGS_JS = """
+<script>
+async function gauthStart(btn){
+  const box=document.getElementById('gauth-box'), fb=document.getElementById('gauth-fallback');
+  const label=btn.textContent; btn.disabled=true; btn.textContent='正在拿授权链接…';
+  // Open the tab synchronously (inside the click) so the popup blocker lets it through, then
+  // point it at Google once the URL arrives. Same browser profile = the candidate's Google login,
+  // which is the whole point — a copy-pasted URL in another window would consent as someone else.
+  const w=window.open('', '_blank');
+  try{
+    const r=await fetch('/api/google/auth/start',{method:'POST'});
+    const j=await r.json();
+    if(!r.ok){ if(w) w.close(); box.textContent='启动失败：'+(j.detail||r.status); btn.disabled=false; btn.textContent=label; return; }
+    if(w){ w.location=j.url; }
+    fb.innerHTML='没弹出新标签？<a href="'+j.url+'" target="_blank">点这里打开 Google 授权页</a>'
+      +'<div class="small muted" style="word-break:break-all;margin-top:4px">'+j.url+'</div>';
+    box.textContent='在新标签页里选他的 Google 账号 → 同意。完成后这页会自己刷新。';
+    gauthPoll();
+  }catch(e){ if(w) w.close(); box.textContent='启动失败：'+e; btn.disabled=false; btn.textContent=label; }
+}
+let _gauthWas=null;
+async function gauthPoll(){
+  try{
+    const r=await fetch('/api/google/auth/status'); const s=await r.json();
+    const sig=JSON.stringify([s.authorized,s.account,s.scopes]);
+    if(_gauthWas===null){ _gauthWas=sig; }
+    else if(sig!==_gauthWas){ location.reload(); return; }
+  }catch(e){}
+  setTimeout(gauthPoll, 3000);
+}
+async function gauthRevoke(btn){
+  if(!confirm('撤销这个工作台的 Google 授权？邮箱和日历功能会立刻变灰，要用得重新授权。')) return;
+  btn.disabled=true;
+  try{ await fetch('/api/google/auth/revoke',{method:'POST'}); }catch(e){}
+  location.reload();
+}
+</script>
+"""
+
+
+class PaceIn(BaseModel):
+    mode: str
+    until: str | None = None             # ISO date; overrides the default auto-revert date
+    auto_revert: bool = True             # False = keep a low level until she changes it
+    companies_per_day: int | str | None = None   # custom only
+    tailor_per_day: int | str | None = None      # custom only; defaults to companies_per_day
+
+
+@app.get("/api/pace")
+def api_pace_get(conn=Depends(view_conn)):
+    """Current 投递节奏 level + today's progress (frozen / handled / résumés queued)."""
+    eff = pacemod.effective(conn, cfg)
+    today = store.la_today()
+    return {**eff, "today": today, "frozen_today": pacemod.frozen_count(conn, cfg, today),
+            "tailored_today": pacemod.tailored_today(conn, today)}
+
+
+@app.post("/api/pace")
+def api_pace_set(body: PaceIn, conn=Depends(view_conn)):
+    """Switch 投递节奏. Takes effect on the next page load (the day's frozen list tops up when
+    the level goes up; a lower level shows only the first N of it)."""
+    try:
+        return pacemod.set_mode(conn, cfg, body.mode, until=body.until or None,
+                                auto_revert=body.auto_revert,
+                                companies_per_day=body.companies_per_day,
+                                tailor_per_day=body.tailor_per_day)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+
+
+def _pace_section(conn) -> str:
+    """设置页「投递节奏」一块：五个档位按钮 + 自定义两个数 + 自动恢复日期。"""
+    from html import escape as esc
+    eff = pacemod.effective(conn, cfg)
+    today = store.la_today()
+    tomorrow = (datetime.date.fromisoformat(today) + datetime.timedelta(days=1)).isoformat()
+    frozen = pacemod.frozen_count(conn, cfg, today)
+    tailored = pacemod.tailored_today(conn, today)
+
+    def lim(v, unit):
+        return "不限" if v is None else f"{v} {unit}"
+    if eff["reverted_from"]:
+        state = (f"已自动回到 <b>{esc(eff['label'])}</b>（之前设的「{esc(eff['reverted_label'])}」到期了）")
+    elif eff["until"]:
+        state = f"<b>{esc(eff['label'])}</b>，到 <b>{esc(eff['until'])}</b> 自动回「{esc(eff['revert_label'])}」"
+    else:
+        state = f"<b>{esc(eff['label'])}</b>"
+    progress = (f"今天已冻结 {frozen} 家 · 已排 {tailored} 份简历"
+                if eff["limited"] else "冲刺档不冻结名单、不限简历数（每轮最多 batch_cap 份）")
+    btns = []
+    for lv in eff["levels"]:
+        on = " on" if lv["mode"] == eff["mode"] else ""
+        desc = (f"每天 {lim(lv['companies_per_day'], '家')} · 简历 {lim(lv['tailor_per_day'], '份')}"
+                if lv["mode"] != "custom" else "自己填两个数")
+        btns.append(f"<button class='pace-btn{on}' data-mode='{lv['mode']}' onclick='paceSet(this)'>"
+                    f"<b>{esc(lv['label'])}</b><br><span class='small muted'>{desc}</span></button>")
+    custom = next(lv for lv in eff["levels"] if lv["mode"] == "custom")
+    return f"""
+      <h2 id="pace">投递节奏</h2>
+      <p class="tip">控制 review 页<b>每天推几家公司</b>、autotailor <b>每天做几份新简历</b>。扫描照常一天四轮，岗位一个不漏；
+      少推的只是排到明天。每天第一次打开 review 页时，按「匹配分 + 新鲜度」取最前面的 N 家、每家一个岗位冻结成当天名单；
+      处理一家少一家，不会补新的。低于「{esc(eff['revert_label'])}」的档默认 {eff['revert_days']} 天后自动回「{esc(eff['revert_label'])}」。</p>
+      <table>
+        <tr><th style='width:160px'>现在</th><td>{state}</td></tr>
+        <tr><th>今天</th><td>{esc(progress)}</td></tr>
+      </table>
+      <div class="pace-row">{''.join(btns)}</div>
+      <div class="pace-opts small">
+        自定义：每天推 <input id="pace-cpd" type="number" min="0" max="{pacemod.CUSTOM_MAX}" value="{custom['companies_per_day']}" style="width:64px"> 家，
+        做 <input id="pace-tpd" type="number" min="0" max="{pacemod.CUSTOM_MAX}" value="{custom['tailor_per_day']}" style="width:64px"> 份新简历
+        <span class="muted">（选「自定义」时生效）</span><br>
+        自动恢复：<input id="pace-until" type="date" min="{tomorrow}"> <span class="muted">（留空 = {eff['revert_days']} 天后）</span>
+        <label style="margin-left:10px"><input id="pace-norevert" type="checkbox"> 不自动恢复</label>
+      </div>
+      <div id="pace-msg" class="small"></div>
+      <style>
+        .pace-row {{ display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 6px; }}
+        .pace-btn {{ min-width:118px; padding:8px 10px; text-align:left; border-radius:6px; line-height:1.35; }}
+        .pace-btn.on {{ background:#1a1d21; color:#fff; border-color:#1a1d21; }}
+        .pace-btn.on .muted {{ color:#cbd5e1; }}
+        .pace-opts {{ margin:4px 0 8px; line-height:2; }}
+      </style>
+      <script>
+      async function paceSet(btn) {{
+        const mode = btn.dataset.mode;
+        const body = {{ mode, until: document.getElementById('pace-until').value || null,
+                        auto_revert: !document.getElementById('pace-norevert').checked }};
+        if (mode === 'custom') {{
+          body.companies_per_day = document.getElementById('pace-cpd').value;
+          body.tailor_per_day = document.getElementById('pace-tpd').value;
+        }}
+        const msg = document.getElementById('pace-msg');
+        msg.textContent = '保存中…';
+        const r = await fetch('/api/pace', {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+                                             body: JSON.stringify(body) }});
+        if (!r.ok) {{ msg.textContent = '没保存上：' + (await r.text()); return; }}
+        location.reload();
+      }}
+      </script>"""
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def settings_page(conn=Depends(view_conn)):
+    """工作台设置：投递节奏、这台子是谁的、邮箱/日历接没接上、一键授权 Google。"""
+    from html import escape as esc
+    st = gauthmod.status(cfg)
+    prof = cfg.get("profile") or {}
+    mc = cfg.get("mailcode") or {}
+    ws = cfgmod.workspace_name(cfg) or "default"
+    _mc, _addr, secret = mailmod._cfg(cfg)
+    cred_kind = ("Google OAuth token" if isinstance(secret, mailmod.OAuthSecret)
+                 else ("secrets.yaml app password" if secret else "无"))
+    mail_on = mailmod.available(cfg)
+    cal_on = gcalmod.available(cfg)
+
+    def row(k, v):
+        return f"<tr><th style='width:160px'>{esc(k)}</th><td>{v}</td></tr>"
+
+    prof_rows = "".join(row(k, esc(str(prof.get(f) or "—"))) for k, f in (
+        ("姓", "last_name"), ("名", "first_name"), ("邮箱", "email"), ("电话", "phone"), ("所在地", "location")))
+
+    if st["authorized"]:
+        acct = esc(st["account"] or "（账号未知）")
+        g_line = f"🟢 已授权 <b>{acct}</b>"
+        if st.get("account_blocked"):
+            # finish_flow refuses such a token, so this is a hand-copied / pre-check file. It is
+            # ignored (mail_scope/calendar_scope False) — say why instead of "没有 Gmail 权限".
+            g_line += (f' <span class="pill" style="background:#fee2e2;color:#991b1b">'
+                       f'{"账号不匹配" if st["account_matches"] is False else "账号未知"}</span>'
+                       f'<div {_RED_TIP}>工作台期待的是 <b>{esc(st["expected_account"] or "")}</b>，这个 token 不会被使用'
+                       f'（邮箱/日历都不亮）。撤销后在 Chrome 右上角切到正确的 Google 账号重新授权。</div>')
+        granted = [n for ok, n in ((st["mail_scope"], "Gmail（IMAP/SMTP）"),
+                                   (st["calendar_scope"], "Calendar 只读")) if ok]
+        g_rows = (row("Google 账号", g_line)
+                  + row("拿到的权限", esc("、".join(granted) or "—")
+                        + ("" if st["mail_scope"] or st.get("account_blocked")
+                           else f'<div {_RED_TIP}>没有 Gmail 权限：重新授权时把 Gmail 勾上。</div>'))
+                  + row("access token 到期", esc(st["expiry"] or "—") + ' <span class="small muted">（自动刷新，不用管）</span>'))
+        auth_btn = "重新授权 Google"
+        revoke_btn = "<button onclick='gauthRevoke(this)' style='margin-left:8px'>撤销授权</button>"
+    else:
+        g_rows = row("Google 账号", "⚪ 未授权")
+        auth_btn = "授权 Google（Gmail + Calendar）"
+        revoke_btn = ""
+    client_line = (f"✅ <code>{esc(str(gauthmod.client_secret_path(cfg)))}</code>" if st["client_present"]
+                   else f'<span {_RED_TIP}>❌ 缺 <code>{esc(str(gauthmod.client_secret_path(cfg)))}</code> —— '
+                        f'Google Cloud Console → Credentials → 建「Desktop app」OAuth client → 下载 JSON 放到这里。</span>')
+    g_rows += row("OAuth client", client_line) + row("token 文件", f"<code>{esc(st['token_path'])}</code>")
+
+    mail_line = (f"{'🟢 可用' if mail_on else '⚪ 不可用'} · mailcode.enabled={'true' if mc.get('enabled') else 'false'} · "
+                 f"邮箱 {esc(_addr or '—')} · 凭据：{esc(cred_kind)}")
+    if st["authorized"] and st["calendar_scope"]:
+        cal_line = "🟢 已连接（这个工作台自己的 token）"
+    elif cal_on:
+        cal_line = "🟡 已连接，但沿用的是共享的旧 token（tools/gcal_auth.py，owner 的日历）—— 授权 Google 后会换成这个工作台自己的"
+    else:
+        cal_line = "⚪ 未连接"
+
+    return _page("Settings", f"""<h1>⚙ 工作台设置 <span class="pill lo">{esc(ws)}</span></h1>
+      {_pace_section(conn)}
+      <h2>这是谁的台子</h2>
+      <table>{prof_rows}</table>
+      <h2>Google 授权（Gmail + Calendar）</h2>
+      <p class="tip">一个 token 同时打通邮箱（IMAP/SMTP，不用 app password）和日历只读。token 只存在本机这个工作台的目录里。</p>
+      <table>{g_rows}</table>
+      <p><button onclick='gauthStart(this)'>{auth_btn}</button>{revoke_btn}</p>
+      <div id="gauth-box" class="small muted"></div>
+      <div id="gauth-fallback" class="small"></div>
+      <h2>接通状态</h2>
+      <table>{row("邮箱", mail_line)}{row("日历", cal_line)}</table>
+      <h2>怎么做</h2>
+      <ol>
+        <li>在<b>这个候选人的 Chrome profile</b> 里打开这一页（右上角头像是他的 Google 账号）。</li>
+        <li>点上面的「{auth_btn}」。</li>
+        <li>新标签页里选<b>他的</b> Google 账号。</li>
+        <li>同意页上把 Gmail 和 Calendar 两项都勾上，点 Continue / Allow。</li>
+        <li>回到这一页 —— 它会自己刷新；没刷就手动刷新，看「Google 账号」一行是不是他的邮箱。</li>
+      </ol>
+      <p class="tip"><b>前提（一次性）：</b>这个 Google Cloud 项目的 OAuth consent screen 多半还是 <b>Testing</b> 模式，
+      所以候选人的 Google 账号必须先加进 <b>Test users</b>（Google Cloud Console → APIs &amp; Services →
+      OAuth consent screen → Test users），否则同意页会直接拒绝。受限范围 <code>https://mail.google.com/</code>
+      对 Test users 不需要走应用审核。</p>
+      {_SETTINGS_JS}""")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1522,6 +2835,11 @@ def _recite_item(conn, item_id: str) -> dict:
         except Exception:
             d[k] = []
     d["canon_spans"] = recitemod.canon_spans(d.get("script") or "")
+    try:
+        d["dialog"] = json.loads(d.get("dialog") or "null")
+    except Exception:
+        d["dialog"] = None
+    d["dialog_followups"] = _recite_merge_followups(d.get("followup_q") or "", d["dialog"])
     return d
 
 
@@ -1546,11 +2864,50 @@ def _recite_has_audio(slot: str, item_id: str) -> bool:
         return False
 
 
+def _recite_dialog_followups(dialog) -> list[dict]:
+    turns = (dialog or {}).get("turns") or []
+    out: list[dict] = []
+    cur: dict | None = None
+    seen_answer = False
+    for t in turns:
+        if not isinstance(t, dict):
+            continue
+        sp = t.get("sp")
+        text = (t.get("x") or "").strip()
+        if not text:
+            continue
+        if sp == "me":
+            seen_answer = True
+            cur = None
+            continue
+        if sp != "iv" or not seen_answer:
+            continue
+        if cur is None:
+            cur = {"x": text, "s": t.get("s", 0)}
+            out.append(cur)
+        else:
+            cur["x"] = f"{cur['x']} {text}"
+    return out
+
+
+def _recite_merge_followups(explicit: str, dialog) -> list[dict]:
+    out = []
+    explicit = (explicit or "").strip()
+    if explicit:
+        out.append({"x": explicit, "s": 0, "source": "recap"})
+    for f in _recite_dialog_followups(dialog):
+        fx = (f.get("x") or "").strip()
+        if fx and not any(fx in (x["x"] or "") or (x["x"] or "") in fx for x in out):
+            out.append(f)
+    return out
+
+
 def _recite_library(conn) -> list[dict]:
     """全部条目（含 script 为空的）按 公司 → 场次 分组。库优先：这一页就是总库。"""
     rows = [dict(r) for r in conn.execute(
         "SELECT i.item_id, i.company, i.interview, i.kind, i.question, i.question_zh,"
         "       i.target_sec, i.script, i.quality, i.deferred, i.link_group,"
+        "       i.followup_q, i.dialog,"
         "       s.box, s.last_total, s.archived,"
         # n_takes 只在评分发生时才涨（apply_outcome），而 v2 里评分是可选的 —— 直接数
         # recite_takes，否则她录了五遍库里还写「练过 0 次」。
@@ -1564,7 +2921,13 @@ def _recite_library(conn) -> list[dict]:
         d["has_ref"] = _recite_has_audio("ref", d["item_id"])
         d["title"] = (d.get("question") or d.get("question_zh") or d["item_id"]).strip()
         d["subtitle"] = (d.get("question_zh") or "").strip()
+        try:
+            dlg = json.loads(d.get("dialog") or "null")
+        except Exception:
+            dlg = None
+        d["followup_count"] = len(_recite_merge_followups(d.get("followup_q") or "", dlg))
         d.pop("script", None)
+        d.pop("dialog", None)
     return rows
 
 
@@ -1642,6 +3005,7 @@ def recite_item_page(item_id: str, request: Request, conn=Depends(view_conn)):
             except Exception:
                 t[k] = None
     it["has_orig"] = _recite_has_audio("orig", item_id)
+    it["has_dialog"] = _recite_has_audio("dialog", item_id)
     n_recorded = conn.execute("SELECT COUNT(*) n FROM recite_takes WHERE item_id=?",
                               (item_id,)).fetchone()["n"]
     # 同一场次的邻居 —— 练完一条能直接跳下一条，不用回库再找。
@@ -1682,6 +3046,8 @@ def recite_audio(item_id: str, slot: str, conn=Depends(view_conn)):
         p = root / "ref" / f"{item_id}.mp3"
     elif slot == "orig":
         p = root / "orig" / f"{item_id}.mp3"
+    elif slot == "dialog":
+        p = root / "dialog" / f"{item_id}.mp3"
     elif slot.startswith("take-"):
         _recite_conn(conn)
         row = conn.execute("SELECT audio_path FROM recite_takes WHERE id=? AND item_id=?",

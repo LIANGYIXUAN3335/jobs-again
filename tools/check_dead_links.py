@@ -141,7 +141,11 @@ def main() -> None:
                                        "why": "no apply_url"})
                 continue
             time.sleep(args.delay)
-            if r["job_id"].startswith("li:"):
+            # li: rows whose apply_url was swapped to the company's own board (li_resolve,
+            # 2026-09-15) are judged by THAT link: LinkedIn pulling its copy says nothing
+            # about the real posting, and deleting on the LinkedIn signal would kill a live
+            # opportunity that just got its direct link.
+            if r["job_id"].startswith("li:") and "linkedin.com" in url:
                 # www.linkedin.com/jobs/view/<id> bounces an anonymous client to a login
                 # wall, so every LinkedIn role read as "blocked". The GUEST posting endpoint
                 # the nightly already uses needs no session and 404s a pulled posting — same

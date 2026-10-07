@@ -156,6 +156,9 @@ _RECITE_MIGRATIONS = [
     ("recite_items", "speaker_name", "TEXT"),       # 这场面试官叫她什么（Lisa/Joy） [PM-问题5.3]
     ("recite_items", "asr_dirty", "INTEGER DEFAULT 0"),       # orig_text 有 ASR 坏词 [PATCH 12]
     ("recite_items", "extra_cues", "TEXT"),         # [:4] 截掉的 content，灰字加分项 [PM-§C-4]
+    ("recite_items", "dialog", "TEXT"),             # json turns：提问→回答→追问全往返（她的要求：
+                                                    # follow-up 不许从上下文里切走，8/31）
+    ("recite_items", "dialog_audio", "TEXT"),       # data/recite/dialog/<id>.mp3，同一窗口的原声
     ("recite_state", "exposed", "INTEGER DEFAULT 0"),         # 曝光轮由它驱动      [MEM2-P1-4b]
     ("recite_state", "exposure_stage", "INTEGER DEFAULT 0"),  # A0 可中断可恢复      [PM-问题5.1]
     ("recite_state", "exposure_at", "TEXT"),        # A0-② 的时刻，>2h 恢复要重走    [MEM3-3b]

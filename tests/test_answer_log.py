@@ -6,6 +6,7 @@ the three behaviors the eval pipeline depends on: every outcome is persisted, [N
 questions are left blank instead of answered, and eval lessons feed back into the prompt.
 """
 import json
+import re
 import sys
 from types import SimpleNamespace
 
@@ -75,7 +76,7 @@ def test_answer_questions_leaves_needs_human_blank_and_logs_everything(
         "Current job title?",
         "Call our API at https://x.test/ping and paste the output.",
         "Anything else?",
-        "Do you require visa sponsorship?",
+        "What is your desired salary?",      # sponsorship left this list 2026-09-09: legal is answerable now
     ])
     assert out == {"Current job title?": "Software Engineer"}   # blank ≠ "I can't do that"
     by_reason = {}
@@ -84,7 +85,7 @@ def test_answer_questions_leaves_needs_human_blank_and_logs_everything(
             by_reason[r["reason"]] = r["question"]
         else:
             assert r["kind"] == "answer" and r["answer"] == "Software Engineer"
-    assert "sponsorship" in by_reason["never_filter"]
+    assert "salary" in by_reason["never_filter"]
     assert "Call our API" in by_reason["needs_human"]
     assert by_reason["model_declined"] == "Anything else?"
 
@@ -130,3 +131,98 @@ def test_pick_option_logs_choice_and_never_filter(cfg, monkeypatch, tmp_path):
     recs = _records(log_path)
     assert recs[0]["index"] == -1 and recs[0]["reason"] == "never_filter"
     assert recs[1]["index"] == 1 and recs[1]["answer"] == "3-5"
+
+
+# ── 2026-09-22: work-authorization / sponsorship autofill ────────────────────────────────
+# The picker's prompt still told the model to REFUSE these two questions (answer -1) months
+# after the 2026-09-09 rescope; 560 of 605 logged legal picks came back blank, and the
+# free-text path volunteered I-485 / green-card details against the 2026-08-07 canonical.
+
+def _capturing_anthropic(monkeypatch, reply: str):
+    sent = {}
+    def create(**kwargs):
+        sent["messages"] = kwargs["messages"]
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text=reply)])
+    mod = SimpleNamespace(Anthropic=lambda api_key=None: SimpleNamespace(
+        messages=SimpleNamespace(create=create)))
+    monkeypatch.setitem(sys.modules, "anthropic", mod)
+    return sent
+
+
+def test_pick_option_instructs_legal_answers_instead_of_forbidding_them(cfg, monkeypatch, tmp_path):
+    log_path = _patch_log_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(aimod, "load_key", lambda c: "test-key")
+    role = {"job_id": "gh:x:1", "company": "X", "title": "SWE"}
+    sent = _capturing_anthropic(monkeypatch, "1")
+    q = "Will you now or in the future require sponsorship to work in the US?"
+    assert aimod.pick_option(cfg, role, q, ["Yes", "No"]) == 1      # not never-filtered, model's pick used
+    prompt = sent["messages"][0]["content"]
+    assert "Do not answer work authorization" not in prompt
+    assert re.search(r"authorized to work in the US\?", prompt)
+    assert "Employment Authorization Document" in prompt
+    assert "-1 ONLY for salary" in prompt
+    rec = _records(log_path)[-1]
+    assert rec["kind"] == "pick_option" and rec["answer"] == "No" and "reason" not in rec
+    # salary is still machine-blank
+    assert aimod.pick_option(cfg, role, "Desired salary?", ["a", "b"]) == -1
+
+
+def test_facts_carry_the_canonical_work_authorization_sentence(cfg):
+    role = {"job_id": "gh:x:1", "company": "X", "title": "SWE"}
+    facts = aimod._facts(cfg, role)
+    assert "I'm authorized to work in the US and I don't require sponsorship." in facts
+    assert "Do NOT volunteer" in facts
+    # config override travels through
+    c2 = dict(cfg); c2["profile"] = {**cfg["profile"], "work_authorization_answer": "CANON-X"}
+    assert '"CANON-X"' in aimod._facts(c2, role)
+
+
+def test_hard_reject_blocks_an_h1b_self_claim_but_not_a_denial(cfg):
+    """The owner's "never claim to hold an H-1B" rule lives in HER config (ai.reject_phrases,
+    2026-09-23) — it is a fact about one candidate, so a second workspace (F-1 OPT, needs
+    H-1B) must not inherit it from code."""
+    assert aimod._hard_reject("I'm currently on an H-1B and would need a transfer.", cfg) == "config_phrase"
+    assert aimod._hard_reject("I hold an H1B visa through my employer.", cfg) == "config_phrase"
+    assert aimod._hard_reject("No, I don't need H-1B sponsorship now or in the future.", cfg) is None
+    assert aimod._hard_reject("I'm authorized to work in the US and I don't require sponsorship.", cfg) is None
+    other = {**cfg, "ai": {**cfg["ai"], "reject_phrases": []}}
+    assert aimod._hard_reject("I'm on F-1 OPT and will need H-1B sponsorship.", other) is None
+    assert aimod._hard_reject("As an AI language model I cannot.", None) == "ai_disclosure"   # built-ins stay
+
+
+def test_prompts_and_facts_follow_the_workspace(cfg, tmp_path):
+    """Second-workspace contract (owner 2026-09-23): name, employers, legal facts and the picker's
+    legal guidance all come from the config + résumé base, never from the owner's identity."""
+    import yaml
+    base = {"name": "Test Person", "contact": {"email": "sample-c6dd0cb5@example.com"},
+            "education": [{"school": "Test University", "degree": "M.S.", "dates": "2020"}],
+            "skills_master": {"Languages": ["Java"]},
+            "experience": [{"company": "Acme Corp", "title": "SWE", "location": "Austin, TX", "dates": "2021-2024",
+                            "bullets_master": ["Built the thing."]},
+                           {"company": "Beta LLC", "title": "SWE", "location": "Austin, TX", "dates": "2018-2021",
+                            "bullets_master": ["Built another thing."]}]}
+    bp = tmp_path / "base.yaml"; bp.write_text(yaml.safe_dump(base), encoding="utf-8")
+    ws = {**cfg, "resume_base": str(bp),
+          "profile": {**cfg["profile"], "work_authorized": True, "needs_sponsorship": True,
+                      "visa_status_pick": ["F-1 OPT", "EAD"], "status_terms_wrong": ["citizen", "permanent resident"],
+                      "legal_facts": ["Immigration: F-1 OPT; will require H-1B sponsorship"],
+                      "work_authorization_answer": "I'm on F-1 OPT and will need sponsorship.", "relocation": "open to relocate"}}
+    sysp = aimod._personalize(aimod._SYSTEM, ws)
+    assert "Test Person" in sysp and "Acme Corp" in sysp and "Test University" in sysp
+    for leak in ("Casey", "TikTok", "Illinois"):
+        assert leak not in sysp
+    facts = aimod._facts(ws, {"job_id": "gh:x:1", "company": "X", "title": "SWE"})
+    assert "F-1 OPT; will require H-1B" in facts and "I'm on F-1 OPT and will need sponsorship." in facts
+    assert "GC-EAD" not in facts and "I-485" not in facts
+    g = aimod._legal_guidance(ws)
+    assert "'require visa sponsorship now or in the future?' → Yes" in g and "F-1 OPT / EAD" in g
+    # the owner's config still reads as the owner
+    g0 = aimod._legal_guidance(cfg)
+    assert "'require visa sponsorship now or in the future?' → No" in g0
+
+
+def test_never_filter_does_not_catch_preferred():
+    from app import ai
+    assert not ai._NEVER.search("Which of the preferred qualifications have you acquired?")
+    assert ai._NEVER.search("Were you referred by an employee? Referral name:")
+    assert ai._NEVER.search("What is your desired salary?")
