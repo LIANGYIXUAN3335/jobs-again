@@ -27,6 +27,8 @@ from pathlib import Path
 import yaml
 
 BASE = Path(__file__).resolve().parent.parent          # jobscan/
+sys.path.insert(0, str(BASE))
+from app import mail as _mail  # noqa: E402 — imap_login: the one IMAP login path (str or OAuth)
 
 
 def _creds():
@@ -82,7 +84,7 @@ def main():
     body_cap = 3000 if args.full else 600
 
     M = imaplib.IMAP4_SSL("imap.gmail.com")
-    M.login(addr, pw)
+    _mail.imap_login(M, addr, pw)
     try:
         for folder in ('"[Gmail]/All Mail"', "INBOX"):
             try:

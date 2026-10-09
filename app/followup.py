@@ -199,11 +199,20 @@ def resolve_contact(cfg: dict, conn, company: str, days: int = 120) -> dict | No
     return None
 
 
+def _system_for(cfg: dict) -> str:
+    """The follow-up voice for THIS workspace's candidate (owner 2026-09-23: name and sign-off
+    used to be the owner's, hardcoded)."""
+    from . import ai as aimod, tailoring
+    prof = cfg.get("profile") or {}
+    first = prof.get("preferred_name") or prof.get("first_name") or tailoring.candidate_name(cfg).split()[0]
+    return aimod._personalize(_SYSTEM, cfg).replace("__FIRST__", first)
+
+
 _SYSTEM = """You write ONE short follow-up note for a job application that has had no reply. \
-First person, as the candidate, Casey Example.
+First person, as the candidate, __NAME__.
 
 Hard rules:
-- 60-120 words. Shorter is better. No subject line, no signature beyond "Best,\\nCasey".
+- 60-120 words. Shorter is better. No subject line, no signature beyond "Best,\\n__FIRST__".
 - Every substantive claim must come from the SUBMITTED RÉSUMÉ below. This is a reminder of an \
 application they already have, not a new pitch: introducing a skill, project, or number that \
 wasn't in the submitted materials is fabrication. If you want to say something you can't source \
@@ -224,8 +233,7 @@ def draft(cfg: dict, conn, job_id: str, *, channel: str = "email") -> dict:
     role = store.get_role(conn, job_id)
     if not role:
         raise ValueError(f"unknown job_id {job_id!r}")
-    key = aimod.load_key(cfg)
-    if not key or not aimod.available(cfg):
+    if not aimod.available(cfg):
         raise RuntimeError("AI drafting is off (needs ai.enabled + a key in secrets.yaml)")
 
     # The submitted résumé — the ONLY source of claims. Fall back to the base only if this role
@@ -258,18 +266,8 @@ def draft(cfg: dict, conn, job_id: str, *, channel: str = "email") -> dict:
         f"{trust.fence('job description', role.get('jd_text'), 3500)}\n{prior}\n"
         f"Write the follow-up note."
     )
-    import anthropic
-    ai = cfg.get("ai") or {}
-    client = anthropic.Anthropic(api_key=key)
-    resp = client.messages.create(
-        model=ai.get("model", "claude-opus-4-8"),
-        max_tokens=1200,
-        thinking={"type": "adaptive"},
-        output_config={"effort": ai.get("effort", "high")},
-        system=_SYSTEM,
-        messages=[{"role": "user", "content": user}],
-    )
-    body = "".join(b.text for b in resp.content if b.type == "text").strip()
+    from . import ai as aimod
+    body = aimod.complete(cfg, system=_system_for(cfg), user=user, max_tokens=1200).strip()
     contact = resolve_contact(cfg, conn, role["company"]) if channel == "email" else None
     return {
         "job_id": job_id, "company": role["company"], "title": role["title"],

@@ -17,20 +17,38 @@ from . import mail, store
 
 
 def _scan_with_retry(cfg: dict, days: int, attempts: int = 3) -> dict:
-    """IMAP sometimes drops long reads mid-FETCH. Treat that as transport, not data."""
+    """IMAP sometimes drops long reads mid-FETCH. Treat that as transport, not data.
+
+    双邮箱（2026-09-09）：逐个扫 mailcode._accounts 里的每个邮箱再合并 —— 小号 candidate
+    名下公司的回信只会出现在小号收件箱。一个邮箱彻底失败不拖死另一个：只有全军覆没才抛。"""
+    from . import mailcode
+    merged: dict | None = None
     last: Exception | None = None
-    for i in range(attempts):
-        try:
-            return scan(cfg, days=days)
-        except (imaplib.IMAP4.abort, OSError) as e:
-            last = e
-            if i == attempts - 1:
+    for account in mailcode._accounts(cfg):
+        for i in range(attempts):
+            try:
+                res = scan(cfg, days=days, account=account)
+            except (imaplib.IMAP4.abort, OSError) as e:
+                last = e
+                if i == attempts - 1:
+                    print(f"mailbox {account[1]} failed after {attempts} attempts: {e}",
+                          file=sys.stderr, flush=True)
+                    break
+                wait = 5 * (i + 1)
+                print(f"IMAP transport error; retrying in {wait}s ({i + 1}/{attempts}): {e}",
+                      file=sys.stderr, flush=True)
+                time.sleep(wait)
+            else:
+                if merged is None:
+                    merged = res
+                else:
+                    merged["scanned"] += res["scanned"]
+                    merged["matched"] += res["matched"]
+                    merged["proposals"] += res["proposals"]
                 break
-            wait = 5 * (i + 1)
-            print(f"IMAP transport error; retrying in {wait}s ({i + 1}/{attempts}): {e}",
-                  file=sys.stderr, flush=True)
-            time.sleep(wait)
-    raise last or RuntimeError("outcomes scan failed")
+    if merged is None:
+        raise last or RuntimeError("outcomes scan failed")
+    return merged
 
 # --- what an email means. Order matters: the first match wins, most decisive first. ---
 _SIGNALS: list[tuple[str, str, str, re.Pattern]] = [
@@ -321,7 +339,7 @@ def _match(company_hint: str, title_hint: str, subject: str, by_co: dict) -> lis
     cn = applied_scan._norm(company_hint)
     if not cn or len(cn) < 3:
         return []
-    hits = [r for co, rs in by_co.items() if (cn in co or co in cn) for r in rs]
+    hits = [r for co, rs in by_co.items() if applied_scan._co_eq(cn, co) for r in rs]
     if title_hint and len(hits) > 1:
         tn = applied_scan._norm(title_hint)
         titled = [r for r in hits if tn and (tn in applied_scan._norm(r["title"])
@@ -432,11 +450,14 @@ def committable(p: dict) -> bool:
 
 # --- the live scan ---------------------------------------------------------------------------
 
-def scan(cfg: dict, days: int = 120, max_emails: int = 600) -> dict:
-    """Return {proposals: [...], scanned, matched}. Nothing is written."""
-    mc, addr, pw = mail._creds(cfg)
+def scan(cfg: dict, days: int = 120, max_emails: int = 600,
+         account: tuple[dict, str, str] | None = None) -> dict:
+    """Return {proposals: [...], scanned, matched}. Nothing is written.
+    `account` picks which mailbox to read (default: primary); callers wanting every
+    configured mailbox go through _scan_with_retry."""
+    mc, addr, pw = account or mail._creds(cfg)
     M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"), timeout=30)
-    M.login(addr, pw)
+    mail.imap_login(M, addr, pw)
     conn = store.connect_view(cfg)
     try:
         M.select("INBOX", readonly=True)

@@ -1,6 +1,8 @@
 """Google Calendar (read-only) — proposes real interview availability slots for auto-replies.
-Headless via a stored OAuth token (secrets/token_gcal.json). Everything degrades to None/empty
-until the user runs `python tools/gcal_auth.py` once. Never writes to the calendar.
+Headless via a stored OAuth token: the WORKSPACE token from /settings (app/google_auth.py,
+data/<name>/secrets/google_token.json) when it carries the calendar scope, else the legacy
+owner token (token_gcal.json from `python tools/gcal_auth.py`). Everything degrades to
+None/empty until one of them exists. Never writes to the calendar.
 """
 from __future__ import annotations
 
@@ -8,6 +10,7 @@ import datetime
 import zoneinfo
 
 from . import config as cfgmod
+from . import google_auth
 
 SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
 TOKEN_PATH = "/path/to/.config/jobscan-secrets/token_gcal.json"      # gitignored — created by tools/gcal_auth.py
@@ -22,6 +25,17 @@ def _service(cfg: dict):
         from googleapiclient.discovery import build
     except ImportError:
         return None
+    # 1) This workspace's own token (one click on /settings). It must win over the legacy file
+    #    whenever it has the calendar scope: the legacy token is the OWNER's calendar, and a
+    #    second candidate's scheduling replies must never offer her free/busy as his.
+    try:
+        creds = google_auth.credentials(cfg)
+        if (creds is not None and SCOPES[0] in (getattr(creds, "scopes", None) or [])
+                and getattr(creds, "valid", True)):
+            return build("calendar", "v3", credentials=creds, cache_discovery=False)
+    except Exception:  # noqa: BLE001 — fall through to the legacy token
+        pass
+    # 2) Legacy: the token tools/gcal_auth.py wrote.
     tp = cfgmod.resolve_path(TOKEN_PATH)
     if not tp.exists():
         return None

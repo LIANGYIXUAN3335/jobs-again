@@ -499,7 +499,7 @@ def scan(cfg: dict, query: str = "is:starred", days: int = 0, limit: int = 0,
     gaz = _gazetteer(cfg)
     _say(progress, f"gazetteer: {len(gaz)} company names")
     M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"), timeout=30)
-    M.login(addr, pw)
+    mail.imap_login(M, addr, pw)
     try:
         M.select(ALL_MAIL, readonly=True)
         q = query
@@ -628,7 +628,7 @@ def reconcile(cfg: dict, threads: list[dict], root: str = "Interviews", tiers=("
                 "messages": sum(t["n"] for _b, ts in want.values() for t in ts), "written": False}
 
     M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"), timeout=30)
-    M.login(addr, pw)
+    mail.imap_login(M, addr, pw)
     made, copied, unfiled, pruned, failed = [], 0, [], [], []
     try:
         existing = _labels(M)
