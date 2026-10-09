@@ -1,15 +1,18 @@
 {
   "manifest_version": 3,
   "name": "JobScan Apply Helper",
-  "version": "0.1.9",
+  "version": "0.2.4",
   "description": "Pre-fills Greenhouse/Lever/Ashby/Workday application forms with your profile and the tailored résumé from your local JobScan. Stops before submit.",
   "permissions": [
     "activeTab",
-    "scripting"
+    "scripting",
+    "storage"
   ],
   "host_permissions": [
     "http://127.0.0.1:8787/*",
     "http://localhost:8787/*",
+    "http://localhost:8788/*",
+    "http://127.0.0.1:8788/*",
     "*://job-boards.greenhouse.io/*",
     "*://boards.greenhouse.io/*",
     "*://*.greenhouse.io/*",
@@ -54,7 +57,9 @@
     "*://*.oraclecloud.com/*",
     "*://*.taleo.net/*",
     "*://*.successfactors.com/*",
-    "*://*.workdayjobs.com/*"
+    "*://*.workdayjobs.com/*",
+    "*://careers.withwaymo.com/*",
+    "*://www.workato.com/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -109,7 +114,9 @@
         "*://*.oraclecloud.com/*",
         "*://*.taleo.net/*",
         "*://*.successfactors.com/*",
-        "*://*.workdayjobs.com/*"
+        "*://*.workdayjobs.com/*",
+        "*://careers.withwaymo.com/*",
+        "*://www.workato.com/*"
       ],
       "js": [
         "content.js"

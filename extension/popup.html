@@ -18,12 +18,25 @@
   <div class="hd">JobScan Apply Helper</div>
   <div class="bd">
     <div id="status"><span class="dot bad"></span>checking local server…</div>
+    <label style="display:block;margin:8px 0 0;font-size:12px;color:#374151">工作台（哪个 JobScan 实例）
+      <select id="port" style="margin-left:6px;font:inherit">
+        <option value="">— 先选择工作台 —</option>
+        <option value="8787|">Casey · 8787</option>
+        <option value="8787|alex">Alex（小号 candidate）· 8787</option>
+        <option value="8788|">Taylor · 8788</option>
+      </select>
+    </label>
     <ol>
       <li>Open a <b>Greenhouse / Lever / Ashby</b> application page.</li>
       <li>The <b>JobScan</b> panel appears if the role is in your DB.</li>
       <li>Click <b>Fill</b> → review → submit yourself.</li>
       <li>Click <b>✓ I submitted</b> to mark it applied.</li>
     </ol>
+    <button id="inject" style="margin-top:10px;width:100%;padding:8px;font:inherit;font-weight:600;
+      cursor:pointer;border:1px solid #12314f;border-radius:8px;background:#12314f;color:#fff;">
+      ▶ 在此页面启动面板</button>
+    <p style="color:#6b7280;margin:6px 0 0;font-size:12px;">公司自家马甲域名（如 careers.withwaymo.com）
+      面板不会自动弹——点上面按钮手动启动，任何网站都行。</p>
     <p class="muted" id="hint" style="color:#6b7280;margin:8px 0 0;"></p>
   </div>
   <script src="popup.js"></script>

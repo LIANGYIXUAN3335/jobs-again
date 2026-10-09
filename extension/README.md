@@ -30,9 +30,17 @@ server. Sensitive/legal/user-choice fields stay manual.
 ## What it deliberately does NOT do
 
 - **Never submits.** ToS, anti-bot, and accuracy all need a human — you click submit.
-- **Never fills sensitive/legal/user-choice fields**: gender, ethnicity, veteran,
-  disability, work authorization, sponsorship/visa, salary, referral/source, criminal or
-  background-check questions, consent, certification, attestation, signature, or submission.
+- **Never guesses a fact that isn't recorded.** Everything it fills comes from `config.yaml`
+  (profile fields, the `eeo` self-ID answers, standing legal/eligibility answers). A question
+  with no recorded answer is left for you, never invented.
+- **Leaves blank on purpose**: salary/compensation and referral/"how did you hear" —
+  owner answers those per-company.
+
+(2026-09-09 owner rescope, restored 2026-09-15: EEO/self-ID — gender, ethnicity, veteran,
+disability — auto-fill from your configured `eeo` answers; work-auth and other legal
+eligibility questions fill from recorded facts; consent/acknowledgement boxes are ticked.
+You review the whole form before submitting. Do not re-add a category-level block here —
+see memory `jobscan-autofill-policy`.)
   Those are yours to answer.
 - **Only fills empty fields** — it won't overwrite anything you already typed.
 - Custom / multi-step forms may only partly fill. It fills what it can and lists the rest.

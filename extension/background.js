@@ -2,11 +2,38 @@
 // Content scripts can't fetch http://localhost from an https page (mixed content),
 // but the service worker has its own extension origin + host_permissions, so it can.
 
-const BASES = ["http://127.0.0.1:8787", "http://localhost:8787"];
+// Which JobScan instance this Chrome profile talks to (owner 2026-09-23): each candidate's
+// workspace runs its own server (Casey 8787, Taylor 8788, …). The choice lives in
+// chrome.storage.local, so a separate Chrome profile per candidate keeps them apart for good.
+// Owner 2026-09-23: there is NO default. Until a workspace is picked in the popup, every API
+// call fails with NO_WORKSPACE and the content script fills nothing — the one way to make sure
+// a form is never filled with the wrong person's data.
+async function selectedPort() {
+  try { return Number((await chrome.storage.local.get({ jobscanPort: 0 })).jobscanPort) || 0; } catch (_) { return 0; }
+}
+async function serverBases() {
+  const port = await selectedPort();
+  return port ? [`http://127.0.0.1:${port}`, `http://localhost:${port}`] : [];
+}
+
+// The selected identity (apply profile) rides along on the lookups that decide which name /
+// email / résumé header a form gets. The server applies it to the role the way the review page's
+// name-card badge does; other endpoints ignore it.
+async function selectedIdentity() {
+  try { return String((await chrome.storage.local.get({ jobscanIdentity: "" })).jobscanIdentity || ""); } catch (_) { return ""; }
+}
+async function withIdentity(path) {
+  const id = await selectedIdentity();
+  if (!id || !/^\/api\/(lookup|top-role|profile)(\?|$)/.test(path)) return path;
+  return path + (path.includes("?") ? "&" : "?") + "identity=" + encodeURIComponent(id);
+}
 
 async function apiFetch(path, init) {
+  const bases = await serverBases();
+  if (!bases.length) throw new Error("NO_WORKSPACE");
+  path = await withIdentity(path);
   let lastErr;
-  for (const base of BASES) {
+  for (const base of bases) {
     try {
       const r = await fetch(base + path, init);
       return r;
@@ -18,7 +45,7 @@ async function apiFetch(path, init) {
 }
 
 async function lookup(url) {
-  const r = await apiFetch(`/api/lookup?url=${encodeURIComponent(url)}`);
+  const r = await apiFetch(`/api/lookup?url=${encodeURIComponent(url)}`);   // throws NO_WORKSPACE when unset
   if (r.status === 404) return { found: false };
   if (!r.ok) throw new Error(`lookup ${r.status}`);
   return { found: true, role: await r.json() };
@@ -127,6 +154,29 @@ async function profileOnly() {
   return r.json();
 }
 
+async function setApplyProfile(jobId, profile, url) {
+  // 切换这个岗位的投递身份（名片）。成功后按 URL 重查一次，把带新名片的 role 还给面板；
+  // URL 认不出角色的场景（pin/LinkedIn 中转）拿不到 role，面板自己就地改。
+  const r = await apiFetch(`/api/roles/${encodeURIComponent(jobId)}/apply-profile`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ profile }),
+  });
+  if (!r.ok) {
+    let detail = `${r.status}`;
+    try { detail = (await r.json()).detail || detail; } catch {}
+    return { ok: false, error: detail };
+  }
+  let role = null;
+  if (url) {
+    try {
+      const lk = await lookup(url);
+      if (lk.found && lk.role && lk.role.job_id === jobId) role = lk.role;
+    } catch {}
+  }
+  return { ok: true, role };
+}
+
 async function markApplied(jobId, variant) {
   const r = await apiFetch(`/api/roles/${encodeURIComponent(jobId)}/status`, {
     method: "POST",
@@ -135,6 +185,23 @@ async function markApplied(jobId, variant) {
   });
   if (!r.ok) throw new Error(`mark applied ${r.status}`);
   return r.json();
+}
+
+// 「这家不让投了」from the panel (owner 2026-09-25): put the company on cooldown for N days or
+// until a date, and (per owner) mark the role on screen skip so it leaves the review queue.
+async function setCooldown(company, days, until, reason, skipJobId) {
+  const r = await apiFetch(`/api/companies/cooldown`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ company, days: days || null, until: until || null, reason: reason || "", skip_job_id: skipJobId || null }),
+  });
+  if (!r.ok) { let d = `${r.status}`; try { d = (await r.json()).detail || d; } catch {} return { ok: false, error: d }; }
+  return { ok: true, ...(await r.json()) };
+}
+async function clearCooldown(company) {
+  const r = await apiFetch(`/api/companies/cooldown/${encodeURIComponent(company)}`, { method: "DELETE" });
+  if (!r.ok) { let d = `${r.status}`; try { d = (await r.json()).detail || d; } catch {} return { ok: false, error: d }; }
+  return { ok: true };
 }
 
 async function capture(payload) {
@@ -167,6 +234,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       else if (msg.type === "coverLetter") sendResponse({ ok: true, ...(await coverLetter(msg.jobId, msg.words)) });
       else if (msg.type === "pickOption") sendResponse({ ok: true, ...(await pickOption(msg.jobId, msg.question, msg.options)) });
       else if (msg.type === "markApplied") sendResponse({ ok: true, ...(await markApplied(msg.jobId, msg.variant)) });
+      else if (msg.type === "setProfile") sendResponse(await setApplyProfile(msg.jobId, msg.profile, msg.url));
+      else if (msg.type === "cooldown") sendResponse(await setCooldown(msg.company, msg.days, msg.until, msg.reason, msg.skipJobId));
+      else if (msg.type === "cooldownClear") sendResponse(await clearCooldown(msg.company));
       else if (msg.type === "capture") sendResponse({ ok: true, ...(await capture(msg.payload)) });
       else sendResponse({ ok: false, error: "unknown message" });
     } catch (e) {
