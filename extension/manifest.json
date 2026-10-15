@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "JobScan Apply Helper",
-  "version": "0.2.4",
-  "description": "Pre-fills Greenhouse/Lever/Ashby/Workday application forms with your profile and the tailored résumé from your local JobScan. Stops before submit.",
+  "version": "0.5.13",
+  "description": "Fill, independently review, repair, and submit one authorized application; verify employer confirmation.",
   "permissions": [
     "activeTab",
     "scripting",
@@ -60,6 +60,12 @@
     "*://*.workdayjobs.com/*",
     "*://careers.withwaymo.com/*",
     "*://www.workato.com/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["runner.html"],
+      "matches": ["http://127.0.0.1:8787/*", "http://localhost:8787/*"]
+    }
   ],
   "background": {
     "service_worker": "background.js"
@@ -119,6 +125,11 @@
         "*://www.workato.com/*"
       ],
       "js": [
+        "page_gate.js",
+        "form_agent.js",
+        "agent_workflow.js",
+        "stop_panel.js",
+        "login_fill.js",
         "content.js"
       ],
       "run_at": "document_idle",

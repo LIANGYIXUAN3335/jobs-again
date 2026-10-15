@@ -1,11 +1,26 @@
 // JobScan content script — runs on Greenhouse / Lever / Ashby application pages
 // (incl. when embedded as an iframe on a company careers site). It matches the page to
-// a role in your local JobScan, then on your click fills the form + attaches the tailored
-// résumé PDF. It NEVER submits — you review and submit yourself.
+// a role in your local JobScan. Reviewed submissions require a bound one-use permit.
 
 (function () {
   if (window.__jobscanLoaded) return;
   window.__jobscanLoaded = true;
+
+  // Only our dedicated extension worker may dispatch; employer page scripts cannot call it.
+  globalThis.chrome?.runtime?.onMessage?.addListener((message, sender, respond) => {
+    if (!['jobscanRunnerReady','jobscanRunnerExecute'].includes(message.type)) return;
+    if (sender.id !== chrome.runtime.id || sender.url !== chrome.runtime.getURL('runner.html') || window !== window.top) return;
+    if (message.type === 'jobscanRunnerReady') {
+      let gate;
+      try { gate = globalThis.JobScanPageGate?.inspect() || {kind:'unknown',evidence:'页面检查组件尚未就绪。'}; }
+      catch (error) { gate = {kind:'unknown',evidence:'页面检查出错：'+String(error.message || error).slice(0,200)}; }
+      respond({ready:gate.kind === 'ready' && !!globalThis.JobScanRunReview,
+        gate:{...gate,url:location.href},job_id:globalThis.JobScanRunnerJobId || null}); return;
+    }
+    if (!globalThis.JobScanRunReview) {respond({status:'blocked',reason:'申请入口尚未准备好。'});return;}
+    globalThis.JobScanRunReview(message).then(respond,()=>respond({status:'unknown',reason:'执行中断；请核对原申请，不自动重试。'}));
+    return true;
+  });
 
   // Reloading the unpacked extension kills the background context but leaves THIS already-
   // injected script running on the page — every later sendMessage then throws "Extension
@@ -14,6 +29,8 @@
   const CONTEXT_DEAD = "context-invalidated";
   const send = (msg) => new Promise((res) => {
     try {
+      if (['localhost','127.0.0.1'].includes(location.hostname) && location.pathname === '/agent-lab/fixture' &&
+          typeof globalThis.JobScanDemoTransport === 'function') return res(JobScanDemoTransport(msg));
       if (!chrome.runtime || !chrome.runtime.id) return res({ ok: false, error: CONTEXT_DEAD });
       chrome.runtime.sendMessage(msg, (r) => {
         const err = chrome.runtime.lastError;
@@ -28,11 +45,17 @@
     }
   });
   const isContextDead = (r) => !!r && r.error === CONTEXT_DEAD;
+  // Only a person's click counts. The employer's page shares this DOM, and what its scripts dispatch is untrusted.
+  const pressed = (action) => (event) => { if (event.isTrusted) return action(event); };
   // Human-like pacing between field fills so forms don't flag the burst as a bot.
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // Stop button: while filling, clicking the button again sets this. humanPause runs between
   // almost every field, so throwing there stops the fill promptly at the next field boundary.
   let abortFill = false;
+  let runnerDeadline = 0;
+  const checkDeadline = () => {
+    if (runnerDeadline && Date.now() >= runnerDeadline) throw new Error('独立执行时间已结束；原申请保留，不继续填写或提交。');
+  };
   const ABORT = "__jobscan_abort__";
   // Owner 2026-09-25 「切到别的标签页就不填了」: Chrome throttles a background tab's timers to
   // one tick per second (and to once a minute after ~5 min), so every 80 ms poll here — waiting
@@ -42,19 +65,27 @@
   let panelLog = null;                                          // set by panel(); humanPause reports through it
   let pausedNotice = false;
   const waitVisible = async () => {
+    checkDeadline();
     if (document.visibilityState === "visible") return;
     if (!pausedNotice && panelLog) { panelLog("⏸ 标签页在后台，Chrome 会把计时器降速——已暂停，切回来自动继续", "warn"); pausedNotice = true; }
+    // Unattended, a silent pause just looks like a hang: say so on the board too.
+    if (runnerDeadline) send({type:'jobscanRunnerEvent',event:{role:'system',text:'⏸ 申请页不在前台，Filler 已暂停。切回这个标签页后自动继续。'}});
     while (document.visibilityState !== "visible") {
+      checkDeadline();
       if (abortFill) throw new Error(ABORT);
       await sleep(400);
     }
     if (panelLog) panelLog("▶ 回到前台，继续填", "good");
+    if (runnerDeadline) send({type:'jobscanRunnerEvent',event:{role:'system',text:'▶ 申请页回到前台，Filler 继续填写。'}});
     pausedNotice = false;
+    checkDeadline();
   };
   const humanPause = async () => {
+    checkDeadline();
     if (abortFill) throw new Error(ABORT);
     await waitVisible();
     await sleep(180 + Math.floor(Math.random() * 140));         // ~0.18–0.32s
+    checkDeadline();
     if (abortFill) throw new Error(ABORT);
   };
 
@@ -83,30 +114,41 @@
     return false;
   }
 
-  function fieldText(el) {
-    let s = `${el.name || ""} ${el.id || ""} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""}`;
+  function fieldLabels(el) {
+    const labels = [el.getAttribute("aria-label") || ""];
+    const labelledBy = el.getAttribute("aria-labelledby");
+    if (labelledBy) labels.push(labelledBy.split(/\s+/)
+      .map((id) => document.getElementById(id)?.textContent || "").join(" "));
     if (el.id) {
       const l = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-      if (l) s += " " + l.innerText;
+      if (l) labels.push(l.innerText);
     }
     const wrapLabel = el.closest("label") || (el.closest(".field, .form-field, [class*=field]") || {}).querySelector?.("label");
-    if (wrapLabel) s += " " + wrapLabel.innerText;
-    return s.toLowerCase();
+    if (wrapLabel) labels.push(wrapLabel.innerText);
+    return labels.filter(Boolean);
+  }
+
+  function fieldText(el) {
+    return `${el.name || ""} ${el.id || ""} ${el.placeholder || ""} ${fieldLabels(el).join(" ")}`.toLowerCase();
   }
 
   const PATTERNS = [
-    // preferred/nickname MUST come before first_name (a "preferred first name" field
-    // contains "first name" and would otherwise match legal first_name).
+    // Specific preferred/legal labels must precede ordinary name fields.
     // FIRST: "How do you pronounce your name?" contains "name", so it would otherwise be
     // caught by one of the name patterns below and get filled with the name itself.
     ["name_pronunciation", /pronounc|phonetic|how (do|would) (you |we )?say your name/],
+    // "Legal First & Last Name" asks for both, and the patterns below would each hand it one of them.
+    ["legal_name", /\blegal\b.{0,12}\b(?:first|given)( name)?\s*(?:&|and|\/|,)\s*(?:last|family|sur)|\b(?:first|given)( name)?\s*(?:&|and|\/|,)\s*(?:last|family|sur)\w*( name)?\b.{0,12}\blegal\b/],
+    ["full_name", /\b(?:first|given)( name)?\s*(?:&|and|\/|,)\s*(?:last|family|sur)|\b(?:last|family|sur)\w*( name)?\s*(?:&|and|\/|,)\s*(?:first|given)\b/],
     // Order matters: "preferred last name" / "preferred first name" both contain "preferred name",
     // so the specific ones must be tested first. A bare "Preferred name" gets the FULL name.
     ["preferred_last_name", /\bpreferred (last|family|sur)\s?name\b/],
     ["preferred_first_name", /\bpreferred first name\b|\bpreferred given name\b/],
-    ["preferred_name", /\bpreferred (full )?name\b|\bnickname\b|\bgoes by\b|\bpreferred\b/],
+    // Not a bare "preferred": "What is your preferred coding language?" once got a name typed into it.
+    ["preferred_name", /\bpreferred (full )?name\b|\bnickname\b|\bgoes by\b/],
+    ["legal_first_name", /\blegal (first|given)( name)?\b|\b(first|given) legal name\b/],
     ["legal_name", /\blegal (full )?name\b/],        // explicit "Legal name" → legal (Alex Example)
-    ["first_name", /\bfirst name\b|\bgiven name\b|\blegal first\b/],
+    ["first_name", /\bfirst name\b|\bgiven name\b/],
     ["last_name", /\blast name\b|\bfamily name\b|\bsurname\b/],
     ["full_name", /\bfull name\b|\byour name\b|^\s*name\b/],
     ["email", /\be-?mail\b/],
@@ -125,22 +167,46 @@
   // were never filled; and "how did you hear" is no longer manual — the answer is always "Job board".
   const EXCLUDE = /salary|compensation|desired pay|\breferral\b|\breferred by\b|who referred/i;
 
+  // Asks where she is. "Location" alone also sits in "the office location listed in the job posting".
+  const WHERE_SHE_IS = /^\W*(?:(?:your|current|home)\s+)*(?:location|city)\b|\b(?:your|current)\s+(?:location|city)\b|\bcity\s*[,/]\s*state\b|\b(?:what|which)\s+city\b|\bwhere\b.{0,30}\b(?:located|based|live|reside)\b/i;
+  // "Country of citizenship" and "City of birth" hold the word and ask something else, and only she can answer those.
+  const NOT_WHERE_SHE_IS = /citizen|passport|birth|born|origin|national|native|naturali|visa|sponsor|relocat|previous|former|\blast\b|prior|issu|degree|earned|years|another|\bother\b/i;
+  const HER_COUNTRY = /^\W*(?:current\s+)?country(?:\s*(?:\/|or)\s*(?:region|territory))?(?:\s+code)?(?:\s+of\s+(?:current\s+)?residence)?\W*$|\b(?:reside|residing|live|living|located|based)\b/i;
+  // A box with no visible question has only its id to go on, and that id cannot be read as anything else.
+  function asksHerPlace(el, key) {
+    const said = fieldLabels(el).join(" ").replace(/\s+/g, " ").trim();
+    if (NOT_WHERE_SHE_IS.test(said || fieldText(el))) return false;
+    // An id can say job_application[location]. A question saying "the role" asks about the role.
+    if (/\b(office|company|role|job|position|team|employer|school|university)\b/i.test(said)) return false;
+    return !said || (key === "country" ? HER_COUNTRY : WHERE_SHE_IS).test(said);
+  }
+
   function classify(el) {
     const t = fieldText(el);
+    // "Preferred Pronouns" is not a preferred-name field. Keep this optional
+    // self-identification empty unless the candidate supplies it explicitly.
+    if (/\bpronouns?\b/i.test(t)) return null;
     if (EXCLUDE.test(t)) return null;               // demographics, EEO, comp, work-auth
-    for (const [key, re] of PATTERNS) if (re.test(t)) return key;
+    // Ashby prepends random IDs and placeholders to fieldText. Check a bare visible
+    // "Name *" label separately so it cannot fall through to AI as an open question.
+    // Do not broaden this to arbitrary "name" text (e.g. Current Company Name).
+    if (fieldLabels(el).some((label) => /^\s*name\s*[*:]*\s*$/i.test(label))) return "full_name";
+    for (const [key, re] of PATTERNS) {
+      if (re.test(t)) return (key === "location" || key === "country") && !asksHerPlace(el, key) ? null : key;
+    }
     return null;
   }
 
   function valueFor(key, profile) {
-    // "First name" / "Full name" / "Legal name" on applications want the LEGAL name (Alex);
-    // Casey is the preferred name, used only for an explicit preferred/nickname field.
+    // Ordinary names follow this role's name card. Only explicit legal-name fields
+    // use legal_first_name; never replace an Casey application with the global name.
     const legalFirst = profile.legal_first_name || profile.first_name;
     const preferred = profile.preferred_name || profile.first_name;
     const legalFull = [legalFirst, profile.last_name].filter(Boolean).join(" ");    // Alex Example
     const preferredFull = [preferred, profile.last_name].filter(Boolean).join(" "); // Casey Example
     return {
-      first_name: legalFirst, last_name: profile.last_name,     // First name → legal (Alex)
+      first_name: preferred, last_name: profile.last_name,
+      legal_first_name: legalFirst,
       preferred_name: preferredFull,                            // bare "Preferred name" → Casey Example
       preferred_first_name: preferred,                          // "Preferred first name" → Casey
       preferred_last_name: profile.preferred_last_name || profile.last_name,   // → Example
@@ -219,6 +285,10 @@
   const LEGAL_CANON = "I'm authorized to work in the US and I don't require sponsorship.";
   const legalText = (p, yn) => (yn === "yes" ? "Yes. " : "No. ") + ((p && p.work_authorization_answer) || LEGAL_CANON);
 
+  // The words an option can use to say which status she holds, on top of the workspace's own list.
+  const STATUS_CLAIM = /\b(?:citizen\w*|national(?:s|ity)?|naturali[sz]\w*|permanent(?:ly)?|temporar\w+|green[- ]?cards?|gc|lpr|h-?1(?:-?b\d?)?|tn|opt|cpt|l-?1|o-?1|f-?1|j-?1|e-?3|daca|tps|asyl\w+|refugee\w*|passports?|clearances?|cleared|ts\/sci|(?:non-?)?immigrants?|(?:student|work|tourist) visa|visa holder|restrict\w*|limited|conditional\w*)\b/i;
+  // "(such as OPT, CPT)" names a status only as an example, and claims nothing.
+  const STATUS_EXAMPLE = /\(?\b(?:such as|e\.g\.|for example)[^)]*\)?/gi;
   // Sentence-style options for those two questions ("I am authorized to work for Lyft and do
   // not require sponsorship" / "I require, or in the future will require, sponsorship…" /
   // "Yes, I have US work authorization but will require sponsorship in the future"): SCORED,
@@ -239,15 +309,16 @@
     const score = (raw) => {
       const t = (raw || "").replace(/\s+/g, " ").trim();
       if (!t) return -9;
+      const claims = t.replace(STATUS_EXAMPLE, " ");
+      // a status this candidate does NOT hold — never pick it, even when it also says "authorized";
+      // an option naming the real basis (EAD / F-1 OPT …) is exempt and earns a point
+      const namesOk = okRe.test(claims);
+      if ((wrongRe.test(claims) || STATUS_CLAIM.test(claims)) && !namesOk) return -9;
       let s = 0;
       const authYes = /^yes\b|^i am (legally |currently )?(authori[sz]ed|eligible|permitted)|\b(i am |i'm )?(legally |currently )?authori[sz]ed to work|\bhave (us |u\.s\. )?work authori[sz]ation|\bright to work\b/i.test(t);
       const authNo = /^no\b|\bnot (currently |legally )?(authori[sz]ed|eligible|permitted)|\bno (us |u\.s\. )?work authori[sz]ation|\bunauthori[sz]ed\b/i.test(t);
       const needDenied = /\b(do|does|will|would|should) not (currently |ever )?(need|require)\b|\b(don'?t|won'?t|doesn'?t) (currently |ever )?(need|require)\b|\bnot (need|require|going to (need|require))\b|\bno (visa |employment |immigration )?sponsorship\b|\bwithout (visa |any )?sponsorship\b|\bnever (need|require)\b/i.test(t);
       const needStated = /\b(will|may|might|do|does|would|currently) (need|require)\b|\b(i|we) (need|require)\b|\brequire,? or\b|\bsponsorship (is|will be) (needed|required)\b|\bneeds? (visa )?sponsorship\b|\brequires? (visa |employment |immigration )?sponsorship\b/i.test(t);
-      // a status this candidate does NOT hold — never pick it, even when it also says "authorized";
-      // an option naming the real basis (EAD / F-1 OPT …) is exempt and earns a point
-      const namesOk = okRe.test(t);
-      if (wrongRe.test(t) && !namesOk) s -= 3;
       if (namesOk) s += 1;
       if (kind === "auth") {                   // authorization question
         if (authYes) s += wa ? 2 : -3;
@@ -268,15 +339,175 @@
 
   // Returns {yesno:"yes"|"no"} for a Yes/No question, {text, choice} for a value question,
   // or null when we have no confident answer (→ falls through to the AI for open questions).
-  function commonAnswer(label, profile) {
-    const t = clean(label).toLowerCase();
+  const EXPORT_CONTROL = /\bu\.?s\.? person\b|export[- ](administration|control)|\bitar\b/i;
+  // The one export question with a standing answer: being from such a country. Everything else about it turns on status.
+  const EXPORT_COUNTRY = /\b(citizen|resident|national)\b.{0,80}\bexport[- ]controlled (countr|nation|region)/i;
+  // Facts not on file and agreements only she can make. No rule answers these, in any mode.
+  const NOT_ON_FILE = /clearance|background check|\bdrug|proof of|\b(start|begin)\b|\bsign(ing|ed)?\b|\bfriends?\b|non[- ]?compet|non[- ]?solicit|non[- ]?disclosure|\bnda\b|confidentiality|arbitration|convicted|felon/;
+  // A claim about her status, whatever the rest of the sentence asks.
+  const STATUS_TERM = /\b(citizen\w*|permanent resident|green card|passport|visas?|licen[cs]e[sd]?)\b/;
+  // A statement she would be signing. In a batch nobody reads it first.
+  const SIGNS = /\b(agree[sd]?|accept(s|ed)?|acknowledge[sd]?|certif(y|ies|ied)|attest(s|ed)?|consent(s|ed)?)\b/;
+  // Interview recording, the one consent she has an answer to. "A track record of interviews" is not it.
+  const RECORDING = /\binterviews?\b.{0,60}\b(?:be |being |to be )?record(?:ing|ed)\b|\brecord(?:ing|ed)\b.{0,60}\binterview|\b(?:may|can|could|will|would|might|to)\s+(?:we\s+|you\s+)?record\b.{0,60}\binterview|\brecording consent|\bconsent\b.{0,30}\brecord(?:ing|ed)?\b|notetak/;
+  // She lives in the Bay Area and will not leave it, so this is the only place she can say Yes to being.
+  const BAY_NAMES = "san francisco|sf|the bay|bay area|silicon valley|south bay|east bay|sunnyvale|san jos[eé]|santa clara|mountain view|palo alto|menlo park|redwood city|redwood shores|san mateo|foster city|burlingame|san bruno|san carlos|daly city|cupertino|milpitas|los altos|los gatos|oakland|berkeley|emeryville|fremont|hayward|pleasanton|san ramon|walnut creek|stanford|presidio";
+  const BAY_AREA = new RegExp("\\b(?:" + BAY_NAMES + ")(?!\\w)(?:,? (?:ca|california)\\b)?", "i");
+  // Places a lower-case label can still name; capitals below catch the rest.
+  const ELSEWHERE = /\b(new york|nyc|seattle|bellevue|redmond|kirkland|austin|dallas|plano|houston|boston|denver|chicago|atlanta|charlotte|miami|los angeles|el segundo|santa monica|san diego|las vegas|portland|pittsburgh|washington,? d\.?c|bluffdale|salt lake|phoenix|philadelphia|quebec|québec|montreal|vancouver|toronto|london|riyadh|texas|new jersey|washington|oregon|colorado|florida|virginia|georgia|illinois|massachusetts|north carolina|utah|arizona|nevada|ohio|michigan|minnesota|pennsylvania|tennessee|europe|asia)\b/i;
+  // Being somewhere with no name on it. "Other teams" and "other work" are not this.
+  const PLACE_WORDS = /\b(?:outside|beyond|elsewhere|anywhere|wherever|another\s+(?:city|state|office|country|location)|different\s+(?:city|state|office|country|location)|other\s+(?:cit(?:y|ies)|states?|offices?|countr\w+|locations?)|any\s+(?:of\s+(?:our|the)\s+)?(?:\w+\s+)?(?:offices?|locations?|sites?|cit(?:y|ies)|states?)|all\s+(?:of\s+)?(?:our\s+)?(?:\w+\s+)?(?:offices|locations|sites)|multiple\s+(?:offices|locations|sites|cities|states)|out[- ]of[- ](?:state|town)|nationwide|east coast|west coast|midwest|northeast|southeast|southwest|northwest)\b/i;
+  // The rest of a label after a Bay name: ", Costa Rica" or ", OH" says it is that place's namesake. ", Seattle, or" is a list.
+  const NAMESAKE = /^\s*,\s*(?!CA\b|CALIF|Calif|US\b|USA\b|U\.S|United States\b)\p{Lu}[\p{L}.'’-]*(?:\s+\p{Lu}[\p{L}.'’-]*)*(?![\p{L}.'’-])(?!\s+\p{Lu})(?!\s*(?:,|\/|or\b|and\b))/u;
+  const NAMESAKE_PLAIN = /^\s*,\s*(?!ca\b|calif|us\b|usa\b|u\.s|united states\b|or\b|and\b|if\b|at\b|in\b|on\b|for\b|are\b|can\b|will\b|do\b|would\b|could\b|should\b|is\b|how\b|what\b|please\b|\d)[\p{L}.'’-]+(?:\s+[\p{L}.'’-]+)?(?![\p{L}.'’-])(?!\s*(?:,|\/|or\b|and\b))/u;
+  // The word in front of "Bay Area": "the Bay Area" is hers, "Tampa Bay Area" is not.
+  const BAY_FRONT = /^(?:the|greater|sf|francisco|south|east|north|in|our|of|at|to|from|near|around|within|entire|whole|wider|broader|a|this|your|or|and|not|outside|metro|is|are)$/i;
+  // A capitalized word in a place's spot that is still not a place. California is here because she lives there.
+  const NOT_A_PLACE = /^(our|the|a|an|this|that|these|those|one|any|all|either|each|your|my|their|its|in|at|from|to|near|around|on|of|for|or|and|if|we|so|as|is|be|by|do|it|up|me|i|you|yes|no|ok|okay|please|note|ai|office|offices|hq|headquarters|headquarter|campus|location|locations|site|sites|area|metro|region|onsite|on-site|person|hybrid|remote|work|working|corporate|main|local|nearest|closest|nearby|physical|head|central|new|job|role|posting|assigned|designated|specified|preferred|selected|hiring|employer|bayarea|company|home|current|primary|listed|least|minimum|most|order|alignment|advance|general|total|addition|case|business|week|weeks|day|days|every|per|times|future|fact|hours|us|u\.s|usa|u\.s\.a|united|states|america|california|calif|ca|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|tu|th|m|f|january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec|eastern|pacific|central|mountain|est|edt|pst|pdt|cst|cdt|mst|mdt|et|pt|ct|mt|gmt|utc|time)$/i;
+  // This company's name, with or without the suffix forms drop ("Genius AI" asks about "Genius").
+  function companyRe(company) {
+    const full = (company || "").trim();
+    if (!full) return null;
+    const core = full.replace(/[\s,]+(inc|llc|ltd|corp|corporation|co|company|technologies|technology|labs?|ai|hq)\.?$|\.(ai|io|com)$/i, "");
+    return new RegExp("(^|\\W)(" + [full, core].filter(Boolean).map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")(?=\\W|$)", "gi");
+  }
+  // Capitalized, or written the company's own way: "Factory" must not read "worked at a factory" as itself.
+  function namesCompany(raw, company) {
+    const re = companyRe(company);
+    return !!re && [...raw.matchAll(re)].some((m) => /^[A-Z]/.test(m[2]) || m[2] === company.trim());
+  }
+  // Is the company itself what the label says she worked for? "a company that deployed on AWS Lambda" names it too.
+  function workedAtCompany(raw, company) {
+    const re = companyRe(company);
+    return !!re && [...raw.matchAll(re)].some((m) => (/^[A-Z]/.test(m[2]) || m[2] === company.trim())
+      && /\b(?:for|at|by|with|of|within)\s+(?:the\s+)?$/i.test(raw.slice(0, m.index + m[1].length)));
+  }
+  // Where does the label put her? `bay`: a Bay Area place it asks about. `elsewhere`: anything else, or the Bay Area
+  // ruled out. `choice`: the two are offered as a list, so a Bay Area answer is a true Yes. No list holds every place,
+  // so anything that could be one counts: a capital mid-sentence, a state code, a word in a place's spot.
+  function whereAsked(text, company) {
+    const co = companyRe(company);
+    let s = (co ? text.replace(co, "$1employer") : text).replace(/\s+/g, " ");
+    // ALL CAPS and Every Word Capitalized have no capitals left to read, and a label in lower case has none at all.
+    const lettered = s.match(/\p{L}[\p{L}'’-]*/gu) || [];
+    const capped = lettered.filter((w) => /^\p{Lu}/u.test(w)).length;
+    const plain = capped <= 1 || capped > lettered.length * 0.6;
+    if (plain) s = s.toLowerCase();
+    let bay = false, other = false;
+    s = s.replace(/([\p{L}.'’-]+) (bay(?: area)?)\b/giu, (m, front) => {
+      if (BAY_FRONT.test(front) || !(plain || /^\p{Lu}/u.test(front))) return m;
+      other = true;
+      return front + " elsewhere";
+    });
+    s = s.replace(new RegExp(BAY_AREA.source, "gi"), (name, at, whole) => {
+      const before = whole.slice(0, at);
+      if ((plain ? NAMESAKE_PLAIN : NAMESAKE).test(whole.slice(at + name.length))) { other = true; return "elsewhere"; }
+      // "if you're based in SF" and "while living in San Jose" say where she may be, not where the work is.
+      if (/\b(?:if(?: you| you're| you are)?\s*(?:not|aren'?t|are not|do not|don'?t|outside|based|located|live|living|reside|residing|in|currently)|while)\b[^,?.;]*$/i.test(before)) return " bayarea ";
+      if (/\b(?:not|rather than|instead of|outside(?: of)?|beyond|away from|out of|other than|apart from|except|excluding)\s+(?:(?:in|at|from|of|the|our)\s+)*$/i.test(before)) { other = true; return " bayarea "; }
+      bay = true;
+      return " bayarea ";
+    }).replace(/\s+/g, " ");
+    const placeWord = (word) => !NOT_A_PLACE.test(word);
+    if (ELSEWHERE.test(s) || PLACE_WORDS.test(s)) other = true;
+    for (const m of s.matchAll(/,\s*(\p{L}{2})(?![\p{L}\d])/gu)) if ((plain || /^\p{Lu}{2}$/u.test(m[1])) && placeWord(m[1])) other = true;
+    if (!plain) {
+      for (const m of s.matchAll(/\p{Lu}[\p{L}\p{M}\d.'’&-]*/gu)) {
+        const before = s.slice(0, m.index);
+        if (/^\s*$/.test(before) || /[.?!]\s+$/.test(before)) continue;     // a sentence's first word is capitalized anyway
+        // A possessive is the employer only when the label also says where its office is ("GridCARE's offices in Redwood City").
+        if (/['’]s$/.test(m[0]) && /^\s*offices? in bayarea\b/.test(s.slice(m.index + m[0].length))) continue;
+        const parts = m[0].replace(/['’](?:s|m|re|ve|ll|d)$/, "").replace(/\.+$/, "").split(/[-/–—]+/);
+        if (parts.some((part) => /^\p{Lu}/u.test(part) && placeWord(part))) other = true;
+      }
+    }
+    // "our boulder office", in any case.
+    for (const m of s.matchAll(/(?:^|[\s(])(?:our|the|your|this|that|an?)\s+([\p{L}][\p{L}'’-]*)\s+(?:offices?|hq|headquarters|campus|locations?|sites?)\b/giu)) if (placeWord(m[1])) other = true;
+    if (plain) {
+      for (const m of s.matchAll(/\b(?:(?:in|at|from|near|around|into|within)|out of|(?:commut\w*|relocat\w*|travel\w*|mov\w+|com\w+) to)\s+(?:downtown\s+)?(?:(?:our|the)\s+)?([\p{L}][\p{L}'’-]*)/gu)) if (placeWord(m[1])) other = true;
+    } else if (/\bdowntown\s+\p{L}/iu.test(s)) other = true;
+    const choice = /\beither\b/i.test(s) || /\bbayarea\b[^?.]{0,20}?(?:, ?| )(?:and\/)?or\b,? (?!relocat|move|work|commut|are\b|can\b|will\b|do\b|would\b|if\b)\S/i.test(s)
+      || /\bor\b,? (?:if not,? )?(?:(?:from|in|at) )?(?:(?:our|the) )?bayarea\b/i.test(s);
+    return { bay, elsewhere: other, choice };
+  }
+  // The facts behind a work-rights answer are about the US. Filler's other rules stop at a place; these also stop at
+  // "a Swiss work permit" and "our Lisbon office". "for Crusoe" and "employment at Scribe" are who she works for, not where.
+  const FOREIGN_WORDS = /\b(swiss|british|german|italian|french|spanish|dutch|irish|polish|portuguese|swedish|norwegian|danish|finnish|austrian|belgian|greek|turkish|israeli|indian|japanese|korean|chinese|taiwanese|singaporean|australian|mexican|brazilian|argentin\w+|colombian|filipino|vietnamese|thai|indonesian|malaysian|emirati|european|philippines|portugal|italy|colombia|emea|apac|latam|asia\w*|africa\w*|nordics?|benelux|dach)\b/;
+  function foreignWorkRights(raw, asked, company) {
+    if (FOREIGN_WORDS.test(asked)) return true;
+    // No list holds every country: "in <place>" has to be the US, California, the Bay Area or the role's own country.
+    if (new RegExp("\\bin (?!(the )?((near|foreseeable|immediate|distant|coming|next) )?future\\b|order\\b|which\\b|the country\\b(?! of\\b)|(this|that|your)\\b|the (role|position|location|job|next|coming)\\b|(the )?(u\\.s\\.|u\\.s\\b|us\\b|usa\\b|united states|america\\b)|connection with\\b|a (full|part)[- ]time\\b|any (us\\b|u\\.s|united states|way\\b|capacity\\b|form\\b|state\\b)|california\\b|(the )?(?:" + BAY_NAMES + ")(?!\\w))").test(asked)) return true;
+    // "in the US and Portugal". "in the US or Canada" is still true of the US, and "and do not require sponsorship" is the same fact.
+    if (/\b(?:in|within) (?:the )?(?:u\.s\.a?\.?|us|usa|united states(?: of america)?)(?!\w)\.?\s*(?:(?:and|&|plus|as well as)\b(?!\s+(?:(?:do|does|will|would)\s+)?(?:not\b|n['’]t\b|don['’]?t\b|won['’]?t\b))|,\s*(?!now\b|for\b|without\b|currently\b|today\b|either\b)\w|or\b(?!\s+canada\b))/.test(asked)) return true;
+    // A bare title: "Work eligibility: Philippines", "Sponsorship (Philippines)".
+    if (/^\W*(?:[\w.]+\s+){0,2}(?:work authori[sz]ation|work eligibility|sponsorship|right to work|work permit)\s*[-–—:(]\s*(?!(?:the )?(?:us\b|u\.s|usa\b|united states|america\b|california\b|required|optional|status|now\b|future\b|e\.g|i\.e|for\b|if\b|please|yes\b|no\b))\p{L}/u.test(asked)) return true;
+    const co = companyRe(company);
+    const s = (co ? raw.replace(co, "$1employer") : raw).replace(new RegExp(BAY_AREA.source, "gi"), " bayarea ");
+    if (ELSEWHERE.test(s)) return true;
+    if (BAY_AREA.test(raw) && whereAsked(raw, company).elsewhere) return true;
+    const run = "((?:\\p{Lu}[\\p{L}.'’&-]*,?\\s*)+)";
+    const spots = [new RegExp("\\b(?:[Ww]ork|[Ww]orking|[Rr]elocat\\w*|[Mm]ov(?:e|ing)|[Tt]ransfer\\w*)\\s+(?:to|at|within|across|out of|from|near|around)\\s+(?:(?:[Oo]ur|[Tt]he)\\s+)?" + run, "gu"),
+                   new RegExp("\\b(?:[Oo]ur|[Tt]he)\\s+" + run + "(?:[Oo]ffices?|HQ|[Hh]eadquarters|[Cc]ampus|[Tt]eams?|[Ll]ocations?|[Ss]ites?)\\b", "gu")];
+    // Once this company's name is out of the way, a name after "for" is another employer or a country.
+    if (co) spots.push(new RegExp("\\b(?:authori[sz]ation|authori[sz]ed|eligib\\w+|permit|work|working)\\s+(?:\\w+\\s+){0,3}?for\\s+(?:the\\s+)?" + run, "gu"));
+    for (const spot of spots) for (const m of s.matchAll(spot)) {
+      if (m[1].split(/[\s,/-]+/).some((w) => /^\p{Lu}/u.test(w) && !NOT_A_PLACE.test(w.replace(/\.+$/, "")))) return true;
+    }
+    return false;
+  }
+  // She agreed to interview in Go or Java if a company insists, and Python is her own pick, so a question stating that language
+  // is a standing Yes. Only those three: she never said so about any other. "Go" has to read as the language, not "go through".
+  const INTERVIEW_LANGUAGE = /\b(?:Java|java|JAVA|Golang|golang|GoLang|Python|python)\b|\b(?:in|using|use|with|requires?)\s+Go\b|\bGo(?=\s+(?:coding|interview|assessment)\b)/;
+  // "Coding" alone is a question about her skill ("Are you comfortable coding in Java?"), not a statement about an interview.
+  const INTERVIEW_WORK = /\b(?:interview\w*|assessments?|coding\s+(?:\w+\s+)?(?:tests?|challenges?|exercises?|rounds?|screens?|sessions?|problems?|questions?))\b/;
+  const GOES_ALONG = /\b(?:comfortable|ok|okay|willing|able|agrees?)\b/;
+  // Every word such a question may hold, once the language and how long the interview runs are out. Anything else is a
+  // second thing to say yes to, however gently it is put ("...and $90k base", "...at our HQ"), so a list of what to refuse
+  // can never be complete. A word missing here costs one question to her, and a wrong Yes goes out under her name.
+  const INTERVIEW_TALK = new Set(`a all an are at be can comfortable complete completing conducted coding do does doing done for held in interview interviewing interviews
+    is it language must of ok okay on our perform please programming required requires role round rounds screen screens session sessions
+    technical test tests that the this to use uses using we will willing with would you able agree agrees assessment assessments challenge challenges
+    exercise exercises position problem problems question questions`.split(/\s+/));
+  function statesInterviewLanguage(raw, t, company) {
+    if (!INTERVIEW_LANGUAGE.test(raw) || !INTERVIEW_WORK.test(t) || !GOES_ALONG.test(t)) return false;
+    const co = companyRe(company);
+    const rest = (co ? t.replace(co, "$1") : t).replace(/\b(?:java|golang|python|go)\b/g, " ").replace(/\b(?:runs?|lasts?|takes?) \d+ (?:minutes?|mins?)\b/g, " ");
+    return rest.split(/[\s.,;:!?()]+/).filter(Boolean).every(word => INTERVIEW_TALK.has(word));
+  }
+  // A rule's bare Yes or No goes into a text box only when the box asks a yes/no question. "Remote work preference" does not.
+  const YES_NO_QUESTION = /^\W*(?:are|is|am|do|does|did|can|could|will|would|should|shall|may|might|must|have|has|had|i am|i'm|i have)\b|\?\W*$/i;
+  // `asked` is all the form says at this control, the statement under the title too.
+  function commonAnswer(label, profile, asked = label) {
+    const raw = clean(label), t = raw.toLowerCase();
     if (!t) return null;
+    // clean() stops at 300 characters, and what comes after still counts against a Yes.
+    const whole = String(label).replace(/\s+/g, " ").trim(), all = whole.toLowerCase();
+    // Answers the owner wrote on the 8787 board beat every rule below (app/confirmed_answers.py). One covers only what
+    // she answered, so it is held against the whole text, not the cut one.
+    // A sentence has no yesno, so a Yes/No control stays blank for the owner instead of guessing.
+    const covers = String(asked).replace(/\s+/g, " ").trim().toLowerCase();
+    for (const item of profile.confirmed_answers || []) {
+      try { if (new RegExp(item.topic, "i").test(covers)) return { text: item.answer, choice: item.answer, yesno: item.yesno || undefined }; } catch (_) { /* bad pattern */ }
+    }
+    // "How/where did you hear about this job" — answer "Job board" (owner's pick, 2026-09-23; was LinkedIn).
+    // Before the sensitive check: "(e.g. LinkedIn, referral)" is an example, not a referral question.
+    // Before the essay guard too, which matches "how did you…?" and any label over 120 chars.
+    if (/(how|where) did you hear\b|hear about (us|this)|(how|where) did you (learn about|find) (us\b|(this|our|the) (role|job|position|opening|opportunity|company|posting))|source of (this )?(job|opportunity|application)/.test(t)
+        && !/\b(why|what)\b/.test(t))   // "How did you hear about us? Why this role?" also asks for an essay
+      return { text: "Job board", choice: "Job board" };
     if (SENSITIVE.test(t)) return null;
+    // Export rules turn on immigration status, not on work authorization: only the owner can answer.
+    if (EXPORT_CONTROL.test(all) && !EXPORT_COUNTRY.test(all)) return null;
+    // Living in the US is a fact about her. This comes before the foreign-country guard: "the US or Canada?" is still Yes.
+    // Anything else said in that sentence is another claim ("in the US on a visa?"), so it stops here. A note after it is not.
+    const inUS = t.match(/^\s*(are you|do you)\b.{0,20}\b(located|reside|residing|live|living|based)\b.{0,12}\bin (the )?(u\.s\.a\.?|u\.s\.?|usa\b|us\b|united states( of america)?)/);
+    if (inUS) {
+      const rest = t.slice(inUS[0].length), sentence = rest.split(/[?!]|\.(?:\s|$)/)[0];
+      return /^( or (in )?canada)?\W*$/.test(sentence) && !rest.slice(sentence.length + 1).includes("?") ? { yesno: "yes" } : null;
+    }
     // Work authorization / sponsorship — BEFORE the essay/length guard: Flexport's sponsorship
     // question runs 260+ chars and Workday's box text past 120, and both used to fall through
-    // to the AI (→ blank) or to the required-field default (→ No). Authorization is checked
-    // first so a combined "authorized to work WITHOUT sponsorship?" reads as Yes; any other
-    // "sponsor" then means "do you need it?" → No. `legal` routes the answer through
+    // to the AI (→ blank) or to the required-field default (→ No). `legal` routes the answer through
     // pickLegalOption when the options are sentences instead of Yes/No.
     // (attestations about the answer — "I understand my response regarding work authorization
     // must be accurate" — are not the question; the acknowledgement rule below handles them)
@@ -290,6 +521,17 @@
                                  okTerms: profile.status_terms_ok, wrongTerms: profile.status_terms_wrong });
       const NO_L = L("no", "spon"), YES_L = L("yes", "spon");
       const AUTH_YES = L("yes", "auth"), AUTH_NO = L("no", "auth");
+      // "Can you legally work in the US? Please explain if you require a visa." asks about
+      // permission; the follow-up only asks for detail, so it must not flip the answer to No.
+      const asked = (t.replace(/\b(?:please\s+)?(?:explain|specify|elaborate|let us know|tell us)\b.*$/, "").trim() || t)
+        .replace(/\b(u\.s\.?|us|usa|united states) or canada\b/g, "$1");   // true of the US alone, so the rest does not change it
+      // The facts are about the US. "Authorized to work in Canada?" is not; never answer it from them.
+      if (/\b(canada|canadian|toronto|iceland|saudi|riyadh|united kingdom|uk|ireland|germany|france|netherlands|spain|poland|india|singapore|japan|australia|israel|mexico|brazil|uae|dubai|eu|european|europe|korea|taiwan|china|argentina|switzerland|sweden)\b/.test(asked)) return null;
+      // Who sponsored whom in the past is on no file: only whether she will need it is.
+      if (/\b(?:ever|previous(?:ly)?|prior|past|former(?:ly)?)\b[^?]{0,60}\bsponsor|\bsponsor\w*\b[^?]{0,40}\b(?:before|previously|in the past)\b|^\W*(?:have|has|did)\b[^?]*\bsponsor|(?<![-\w])sponsored\b|\bsponsoring\b/.test(asked)) return null;
+      // "We do not offer sponsorship. Is that OK?" tells her something and asks nothing about her.
+      const offered = /[^.?!]*(?:\b(?:do|does|will|can|could|is|are)(?:n['’]t| not)\b(?:(?!\b(?:require|need)\b)[^.?!]){0,40}\b(?:offer\w*|provid\w*|sponsor\w*|support\w*|hir\w*|availabl\w*)\b|\b(?:cannot|can['’]t|unable to|no longer)\b[^.?!]{0,40}\b(?:offer|provid\w*|sponsor\w*|support|hire)\b|\bsponsor\w*\b[^.?!]{0,30}\b(?:not|un)\s?(?:available|offered|provided|possible)\b)[^.?!]*[.?!]?/g;
+      const question = asked.replace(offered, " ");
       // What is the question ABOUT? "Will you require sponsorship … to maintain your work
       // authorization?" asks whether she NEEDS sponsorship (No) even though it contains the
       // authorization wording; "are you authorized to work … without requiring sponsorship?"
@@ -297,13 +539,37 @@
       // "authorization first" order got the first kind wrong (18 of 74 logged phrasings), so
       // a require/need-sponsorship construction is recognised first, unless it is negated by
       // "without". "Require our assistance with work authorization" is the same question.
-      const withoutSpon = /\bwithout\b[^?]{0,30}\bsponsor/.test(t);
-      const asksNeed = /\b(will|would|do|does|might|may|could|are)\s+you\b[^?]{0,60}?\b(require|need|going to need)\b[^?]{0,90}?\bsponsor|\brequire\b[^?]{0,20}\bsponsor|\bsponsor(ship)?\b[^?]{0,30}\b(required|needed)\b|(require|need)\b.{0,40}\b(assistance|support|help)\b.{0,25}(work authori|visa|immigration)|(require|need)\b.{0,30}(work authori[sz]ation|visa|immigration) (assistance|support|help)|(require|need)\b[^?]{0,40}\b(work permit|a visa|visa sponsorship|right to work support)\b/.test(t);
-      if (asksNeed && !withoutSpon) return ns ? YES_L : NO_L;          // "do you need sponsorship?"
-      if (/authori[sz]ed to (lawfully |legally )?work|authori[sz]ation to work|legally (authorized|allowed|entitled|eligible|able to|permitted)\b.{0,20}\bwork|(legally|lawfully) work|legally eligible|(right|eligible|permitted|permission) to work|work authoriz|eligib(le|ility) to (work|begin|start)|work (permit|eligibility)/.test(t))
-        return (withoutSpon ? (wa && !ns) : wa) ? AUTH_YES : AUTH_NO;   // "authorized (without sponsorship)?"
-      if (/\bsponsor/.test(t)) return ns ? YES_L : NO_L;
+      const sponsorTalk = /\bsponsor/.test(question);
+      const withoutSpon = /\bwithout\b[^?]{0,60}\bsponsor/.test(question);
+      // "I do not require sponsorship" says the answer for her. Beside "I am authorized" it is that same fact.
+      const statesNeed = sponsorTalk && (/\b(?:(?:do|does|will|would)(?:n['’]t| not)|don['’]?t|won['’]?t)\s+(?:\w+\s+)?(?:require|need)\b|\bnot\s+(?:require|need)\b|\bsponsor\w*\b[^.?!]{0,20}\bnot\s+(?:required|needed)\b/.test(question) || /^\W*i\b[^?]*\b(?:require|need)\b[^?]*\bsponsor/.test(question));
+      const asksNeed = /\b(will|would|do|does|might|may|could|are)\s+you\b[^?]{0,60}?\b(require|need|going to need)\b[^?]{0,90}?\bsponsor|\brequire\b[^?]{0,20}\bsponsor|\bsponsor(ship)?\b[^?]{0,30}\b(required|needed)|(require|need)\b.{0,40}\b(assistance|support|help)\b.{0,25}(work authori|visa|immigration)|(require|need)\b.{0,30}(work authori[sz]ation|visa|immigration) (assistance|support|help)|(require|need)\b[^?]{0,40}\b(work permit|a visa|visa sponsorship|right to work support)\b|\b(require|need)\b[^?]{0,20}\bauthori[sz]ation\b/.test(question);
+      const asksAuth = /authori[sz]ed to (lawfully |legally )?work|authori[sz]ation to work|legally (authorized|allowed|entitled|eligible|able to|permitted)\b.{0,20}\bwork|(legally|lawfully) work|legally eligible|(right|eligible|permitted|permission) to work|work authoriz|eligib(le|ility) to work|eligib(le|ility) to (begin|start) (work|employment)|work (permit|eligibility)/.test(question);
+      const workWithout = withoutSpon && /\b(work|employ)/.test(question);
+      if (/\bsponsor/.test(asked) && !sponsorTalk && !asksNeed && !asksAuth) return null;
+      if ((asksNeed || asksAuth || sponsorTalk) && foreignWorkRights(whole, question, profile.company_name)) return null;
+      if (statesNeed && !asksAuth) return null;
+      if (asksNeed && !withoutSpon && !statesNeed) return ns ? YES_L : NO_L;          // "do you need sponsorship?"
+      if (asksAuth || workWithout) {                                                   // "authorized (without sponsorship)?"
+        // "Authorized to work" answers one fact. Whatever else the sentence claims with it is not that fact.
+        const rest = all.replace(/eligib\w+ to (?:begin|start) (?:work\w*|employment)/g, " ");
+        if (/citizen|permanent|green card|passport|clearance|ts\/sci|background|\b(?:start|begin)\b|immediate|restrict|limitation|\black(?:s|ing)?\b|unauthori|ineligib|\bnational\b|naturali|convict|felon|temporar|indefinite|long[- ]term|\bfor the next\b|\bexpir|\b(?:tied|depend\w*|through|via|based on)\b|\bon an? (?:\w+ )?visa\b|\bvisa (?:holder|status|type)\b|\bh-?1|\bopt\b|\bcpt\b|\bf-?1\b|\btn\b|\bl-?1\b|\bo-?1\b|\bead\b|\band that\b|(?<!\bif )\bnot\s+(?:currently\s+|legally\s+|lawfully\s+)*(?:authori|eligible|permitted|allowed|entitled)|\band (?:are|do you|have|hold|will|can|would|willing|able)\b/.test(rest)) return null;
+        if (profile.unattended && SIGNS.test(rest)) return null;
+        return (withoutSpon || statesNeed ? (wa && !ns) : wa) ? AUTH_YES : AUTH_NO;
+      }
+      // Anything else mentioning sponsorship has to ask whether she needs it, or be that bare topic.
+      if (sponsorTalk) return /\b(?:requir|need)\w*\b[^?]{0,90}\bsponsor|^\W*(?:(?:visa|immigration|employment|employer|work|company)\s+){0,3}sponsorship\W*(?:status\W*)?$/.test(question) ? (ns ? YES_L : NO_L) : null;
     }
+    // Recording an interview is optional however the form words it, and the owner opts out.
+    if (RECORDING.test(t) && !/^\W*(?:have|did) you\b/.test(t))
+      return {text:"Opt out of recording", choice:"Opt out", yesno:"no"};
+    // "Where are you located?" names a place; the narrative guard below would take it for an essay.
+    if (/^\s*where are you (currently )?(based|located)\b/.test(t)) return { text: fullLoc(profile) };
+    // Office-days questions run long, and a long label is otherwise taken for an essay.
+    // "Hybrid cloud" and "Office 365" hold the words and are about technology.
+    const techWords = /\bhybrid\s+(?:cloud|search|retrieval|deployment|infrastructure|architecture|kubernetes|encryption|storage|database|rag|mobile|app|compute|network|transactional)|\boffice\s*365\b|\b(?:microsoft|ms) office\b|\boffice suite\b/.test(t);
+    const officeDays = !techWords && /\b(in[- ]office|in the office|offices?|on-?site|in[- ]person|hybrid)\b/.test(t)
+      && /\b(comfortable|able to|willing|would you|can you|are you|i am|i'm)\b/.test(t) && !/\b(based|located|reside|live in|which)\b/.test(t);
     // OPEN-ENDED essay questions must NEVER get a Yes/No or canned value — they go to the AI.
     // "Tell us about your experience working remote…" contains "remote", which used to trigger a
     // stray "Yes". A prompt that asks you to narrate is not an eligibility toggle.
@@ -311,60 +577,120 @@
         || /\byour experience\b/.test(t)
         || /\bwhat\b.{0,30}\b(challenge|experience|approach|practice|excite|draw|motivat|interest|learn|proud|accomplish)/.test(t)
         || /\b(what|how|why|when|where)\b.{0,60}\byou\b.{0,40}\?/.test(t)   // "what … do you …?" narrative
-        || t.length > 120) return null;
+        || (t.length > 120 && !officeDays)) return null;
     const YES = { yesno: "yes" }, NO = { yesno: "no" };
+    // Acceptable only because she reads the form before submitting. A batch has no such reader.
+    const SOFT_YES = profile.unattended ? null : YES;
     const US = profile.country || "United States";
+    // Citizenship / residency in an export-controlled or sanctioned country → No. Before the status check below:
+    // this one names a citizenship only to deny it.
+    if (/(citizen|resident|national|permanent resident)\b.{0,80}(cuba|syria|iran|north korea|crimea|donetsk|luhansk|sanction)/.test(t)
+        || EXPORT_COUNTRY.test(t) || /sanctioned (countr|region|nation)/.test(t)) return NO;
+    if (NOT_ON_FILE.test(all) || STATUS_TERM.test(all)) return null;
+    // In every mode, and before a signed statement stops it: "agree" here is only to the language.
+    if (statesInterviewLanguage(raw, t, profile.company_name)) return YES;
+    // Soft rules below say Yes to working arrangements. Being somewhere else is not one: she will not leave the
+    // Bay Area, so a place outside it, unless the Bay Area is one of the choices, goes to the AI.
+    const where = whereAsked(whole, profile.company_name);
+    const away = where.elsewhere && !(where.bay && where.choice);
+    if (away && /office|on-?site|in[- ]person|relocat|commut|hybrid|remot|\blive\b|\bliving\b|\bresid|work(ing)? (at|in|from)|\blocat|\bbased\b|(role|position|job) is (in|at)\b/.test(t)) return null;
+    // She cannot travel abroad, and no list tells a foreign city from a US one, so only unnamed travel or travel within the US stays a Yes.
+    if (/\btravel/.test(t) && (where.elsewhere || /\b(international|abroad|overseas|globally|worldwide|foreign|outside|countr|border|across(?! the (?:us\b|u\.s|united states))|global|world|apac|emea|latam|asia)/.test(t))) return null;
     // eligibility / logistics (Yes/No)
     // Harmless required opt-ins (marketing / personalization / job recommendations / alerts) —
     // no "right" answer and won't affect the application, so just satisfy the field. Decline
     // (No) is the tidy default: fewer marketing emails. Owner's rule: "just pick one."
-    if (/personali[sz]e|job recommendation|recommended content|marketing (email|communication)|promotional|stay up to date|receive (updates|alerts|newsletter)|opt.?in/.test(t)) return NO;
+    if (/personali[sz]e|job recommendation|recommended content|marketing (email|communication)|promotional|stay up to date|receive (updates|alerts|newsletter)|\bopt[- ]?in\b/.test(t)) return NO;
     // Don't let them contact the CURRENT employer (job-search confidentiality) — a past/previous
     // employer is fine. "may we contact your current employer / present employer" → No.
     if (/(may we |can we |okay to )?contact.{0,30}(current|present)\s*employer|current employer.{0,20}contact/.test(t)) return NO;
-    if (/(ever|previously|before|prior|former|formerly).{0,40}(employ|work)/.test(t) || /(employ|work(ed)?)\b.{0,25}(for us|by us|here before|at (this|our) (compan|organi)|our compan|current or former)/.test(t) || /current or former (employee|worker|contractor)/.test(t)) return NO;
+    // Her own employers are the exception; "Have you ever worked with Kubernetes?" is about experience.
+    const ownEmployer = /\b(tiktok|bytedance|meta|facebook)\b/.test(t);
+    // "our company's competitors" and "a company such as Acme" ask about someone else she may well have worked for.
+    const someoneElse = /\b(compet\w*|customers?|partners?|clients?|uses|using|such as|like)\b/.test(t);
+    // She has worked elsewhere ("ever worked at a FAANG company?"), so No needs THIS company, as who she worked for.
+    // "for us" reads the original case: lower-cased, "worked for US companies" would look like it.
+    const usHere = /\b(for|by|with|of|at) us\b/.test(raw) || /\b(works?|worked|working|employed) here\b|\bhere before\b/.test(t);
+    const thisCompany = workedAtCompany(raw, profile.company_name) || usHere || /\b(for|at|by|of|with|within) (this|our|the) (compan|organi[sz]ation|firm)|\b(current|former|previous|past)( or (current|former|previous|past))? (employee|worker|contractor)s?\W*$/.test(t);
+    if (!ownEmployer && !someoneElse && thisCompany && (/(ever|previously|before|prior|former|formerly)\b.{0,40}\b(employed|employee|worked? (for|at|by|here|with us)|working (for|at))\b/.test(t)
+        || /\bworked (for|at)\b.{0,40}\b(in the past|before)\b/.test(t) || /work on behalf of|contractor, agency|third[- ]party vendor/.test(t)
+        || /(employ|work(ed)?)\b.{0,25}(for us|by us|here before|at (this|our) (compan|organi)|our compan|current or former)/.test(t) || /current or former (employee|worker|contractor)/.test(t))) return NO;
+    // Related to / knows a current employee of THIS company → No. Family anywhere else is on no file.
+    // "I have no relatives working here" is a statement, and a No to it says the opposite of what it seems to.
+    if (/\brelated to\b|\b(family members?|relatives?|spouse|sibling|parent|partner)\b.{0,30}\b(work|employ)|do you (have|know)\b.{0,30}(relative|family member)/.test(t))
+      return /\bi (?:have|am|do)\b|\bno (?:family|relatives?)\b/.test(t) ? null : namesCompany(raw, profile.company_name) || usHere || /\b(our|this|the) (compan|organi[sz]ation|firm)|\b(current|former) (employee|worker)s?\W*$/.test(t) ? NO : null;
     // Employed by / affiliated with a university, government, or public-sector entity → No (none
     // of these apply to her; this is the standard screening answer).
     if ((/(employ\w*|work\w*|affiliat\w*|officer|official|contractor)\b.{0,45}(universit|college|government|federal|state agenc|state government|public sector|public office|regulatory)/.test(t)
-         || /\b(government|public)\s+(official|employee|officer|entity|agenc)/.test(t)) && !/authori[sz]|united states/.test(t)) return NO;
-    // Citizenship / residency in an export-controlled or sanctioned country → No.
-    if (/(citizen|resident|national|permanent resident)\b.{0,80}(cuba|syria|iran|north korea|crimea|donetsk|luhansk|sanction)/.test(t)
-        || /\bexport[- ]control|sanctioned (countr|region|nation)/.test(t)) return NO;
-    // Related to / knows a current employee of the company → No.
-    if (/\brelated to (a |an |any |current |anyone|someone)/.test(t)
-        || /(family member|relative|spouse|friend)\b.{0,30}(work|employ)|do you (have|know)\b.{0,30}(relative|family member).{0,20}(work|employ)/.test(t)) return NO;
-    if (/relocat/.test(t)) return YES;
+         || /\b(government|public)\s+(official|employee|officer|entity|agenc)/.test(t)) && !/authori[sz]|united states|\b(family|relatives?|spouse|sibling|parent|partner|anyone|someone)\b/.test(t)) return NO;
+    // A statement to sign, however gently it is worded. Every Yes below would sign it in a batch.
+    const signs = SIGNS.test(t) && !/decline/.test(t);
+    if (signs && profile.unattended) return null;
+    const moving = /relocat|\bmov(?:e|ing)\b(?! forward| on\b| fast| quickly)/;
+    if (moving.test(t)) {
+      if (!where.elsewhere && /\b(require|need)\b.{0,20}\brelocat/.test(t)) return NO;     // she lives here: "Will you require relocation?"
+      // Yes only to a Bay Area place, read where the label says she would move to: "If not located
+      // in SF, are you willing to relocate to New York?" names SF, and moving to SF is not the question.
+      const at = all.search(moving), before = whole.slice(0, at), after = whole.slice(at);
+      if (/\b(away|out of|outside|from|anywhere)\b/i.test(after)) return null;
+      const to = (after.match(/^(?:relocat|mov)\w*\b(?:(?!\b(?:if|unless|when|while)\b)[^?.;])*?\b(?:to|near|in|around|within)\b([^?.;]*)/i) || [])[1] || "";
+      const target = to.split(/\b(?:if|unless|when|while)\b/i)[0];
+      if (target.trim()) {
+        const there = whereAsked(target, profile.company_name);
+        return there.bay && (!there.elsewhere || there.choice) ? YES : null;
+      }
+      // No target: "located in SF, or willing to relocate" means moving there, so the Bay Area has to be named first.
+      const named = whereAsked(before.replace(/\bif not\b/gi, " "), profile.company_name);
+      return named.bay && !where.elsewhere ? YES : null;
+    }
     // Do you use / have experience with the company's OWN product or system → Yes (favorable and
     // truthful — she's an engineer; owner's rule: answer toward getting the interview).
-    if (/(do you|have you|are you)\b.{0,45}(use|used|using|work(ed|ing)? (on|with)|experience (with|using)|familiar with|hands.?on|knowledge of)\b.{0,55}(workday|servicenow|our (product|platform|software|system|tool|technolog)|the (product|platform|system|software)|this (product|platform|system))/.test(t)) return YES;
-    if (/\bremot/.test(t)) return YES;
-    if (/on-?site|onsite|in[- ]office|in person|\bhybrid\b|commut/.test(t)) return YES;
+    if (/(do you|have you|are you)\b.{0,45}(use|used|using|work(ed|ing)? (on|with)|experience (with|using)|familiar with|hands.?on|knowledge of)\b.{0,55}(workday|servicenow|our (product|platform|software|system|tool|technolog)|the (product|platform|system|software)(?=\W*$)|this (product|platform|system))/.test(t)) return YES;
+    // Everything below says Yes to something she would do, so the label has to ask that. "Have you built remote
+    // attestation?" and "Do you object to on-site work?" hold the same words and ask the opposite of a standing answer.
+    const didIt = /\b(have you|did you|experience|built|certified|led|managed|implemented)\b/.test(t);
+    const refuses = /\b(object\w*|cannot|can['’]t|can not|unable|unwilling|uncomfortable|prevent\w*|restrict\w*|limitations?|limit(?:s|ed)?|problems?|issues?|accommodat\w*|concerns?|difficult\w*|hardship|conflicts?|obstacles?|barriers?|impossible|refuse\w*|reason)\b|\bnot (?:able|willing|open|comfortable|available)\b/.test(t);
+    const willing = !didIt && !refuses && !/^\W*which\b/.test(t) && /\b(?:(?:are you|i am|i'm|you're|you are|would you|will you)\b[^?.]{0,60}\b(?:able|willing|comfortable|open|ok|okay|available|excited|happy|prepared|ready|commutable|fine|flexible)\b|can you|could you|you can)/.test(t);
+    const remote = /\bremot/.test(t);
+    // Days in office, on-site, commuting and on-call are a standing Yes in every mode: the queue only holds Bay Area or remote roles.
+    const arrangement = !techWords && (/on[- ]?site|in[- ]office|in person|\bhybrid\b|\bcommut(?:e|es|ing|able)\b|\bon[- ]?call\b/.test(t) || officeDays || (where.bay && /work(ing)? (at|in|from)/.test(t)));
+    if (techWords) return null;
+    if (remote && !arrangement) {
+      // Open to remote work is a Yes. A remote role with a residency rule, or a need for remote work, is neither her answer nor on file.
+      return willing && !/\b(only|require[sd]?|needs?|must|states?|qualify)\b[^.?!]{0,30}\bremot|\bremot[^.?!]{0,30}\b(only|require[sd]?|needs?|must|states?|qualify)\b/.test(t)
+        && /\bwork(?:ing)? (?:\w+ )?remote(?:ly)?\b|\bremote(?:ly)?[- ](?:work|role|position|job|basis|setting|arrangement|environment|schedule|first)\b|\b(?:be|being|stay|go|fully) remote\b|\bremote(?:ly)?\W*$/.test(t) ? YES : null;
+    }
+    if (arrangement) return willing ? YES : null;
+    if (/\btravel/.test(t) && !willing) return null;
     if (/able to travel|willing.*travel/.test(t)) return YES;
     // Generic favorable "are you willing / able to …" → Yes (aim for the interview).
-    if (/are you (willing|able|comfortable|prepared|ready|open|available)\b.{0,40}(to|for|work)|can you (start|begin|commit|work|commute|attend)|willing to (start|commit|undergo|travel)/.test(t)) return YES;
-    if (/\b18\b.*(older|age)|at least 18|over 18|of legal age|legally an adult/.test(t)) return YES;
-    // acknowledgements / confirmations the form needs a Yes on
-    if (/\b(do you |please |i )?(accept|confirm|acknowledge|agree|certif(y|ies)|consent)\b/.test(t) && !/decline/.test(t)) return YES;
-    // "how/where did you hear about this job" — answer "Job board" (owner's pick, 2026-09-23; was LinkedIn)
-    if (/(how|where) did you (hear|learn|find)|hear about (us|this)|source of (this )?(job|opportunity|application)/.test(t))
-      return { text: "Job board", choice: "Job board" };
+    if (!refuses && !away && /are you (willing|able|comfortable|prepared|ready|open|available)\b.{0,40}(to|for|work)|can you (commit|work|commute|attend)|willing to (commit|undergo|travel)/.test(t)) return SOFT_YES;
+    if (/\b18\b.*(older|age)|at least 18|over 18|of legal age|legally an adult/.test(t) && !/\band\b/.test(t)) return YES;
+    // acknowledgements / confirmations the form needs a Yes on.
+    if (/\b(do you |please |i )?(accept|confirm|acknowledge|agree|certif(y|ies)|consent)\b/.test(t) && !/decline/.test(t)) return SOFT_YES;
     // residency / country / location (value)
-    if (/(which )?country.*(resid|live|based|located|from|in)|(resid|live|based).*country|country of (residence|origin)/.test(t)) return { text: US, choice: US };
-    if (/\bcountry\b/.test(t)) return { text: US, choice: US };
+    // Only where she lives now. A country she was born in, holds a passport from or once lived in is not that one.
+    if (/\bcountry\b/.test(t)) {
+      if (/\b(citizen|passport|birth|born|origin|national|native|naturali)|home country|are you from\b/.test(t)) return null;
+      const bareCountry = /^\W*(?:current\s+)?country(?:\s*(?:\/|or)\s*(?:region|territory))?(?:\s+code)?\W*(?:required\W*)?$|^\W*(?:your\s+|current\s+)*country of (?:current )?residence\b/.test(t);
+      const livesThere = /\b(reside|residing|live|living|located|based)\b/.test(t);
+      return (bareCountry || livesThere) && !/\b(previous|former|last|prior|past|other|another|ever|years?|family|have you|did you|were you|office|company|role|job|position|team|employer|school|university)\b/.test(t) ? { text: US, choice: US } : null;
+    }
     if (/current (city|location)|city\/state|where are you (based|located|currently)|your (current )?location|based in|current residence/.test(t)) return { text: fullLoc(profile) };
-    if ((/^\s*state\b|\bstate\/province|\bprovince\b/.test(t)) && !/united states|statement/.test(t)) {
+    if (/^\W*state(?:\s*(?:[/,]|or)\s*province)?(?:\s*(?:[/,]|or)\s*region)?\W*$|^\W*province\W*$|\bstate(?:\/province)? of residence\b|\bstate\s*[/,]\s*province\b.*\b(?:live|reside|located|based)\b/.test(t)) {
       // owner 2026-09-23: the state comes from the profile (Texas for Taylor, California for her),
       // and a dropdown may list either the full name or the two-letter code — match both.
       const st = stateFull(profile), ab = stateAbbr(profile);
       return { text: st, choice: st, choiceAlt: ab };
     }
-    if (/able to work (at|in|from)|can you work (at|in|from)|position is (located|based)|role is (in|located|based)|work (at|from) (this|the) (location|office)/.test(t)) return YES;
+    if (willing && /able to work (at|in|from)|can you work (at|in|from)|position is (located|based)|role is (in|located|based)|work (at|from) (this|the) (location|office)/.test(t)) return YES;
     return null;
   }
 
   // The question text for a select / radio group / combobox (fieldset legend, label[for],
   // or the enclosing question container) — richer than fieldText, used for common answers.
   function controlLabel(el) {
+    if (el.type === "radio") return globalThis.JobScanFormAgent?.radioQuestion(el) || "";
     const fs = el.closest("fieldset");
     if (fs) { const lg = fs.querySelector("legend"); if (lg && lg.innerText.trim()) return clean(lg.innerText); }
     const byFor = el.id && document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
@@ -381,7 +707,8 @@
       const i = pickLegalOption(opts.map((o) => o.text), want);
       if (i >= 0) target = opts[i];
     }
-    if (!target && want.yesno) {
+    // A legal answer has only the score: a first-word click would take "Yes - I have a green card".
+    if (!target && want.yesno && !want.legal) {
       const yn = want.yesno === "yes" ? /^\s*y(es)?\b/i : /^\s*no?\b/i;
       target = opts.find((o) => yn.test(o.text));
     }
@@ -409,7 +736,7 @@
       const i = pickLegalOption(radios.map(radioLabel), want);
       if (i >= 0) target = radios[i];
     }
-    if (!target && want.yesno) {
+    if (!target && want.yesno && !want.legal) {
       const yn = want.yesno === "yes" ? /^\s*y(es)?\b/i : /^\s*no?\b/i;
       target = radios.find((r) => yn.test(radioLabel(r)));
     }
@@ -496,10 +823,10 @@
       const menu = document.getElementById(input.getAttribute("aria-controls") || "");
       if (menu) {
         options = [...menu.querySelectorAll("[role=option]")];
-        // a FUNCTION fallback is a scorer over the rendered options (pickLegalOption) — it
-        // knows the sentence twins apart, so it gets first pick; the plain regex still follows
+        // a FUNCTION fallback is a scorer over the rendered options (pickLegalOption). It knows the
+        // sentence twins and false statuses apart, so when it picks nothing, nothing gets clicked.
         if (options.length && typeof fallback === "function") opt = fallback(options) || null;
-        if (!opt) opt = options.find((o) => want.test(o.textContent));
+        else if (!opt) opt = options.find((o) => want.test(o.textContent));
       }
     }
     if (!opt && fallback && typeof fallback !== "function") opt = options.find((o) => fallback.test(o.textContent));
@@ -530,9 +857,15 @@
   // Async typeahead (location/city pickers): the suggestions are fetched only AFTER you type,
   // and they come back worded differently from what we typed ("San Jose, CA" → "San Jose, CA,
   // USA"), so an exact match would always miss. Type to filter, wait for the fetch, take the
-  // FIRST suggestion — which is what a human does here.
-  async function pickTypeahead(control, input, text) {
+  // FIRST suggestion — which is what a human does here. A Yes/No answer is different: a filter
+  // that matches anywhere lists "Yes, now" first for a typed "No", so only an option starting with
+  // that word counts. `choose` (the options → one of them, or nothing) replaces both rules.
+  async function pickTypeahead(control, input, text, choose) {
     if (!control || !input || !text) return { ok: false };
+    const word = /^\s*(yes|no)\b/i.exec(text);
+    const pick = choose || (word
+      ? (els) => els.find((o) => new RegExp("^\\s*" + word[1] + "\\b", "i").test(o.textContent))
+      : (els) => els[0]);
     if (input.getAttribute("aria-expanded") === "true") {
       input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
       await sleep(120);
@@ -541,17 +874,23 @@
     await sleep(60);
     input.focus();
     setNativeValue(input, text);                         // filter
-    let opts = [];
-    for (let i = 0; i < 22 && !opts.length; i++) {        // async fetch — poll fast, bail late
+    let target = null;
+    for (let i = 0; i < 22 && !target; i++) {             // async fetch — poll fast, bail late
       await sleep(80);
       const menu = document.getElementById(input.getAttribute("aria-controls") || "");
-      opts = menu
+      const opts = menu
         ? [...menu.querySelectorAll("[role=option]")]
         : [...document.querySelectorAll('[role=option],[class*="select__option"]')].filter((o) => o.offsetParent);
+      if (opts.length) target = pick(opts) || null;
     }
-    if (!opts.length) { input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); return { ok: false }; }
+    if (!target) {
+      input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      // Blank for Reviewer to raise. Letters left in the box would read as her answer.
+      if (choose || word) setNativeValue(input, "");
+      return { ok: false };
+    }
     const before = (control.innerText || "").trim();
-    coordSeq(opts[0]);                                   // take the FIRST suggestion
+    coordSeq(target);
     for (let i = 0; i < 10 && (control.innerText || "").trim() === before; i++) await sleep(40);
     return { ok: true, picked: (control.innerText || "").replace(/\s+/g, " ").trim() };
   }
@@ -637,6 +976,20 @@
   // Open a sentence-option dropdown, read its real options, ask the server (AI) which one fits
   // this candidate, and select it. Returns true if it committed a choice. Used only when the
   // deterministic rules can't answer — the options are worded per-company and can't be hardcoded.
+  // A required Ashby choice no rule can answer: the model answers soft questions yes, hard ones from
+  // the facts, and -1 leaves it blank so Reviewer stops and the owner is asked.
+  const mayAskAI = (el, role) => {
+    const entry = el.closest('[class*="_fieldEntry"], .ashby-application-form-field-entry');
+    const label = entry && entry.querySelector("label");
+    return !!(IS_ASHBY && role && role.ai_enabled && role.auto_dropdowns !== false && label && /(?:^|\s)_required/.test(label.className || "") &&
+              !EXPORT_CONTROL.test(label.textContent || ""));
+  };
+  async function aiPickIndex(role, question, options) {
+    const res = await send({ type: "pickOption", jobId: role.job_id, question, options });
+    const index = res && typeof res.index === "number" ? res.index : -1;
+    return index < options.length ? index : -1;
+  }
+
   async function aiPickCombo(input, control, label, role, log) {
     if (input.getAttribute("aria-expanded") === "true") {
       input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })); await sleep(120);
@@ -659,8 +1012,55 @@
     return true;
   }
 
+  // An Ashby autocomplete no rule can answer goes to the model as a radio does, so it needs the options.
+  // It may list nothing until you type, and only every first letter together is the whole list, whether
+  // it filters by prefix or anywhere: the model must not choose from a part of the choices.
+  async function aiPickTypeahead(input, control, label, role, log) {
+    const escape = () => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    const listed = () => {
+      const menu = document.getElementById(input.getAttribute("aria-controls") || "");
+      return menu ? [...menu.querySelectorAll("[role=option]")].map((o) => o.textContent.trim()).filter(Boolean) : [];
+    };
+    if (input.getAttribute("aria-expanded") === "true") { escape(); await sleep(120); }
+    coordSeq(control);
+    let options = [];
+    for (let i = 0; i < 6 && !options.length; i++) { await sleep(80); options = listed(); }
+    if (!options.length) {
+      const seen = new Set();
+      for (const letter of "abcdefghijklmnopqrstuvwxyz0123456789") {
+        checkDeadline();
+        setNativeValue(input, letter);
+        await sleep(100);
+        for (const option of listed()) seen.add(option);
+      }
+      setNativeValue(input, "");
+      options = [...seen];
+    }
+    if (!options.length) { escape(); return false; }
+    const index = await aiPickIndex(role, label, options);
+    if (index < 0) { escape(); return false; }
+    const r = await pickTypeahead(control, input, options[index], (els) => els.find((o) => o.textContent.trim() === options[index]));
+    if (r.ok) log("AI picked: " + short(label) + " → " + short(options[index]) + " — verify it", "good");
+    return r.ok;
+  }
+
+  // The form's own mark, as capture reads it. Ashby marks the question's label, not the box.
+  const isRequired = (el) => {
+    const entry = el.closest('[class*="_fieldEntry"], .ashby-application-form-field-entry');
+    const label = entry && entry.querySelector("label");
+    return !!(el.required || el.getAttribute("aria-required") === "true" || (label && /(?:^|\s)_required/.test(label.className || "")));
+  };
+  // A batch has nobody reading model text before Submit, and preflight only reads required questions.
+  // So optional boxes wait for the board's essay switch.
+  const essaysHeld = (profile) => !!runnerDeadline && !(profile && profile.allow_unread_essays);
+
   async function fillCommon(profile, log, role) {
     const leftover = [];
+    // All the form says at this control. A confirmed answer has to cover the statement under the title as well.
+    const askedAt = (el, label) => {
+      const statement = globalThis.JobScanFormAgent?.statementOf?.(el) || "";
+      return statement ? `${label} ${statement}` : label;
+    };
     let acted = false;
     const pace = async () => { if (acted) await humanPause(); acted = true; };
 
@@ -668,7 +1068,7 @@
       if (sel.disabled) continue;
       const label = controlLabel(sel);
       if (SENSITIVE.test(label)) continue;
-      const ans = commonAnswer(label, profile);
+      const ans = commonAnswer(label, profile, askedAt(sel, label));
       if (!ans) continue;
       if (sel.selectedIndex > 0 && (sel.value || "").trim()) continue;   // already chosen
       await pace();
@@ -683,10 +1083,17 @@
       if (group.some((x) => x.checked)) continue;                        // already answered
       const label = controlLabel(r);
       if (SENSITIVE.test(label)) continue;
-      const ans = commonAnswer(label, profile);
-      if (!ans || !ans.yesno) continue;
+      const ans = commonAnswer(label, profile, askedAt(r, label));
+      if (ans && (ans.yesno || ans.choice)) {
+        await pace();
+        if (fillRadio(group, ans)) { log("answered: " + short(label), "good"); continue; }
+      }
+      // A rule that answered Yes/No or in words a radio cannot hold stays blank for Reviewer to raise.
+      if (ans && !ans.choice) continue;
+      if (DEMOGRAPHIC.test(label) || !mayAskAI(r, role)) continue;
       await pace();
-      if (fillRadio(group, ans)) log("answered: " + short(label), "good");
+      const index = await aiPickIndex(role, label, group.map(radioLabel));
+      if (index >= 0) { group[index].click(); log("AI picked: " + short(label) + " → " + short(radioLabel(group[index])) + " — verify it", "good"); }
     }
 
     const seenCombo = new Set();
@@ -698,25 +1105,56 @@
       const cur = (control.innerText || "").replace(/\s+/g, " ").trim();
       if (cur && !/^select\.\.\.$/i.test(cur)) continue;              // already chosen
       if (DEMOGRAPHIC.test(label)) continue;                          // handled by fillDemographics
+      // Ashby's autocomplete keeps its value in the input and lists nothing until you type.
+      const autocomplete = IS_ASHBY && input.getAttribute("aria-autocomplete") === "list";
+      if (autocomplete && ((input.value || "").trim() || /search schools/i.test(input.placeholder || ""))) continue;
 
-      const ans = commonAnswer(label, profile);
+      const ans = commonAnswer(label, profile, askedAt(input, label));
+      // legal Yes/No: score the real option texts (a "Yes, … but will require sponsorship"
+      // twin must lose to "Yes, … and do not require"); no score, no click
+      const legalPick = ans && ans.legal
+        ? (els) => { const i = pickLegalOption(els.map((o) => o.textContent), ans); return i >= 0 ? els[i] : null; }
+        : null;
       let done = false;
+      if (autocomplete) {
+        const source = /how (did|do) you hear|where did you (hear|learn|find)|hear about (us|this)|source of (this )?(job|opportunity|application)|referral source/.test(label.toLowerCase());
+        const said = ans && !ans.legal && ans.text;
+        const yesNo = ans && ans.yesno ? (ans.yesno === "yes" ? "Yes" : "No") : "";
+        // A place question wants the state as asked, or the city, which matches more than the full address.
+        // A question answered Yes or No is not one, whatever it mentions ("based in or open to relocating…?").
+        const place = !yesNo && (ans ? ans.text === fullLoc(profile) : WHERE_SHE_IS.test(label));
+        const wording = source ? ["Job board", "LinkedIn", "Online", "Website", "Other"]
+          : /\bstate\b|province|region/i.test(label) ? [said || yesNo]
+          : place ? [cityOnly(profile) || said]
+          : [yesNo || said, ans && !ans.legal && ans.choice];
+        for (const text of new Set(wording.filter(Boolean))) {
+          await pace();
+          const r = await pickTypeahead(control, input, text, legalPick);
+          if (r.ok) { log("selected: " + short(label) + " → " + short(input.value || text), "good"); done = true; break; }
+          setNativeValue(input, "");
+        }
+        // As with a radio: a rule that could only say Yes or No stays blank for Reviewer to raise.
+        if (!done && (!ans || ans.choice) && !SENSITIVE.test(label) && mayAskAI(input, role)) {
+          await pace();
+          done = await aiPickTypeahead(input, control, label, role, log);
+        }
+        if (!done && !SENSITIVE.test(label)) log("dropdown — pick manually: " + short(label), "warn");
+        continue;
+      }
       // "How did you hear about us?" — prefer "Job board" (owner 2026-09-23), then LinkedIn and the
       // other common sources, then the FIRST real option, so a required field never blocks.
       if (!done && /how (did|do) you hear|where did you (hear|learn|find)|hear about (us|this)|source of (this )?(job|opportunity|application)|referral source/.test(label.toLowerCase())) {
         await pace();
-        let r = await pickReactSelect(control, input, /job\s?board/i, /linkedin|online|internet|company (web)?site|social media|search engine|google|other/i);
+        // A role found on a job board is not one found on LinkedIn: xAI's list put LinkedIn first, and the Reviewer
+        // refused it against her standing "Job board" (2026-11-08). So a site like a board comes first, LinkedIn last.
+        let r = await pickReactSelect(control, input, /job\s?board/i, /job\s?(?:site|search|posting)|careers? (?:page|site|website)|company (?:web)?site|online|internet|search engine|google/i);
+        if (!r.ok) r = await pickReactSelect(control, input, /^\s*other\b/i, /linkedin|social media/i);
         if (!r.ok) r = await pickAnyOption(control, input);   // still nothing → first real option
         if (r.ok) { log("how did you hear → " + short(r.picked), "good"); done = true; }
       }
       if (!done && ans && (ans.choice || ans.yesno)) {
         const want = ans.yesno ? (ans.yesno === "yes" ? /^\s*yes\b/i : /^\s*no\b/i)
           : new RegExp(escapeRe(ans.choice) + (ans.choiceAlt ? "|^\\s*" + escapeRe(ans.choiceAlt) + "\\b" : ""), "i");
-        // legal Yes/No: score the real option texts (a "Yes, … but will require sponsorship"
-        // twin must lose to "Yes, … and do not require"); the plain regex stays as fallback
-        const legalPick = ans.legal
-          ? (els) => { const i = pickLegalOption(els.map((o) => o.textContent), ans); return i >= 0 ? els[i] : null; }
-          : null;
         await pace();
         const r = await pickReactSelect(control, input, want, legalPick);
         if (r.ok) { log("selected: " + short(label) + " → " + short(r.picked), "good"); done = true; }
@@ -740,12 +1178,13 @@
       if (isDropdownish(el)) continue;
       const label = questionLabel(el);
       if (!label || label.length < 4 || !/[a-z]/i.test(label)) continue;
-      const ans = commonAnswer(label, profile);
+      const ans = commonAnswer(label, profile, askedAt(el, label));
       // value answer (country/location) OR a Yes/No question rendered as a free-text box
       // ("Have you previously worked at <company>?" → No; "Authorized to work?" → Yes).
-      const val = ans && (ans.text || (ans.yesno ? (ans.yesno === "yes" ? "Yes" : "No") : ""));
+      const val = ans && (ans.text || (ans.yesno && YES_NO_QUESTION.test(label) ? (ans.yesno === "yes" ? "Yes" : "No") : ""));
       if (val) { await pace(); el.focus(); setNativeValue(el, val); el.blur(); log("filled: " + short(label), "good"); continue; }
       if (SENSITIVE.test(fieldText(el))) continue;      // sensitive & no known answer → user handles
+      if (essaysHeld(profile) && !isRequired(el)) continue;
       leftover.push({ el, label });
       if (leftover.length >= 15) break;
     }
@@ -865,6 +1304,10 @@
   // (Nvidia offers only "B Tech", no "Bachelor"). Match on ALL common aliases for the level.
   function degreeRegex(degree) {
     const d = (degree || "").toLowerCase();
+    // A business master's is a different degree: Glean's list puts "Master of Business Administration (M.B.A.)" before
+    // "Master's Degree", and the first match used to win (2026-11-08 dry run).
+    if (/master|\bm\.?s\b|graduate/.test(d) && !/business|\bm\.?b\.?a\b/.test(d))
+      return /^(?!.*(?:business|\bm\.?\s?b\.?\s?a\b)).*(?:master|\bm\.?\s?s\b|\bm\.?\s?tech|\bm\.?\s?eng|post.?grad|graduate)/i;
     if (/master|\bm\.?s\b|graduate/.test(d)) return /master|\bm\.?\s?s\b|\bm\.?\s?tech|\bm\.?\s?eng|\bmba\b|post.?grad|graduate/i;
     if (/bachelor|\bb\.?s\b|undergrad/.test(d)) return /bachelor|\bb\.?\s?s\b|\bb\.?\s?tech|\bb\.?\s?e\b|\bb\.?\s?eng|undergrad/i;
     if (/ph\.?d|doctor/.test(d)) return /ph\.?d|doctor/i;
@@ -933,8 +1376,11 @@
         if (fb && await ghSetTypeahead(`discipline--${i}`, fb))
           log(`discipline: no "${e.discipline}" in the list → ${fb}`, "good");
       }
-      ghSetText(`start-date-year--${i}`, e.start_year);   // present on some tenants
-      ghSetText(`end-date-year--${i}`, e.end_year);
+      // Dates are on some tenants only, under either name (Glean: start-year--0, required).
+      for (const id of [`start-date-year--${i}`, `start-year--${i}`]) ghSetText(id, e.start_year);
+      for (const id of [`end-date-year--${i}`, `end-year--${i}`]) ghSetText(id, e.end_year);
+      for (const [id, month] of [[`start-month--${i}`, e.start_month], [`end-month--${i}`, e.end_month]])
+        if (month && document.getElementById(id)) await ghSetCombo(id, /^\d+$/.test(month) ? monthName(month) : month);
       log("education: " + e.school, "good");
       await humanPause();
     }
@@ -965,6 +1411,11 @@
     return true;
   }
 
+  // The select's values are 1-12. The profile may say "January" or "01".
+  function monthNumber(mm) {
+    const named = "janfebmaraprmayjunjulaugsepoctnovdec".indexOf(String(mm).trim().slice(0, 3).toLowerCase());
+    return String(named >= 0 && named % 3 === 0 ? named / 3 + 1 : parseInt(mm, 10));
+  }
   async function ashbyDateInto(div, mm, yyyy) {   // the month/year <select> pair inside a date <div>
     if (!div) return false;                       // pass the ELEMENT — ids repeat, getElementById lies
     // Set month, then year, and VERIFY each landed (a React re-render can otherwise clobber the
@@ -980,7 +1431,7 @@
       return false;
     };
     let ok = true;
-    if (mm) { ok = setVerify(String(parseInt(mm, 10)), true) && ok; await sleep(70); }   // "04"→"4"
+    if (mm) { ok = setVerify(monthNumber(mm), true) && ok; await sleep(70); }   // "04" or "April" → "4"
     if (yyyy) { ok = setVerify(String(yyyy), false) && ok; await sleep(50); }
     return ok;
   }
@@ -1009,7 +1460,7 @@
   // Ashby renders some Yes/No questions as a PAIR OF BUTTONS (not radios/dropdown): two
   // <button> with text "Yes"/"No". Answer from the profile (sponsorship→No, previously
   // employed→No, authorized→Yes), clicking the matching button in that question's block.
-  async function fillAshbyButtons(profile, log) {
+  async function fillAshbyButtons(profile, log, role) {
     // Group Yes/No buttons by their QUESTION container. NOTE the buttons' own class contains
     // "_container", so closest('[class*=_container]') would return the button itself — walk up to
     // the "_fieldEntry" block (which holds the question label + both buttons), or the smallest
@@ -1034,10 +1485,21 @@
     for (const [block, btns] of groups) {
       if (btns.length < 2) continue;
       if (btns.some((b) => /_selected|_active|true/i.test((b.getAttribute("aria-pressed") || "") + " " + b.className))) continue; // answered
-      const q = (block.innerText || "").replace(/\s+/g, " ").replace(/\b(yes|no)\b/gi, "").trim();
+      // Only the buttons' own words come off. A "no" inside a statement is the difference between two statements.
+      let q = (block.innerText || "").replace(/\s+/g, " ").trim();
+      for (const b of [...btns].reverse()) {
+        const word = (b.textContent || "").trim();
+        if (q.toLowerCase().endsWith(word.toLowerCase())) q = q.slice(0, -word.length).trimEnd();
+      }
       if (SENSITIVE.test(q)) continue;
       const ans = commonAnswer(q, profile);
-      if (!ans || !ans.yesno) continue;
+      if (!ans) {
+        if (!mayAskAI(btns[0], role)) continue;
+        const index = await aiPickIndex(role, q, btns.map((b) => (b.textContent || "").trim()));
+        if (index >= 0) { btns[index].click(); await sleep(150); log("AI picked: " + short(q) + " → " + btns[index].textContent.trim() + " — verify it", "good"); }
+        continue;
+      }
+      if (!ans.yesno) continue;
       const want = ans.yesno === "yes" ? /^yes$/i : /^no$/i;
       const target = btns.find((b) => want.test((b.textContent || "").trim()));
       if (target) { target.click(); await sleep(150); log("answered: " + short(q) + " → " + ans.yesno, "good"); }
@@ -1108,14 +1570,13 @@
   }
 
   async function fillGoogle(profile, log) {
-    const legalFirst = profile.legal_first_name || profile.first_name;
     // text fields by label
     let filled = [];
     for (const el of document.querySelectorAll('input[jsname="YPqjbf"]')) {
       if (!el.offsetParent || (el.value || "").trim()) continue;
       const l = gLabel(el).toLowerCase();
       let v = "";
-      if (/first name/.test(l)) v = legalFirst;
+      if (/first name/.test(l)) v = valueFor(/\blegal\b/.test(l) ? "legal_first_name" : "first_name", profile);
       else if (/last name|surname|family/.test(l)) v = profile.last_name;
       else if (/email/.test(l)) v = profile.email;
       // Phone: Google's number box wants PLAIN DIGITS only — the "+1" lives in the separate
@@ -1224,7 +1685,7 @@
     const profile = role.profile || {};
     const filled = [];
     const t = [
-      ["first-name-input", profile.legal_first_name || profile.first_name, "first name"],
+      ["first-name-input", valueFor("first_name", profile), "first name"],
       ["last-name-input", profile.last_name, "last name"],
       ["email-input", profile.email, "email"],
       ["confirm-email-input", profile.email, "confirm email"],
@@ -1363,7 +1824,7 @@
       if (!inp || (inp.value || "").trim()) continue;
       if (SENSITIVE.test(q)) { log("manual confirmation needed: " + q.slice(0, 42), "warn"); continue; }
       if (/signature/.test(q)) {
-        const nm = ((role.profile || {}).preferred_name || (role.profile || {}).first_name || "") + " " + ((role.profile || {}).last_name || "");
+        const nm = valueFor("legal_name", role.profile || {});
         if (srNativeSet(inp, nm.trim())) { n++; log("signed: " + nm.trim(), "good"); }
       } else if (/preferred.*name|nickname|goes by|what should we call you/.test(q)) {
         // owner 2026-09-23: a bare "Preferred name" question gets the preferred full name
@@ -1398,13 +1859,18 @@
     // prefer an input whose context says "resume"/"cv", not "cover letter"
     let target = preferred;
     if (!target) {
-      const files = [...document.querySelectorAll('input[type=file]')];
+      // Ashby's autofill uploader only parses a file; the answer belongs in the Resume field.
+      const files = [...document.querySelectorAll('input[type=file]')]
+        .filter((f) => !f.closest('.ashby-application-form-autofill-input-root'));
       target = files.find((f) => /resume|cv/i.test(fieldText(f)) && !/cover/i.test(fieldText(f)));
       if (!target) target = files.find((f) => !f.accept || /pdf/i.test(f.accept));
     }
     if (!target) return false;
     const dt = new DataTransfer();
-    dt.items.add(new File([bytes], name, { type: "application/pdf" }));
+    const file = new File([bytes], name, { type: "application/pdf" });
+    dt.items.add(file);
+    // Greenhouse takes the input away once the file is uploaded; the Reviewer then checks these bytes.
+    globalThis.JobScanFormAgent?.rememberPicked?.(file);
     Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "files").set.call(target, dt.files);
     target.dispatchEvent(new Event("input", { bubbles: true }));
     target.dispatchEvent(new Event("change", { bubbles: true }));
@@ -1449,14 +1915,18 @@
     return b.length >= 4 && b.length <= 8 ? b : null;
   }
   function fillCode(code) {
+    // Before anything is written: a snapshot must never carry this to the Reviewer model, even if she pastes it in herself.
+    const written = (...elements) => globalThis.JobScanFormAgent?.codeWritten?.(code, elements);
+    written();
     const boxes = otpBoxes();
     if (boxes && code.length === boxes.length) {         // split OTP boxes → one digit each
+      written(...boxes);
       boxes.forEach((el, i) => { el.focus(); setNativeValue(el, code[i]); });
       boxes[boxes.length - 1].blur();
       return true;
     }
     const el = codeField();
-    if (el) { el.focus(); setNativeValue(el, code); el.blur(); return true; }
+    if (el) { written(el); el.focus(); setNativeValue(el, code); el.blur(); return true; }
     return false;
   }
 
@@ -1497,6 +1967,8 @@
   const CONSENT_RE = /consent|acknowledg|i agree|i accept|i certify|i confirm|i have read|terms|privacy|gdpr|understand and agree|authoriz/i;
 
   function tickConsents(log) {
+    // Her review is what makes ticking these acceptable, and a batch has none. An agreement stays hers to sign.
+    if (runnerDeadline) return 0;
     let n = 0;
     for (const c of document.querySelectorAll('input[type=checkbox]')) {
       if (c.disabled || c.checked || !c.offsetParent) continue;
@@ -1992,7 +2464,8 @@
       if (SENSITIVE.test(q)) continue;
       const ca = commonAnswer(q, profile);
       let want = null, note = "";
-      if (ca && ca.yesno) want = ca.yesno === "yes" ? YES : NO;
+      // A legal answer never lands on "Yes - I have a green card" here either.
+      if (ca && ca.yesno) want = ca.legal ? new RegExp("^\\s*" + ca.yesno + "\\b(?!.*" + STATUS_CLAIM.source + ")", "i") : ca.yesno === "yes" ? YES : NO;
       else if (ca && (ca.choice || ca.text)) want = new RegExp("^\\s*" + escapeRe(ca.choice || ca.text), "i");
       if (!want) {
         const required = /\*/.test(box.innerText) || /\brequired\b/i.test(box.innerText);
@@ -2013,7 +2486,7 @@
   // draft a short paragraph with the same voice method as the cover-letter skill. Only ever
   // fills an EMPTY box, and only a genuinely open one — never a short factual field.
   async function fillCoverLetterBox(role, log) {
-    if (!role.ai_enabled) return;
+    if (!role.ai_enabled || essaysHeld(role.profile)) return;
     // Cover-letter drafting is the token-heavy call, so it does NOT fire automatically unless
     // you opted in (config ai.auto_cover_letter). Otherwise we just flag that a box exists —
     // the panel's "✍ cover letter" button drafts it on demand.
@@ -2249,11 +2722,17 @@
   }
 
   // ---- floating panel ----
+  // What a refusal means for her, on the panel and after a hand submit alike.
+  const EMPLOYER_SAID_NO = '雇主说不收这份。这家公司先不投了，它写了多久就停多久。不用再提交。';
+  // form_agent keeps its success check to itself. Its preflight runs that check first and answers in these words.
+  const RECEIPT_SEEN = /投递成功回执/;
+  let endHandWatch = null;   // a panel rebuilt for this page takes over the last one's watch
   function panel(role) {
     // Shadow DOM so the host page's CSS can't bleed in and overlap our text.
     const host = document.createElement("div");
     host.id = "jobscan-panel";
-    const shadow = host.attachShadow({ mode: "open" });
+    // Closed: an open root would let the employer's page read this log and reach these buttons.
+    const shadow = host.attachShadow({ mode: "closed" });
     shadow.innerHTML = `
       <style>
         :host{ all: initial; display:block; }
@@ -2305,6 +2784,9 @@
           <div class="role"></div>
           <div class="status"></div>
           <button class="primary fill">Fill application</button>
+          <button class="ok agent-review">Fill + Review</button>
+          <button class="ok agent-review-only">Review current form</button>
+          <button class="ok agent-submit">Fill → Review → Submit（此份）</button>
           <button class="code" hidden>📧 Get email code</button>
           <button class="ok submitted">✓ I submitted this</button>
           <div class="log"></div>
@@ -2327,15 +2809,17 @@
     // contradiction the owner hit: JobScan showed an un-applied role while the panel insisted
     // the role was already applied, because they were talking about two different rows.
     const guessed = role.top_role_default || role.from_pin;
+    // Titles and company names come from the employer's posting, and this string goes in as markup.
+    const text = (x) => String(x == null ? "" : x).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
     let appliedWarn = "";
     if (role.this_status === "applied" || role.this_status === "interviewing") {
       appliedWarn = guessed
-        ? `<div class="chip company-warn" title="This role was not matched from the page URL, so this may not be the posting you are on.">⚠ the role shown here (“${role.title}”) is marked “${role.this_status}” — but it was not matched from this URL, so it may not be this posting</div>`
-        : `<div class="chip applied-warn">⚠ you already marked THIS role “${role.this_status}”</div>`;
+        ? `<div class="chip company-warn" title="This role was not matched from the page URL, so this may not be the posting you are on.">⚠ the role shown here (“${text(role.title)}”) is marked “${text(role.this_status)}” — but it was not matched from this URL, so it may not be this posting</div>`
+        : `<div class="chip applied-warn">⚠ you already marked THIS role “${text(role.this_status)}”</div>`;
     } else if ((role.company_applied || []).length) {
       const a = role.company_applied;
-      const names = a.slice(0, 2).map((x) => x.title).join("; ") + (a.length > 2 ? ` +${a.length - 2} more` : "");
-      appliedWarn = `<div class="chip company-warn" title="${a.map((x) => x.title + " · " + x.status + (x.date ? " · " + x.date : "")).join("\n")}">↩ you've applied to ${role.company} before (${a.length}): ${names}</div>`;
+      const names = a.slice(0, 2).map((x) => text(x.title)).join("; ") + (a.length > 2 ? ` +${a.length - 2} more` : "");
+      appliedWarn = `<div class="chip company-warn" title="${text(a.map((x) => x.title + " · " + x.status + (x.date ? " · " + x.date : "")).join("\n"))}">↩ you've applied to ${text(role.company)} before (${a.length}): ${names}</div>`;
     }
     // This page's URL did NOT identify the role — it came from the ↗ you clicked in JobScan.
     // Say so loudly: everything below (résumé, salary, AI answers) is for THAT role, and if you
@@ -2361,7 +2845,7 @@
     // non-event ("why is there no résumé?") into a readable one ("those are for other tabs").
     const rejectedNames = (role.pins_rejected || []).map((p) => `${p.company} — ${p.title}`);
     const rejectedNote = rejectedNames.length
-      ? `<div class="chip company-warn" title="${rejectedNames.join("\n")}">📌 ${rejectedNames.length} other pinned role(s) ignored — they belong to a different company than this page</div>`
+      ? `<div class="chip company-warn" title="${text(rejectedNames.join("\n"))}">📌 ${rejectedNames.length} other pinned role(s) ignored — they belong to a different company than this page</div>`
       : "";
     // "no tailored résumé" means the upload below is the BASE résumé, not one written for this
     // JD. Spell that out — "text only" read as a formatting note, not as "wrong file".
@@ -2375,7 +2859,7 @@
     const apKey = role.apply_profile || ap.default;
     const apCard = (ap.profiles || {})[apKey];
     const idChip = apCard
-      ? `<div class="chip idcard${apKey !== ap.default ? " alt" : ""}" title="自动填表用这张名片：first name、email、电话都按它填，附的简历 PDF 抬头也是它。想换身份用下面的 ⇄ 按钮。">📇 ${apCard.label} ${apCard.display_name} · ${apCard.email}</div>`
+      ? `<div class="chip idcard${apKey !== ap.default ? " alt" : ""}" title="自动填表用这张名片：first name、email、电话都按它填，附的简历 PDF 抬头也是它。想换身份用下面的 ⇄ 按钮。">📇 ${text(apCard.label)} ${text(apCard.display_name)} · ${text(apCard.email)}</div>`
       : "";
     $(".status").innerHTML = pinNote + rejectedNote + appliedWarn + idChip + resumeChip;
     // One-click override for each rejected pin, when this panel has no résumé of its own.
@@ -2395,14 +2879,14 @@
         b.title = "JobScan did not find this company's name on this page, so it refused to " +
           "auto-attach the role's résumé. Click ONLY if you are sure this page is that " +
           "job's application form.";
-        b.onclick = () => {
+        b.onclick = pressed(() => {
           claimPin(pr);
           const cur = document.getElementById("jobscan-panel");
           if (cur) cur.remove();                    // panel() builds a fresh host each call
           const chosen = { ...pr, pin_override: true };
           panel(chosen);
           sparkleStart(chosen);                     // ✨ chips need the real job_id too
-        };
+        });
         $(".status").appendChild(b);
       }
     }
@@ -2422,7 +2906,7 @@
         "margin-top:0;margin-bottom:6px;border:1px dashed #64748b;background:#f8fafc;font-weight:600;";
       sb.textContent = `⇄ 这份改用 ${nc.label} ${nc.display_name} 投（${nc.email}）`;
       sb.title = "切换这个岗位的投递身份：简历立刻换抬头重打（内容不变），自动填表也换成这张名片的名字/邮箱/电话。";
-      sb.onclick = async () => {
+      sb.onclick = pressed(async () => {
         sb.disabled = true; sb.textContent = "切换中…";
         const res = await send({ type: "setProfile", jobId: role.job_id, profile: next, url: location.href });
         if (res && res.ok) {
@@ -2446,7 +2930,7 @@
           sb.textContent = `⇄ 这份改用 ${nc.label} ${nc.display_name} 投（${nc.email}）`;
           log(`身份切换失败：${(res && res.error) || "unknown"}`, "warn");
         }
-      };
+      });
       $(".status").appendChild(sb);
     }
 
@@ -2468,17 +2952,20 @@
         chip.className = "chip company-warn";
         chip.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:6px;";
         const left = (cd.days_left != null) ? `（还剩 ${cd.days_left} 天）` : "";
-        chip.innerHTML = `<span>❄️ ${role.company} 冷却中 → 到 ${cd.until}${left}${cd.reason ? " · " + cd.reason : ""}</span>`;
+        // Text, never markup: the reason can hold an employer's own words, and a script from that page would see this closed panel.
+        const said = document.createElement("span");
+        said.textContent = `❄️ ${role.company} 冷却中 → 到 ${cd.until}${left}${cd.reason ? " · " + cd.reason : ""}`;
+        chip.appendChild(said);
         chip.title = "这家公司在冷却期：扫描跳过、review 页隐藏、自动排队不排。到期自动解除。";
         if (cd.source !== "config") {
           const undo = document.createElement("button"); undo.type = "button"; undo.textContent = "撤销";
           undo.style.cssText = CD_BTN;
-          undo.onclick = async () => {
+          undo.onclick = pressed(async () => {
             undo.disabled = true;
             const res = await send({ type: "cooldownClear", company: role.company });
             if (res && res.ok) { log(`已解除 ${role.company} 的冷却`, "good"); renderPicker(); }
             else { undo.disabled = false; log(`解除失败：${(res && res.error) || "unknown"}`, "warn"); }
-          };
+          });
           chip.appendChild(undo);
         } else {
           const note = document.createElement("span"); note.style.cssText = "font-size:11px;color:#6b7280;"; note.textContent = "（写在 config.yaml 里）"; chip.appendChild(note);
@@ -2506,18 +2993,18 @@
         for (const d of [30, 60, 90, 180]) {
           const b = document.createElement("button"); b.type = "button"; b.textContent = `${d}天`;
           b.style.cssText = CD_BTN;
-          b.onclick = () => setIt(d, null, `${d} 天`);
+          b.onclick = pressed(() => setIt(d, null, `${d} 天`));
           line.appendChild(b);
         }
         const c = document.createElement("button"); c.type = "button"; c.textContent = "自定义";
         c.style.cssText = CD_BTN;
-        c.onclick = () => {
+        c.onclick = pressed(() => {
           const v = (prompt(`冷却 ${role.company} 多久？填天数（如 45）或日期（如 2027-01-01）`, "") || "").trim();
           if (!v) return;
           if (/^\d{1,3}$/.test(v)) setIt(Number(v), null, `${v} 天`);
           else if (/^\d{4}-\d{2}-\d{2}$/.test(v)) setIt(null, v, `到 ${v}`);
           else log("没听懂：请填 45 这样的天数，或 2027-01-01 这样的日期", "warn");
-        };
+        });
         line.appendChild(c);
         cdRow.appendChild(line);
       };
@@ -2525,16 +3012,16 @@
       $(".status").appendChild(cdRow);
     }
 
-    $(".x").onclick = () => { abortFill = true; host.remove(); };   // closing the panel also stops a fill
+    $(".x").onclick = pressed(() => { abortFill = true; host.remove(); });   // closing the panel also stops a fill
 
     // minimize / restore — collapse to just the header pill so it never covers the submit button
     const wrap = $(".wrap"), minBtn = $(".min");
-    minBtn.onclick = (e) => {
+    minBtn.onclick = pressed((e) => {
       e.stopPropagation();
       const collapsed = wrap.classList.toggle("collapsed");
       minBtn.textContent = collapsed ? "▢" : "–";
       minBtn.title = collapsed ? "restore" : "minimize";
-    };
+    });
 
     // drag the panel by its header (switch from bottom/right anchoring to top/left on first drag)
     $(".hd").addEventListener("mousedown", (e) => {
@@ -2555,7 +3042,7 @@
 
     const fillBtn = $(".fill");
     const FILL_LABEL = "Fill application";
-    fillBtn.onclick = async () => {
+    const runFill = async () => {
       // Second click while filling = STOP. Sets the abort flag; humanPause throws it and the
       // whole fill unwinds to the finally below, leaving whatever's filled so far in place.
       if (fillBtn.dataset.filling === "1") {
@@ -2563,12 +3050,13 @@
         fillBtn.textContent = "stopping…";
         return;
       }
+      let fillOutcome = { status: "completed" };
       abortFill = false;
       fillBtn.dataset.filling = "1";
       fillBtn.classList.add("stop");
       fillBtn.textContent = "■ Stop";
       $(".log").textContent = "";
-      const profile = role.profile || {};
+      const profile = role.profile = role.profile || {};
       profile._cards = (role.apply_profiles || {}).profiles;   // staleIdentityValue 用来认旧身份残值
       // 2026-09-15: the panel caches the role payload from INJECTION time. A tab opened while
       // the server was serving an empty profile (the stale-config incident) fills everything
@@ -2588,6 +3076,10 @@
               + "persists, restart the JobScan web server.", "warn");
         }
       }
+      // commonAnswer reads these. A batch has nobody reading the form before Submit, and whether a
+      // label means this employer ("Are you a former employee of Aurora?") needs the employer's name.
+      profile.unattended = !!runnerDeadline;
+      profile.company_name = role.company || "";
       try {
       // Workday is a different animal (multi-step wizard, its own widgets) — own filler,
       // fills the CURRENT step only; you click Save and Continue / Submit yourself.
@@ -2622,7 +3114,7 @@
       if (IS_ASHBY && document.querySelector('[id$="education_history-degree"]')) {
         await fillAshbyHistory(role, log);                // Ashby education block
       }
-      if (IS_ASHBY) await fillAshbyButtons(profile, log); // Ashby Yes/No button-pair questions
+      if (IS_ASHBY) await fillAshbyButtons(profile, log, role); // Ashby Yes/No button-pair questions
 
       // 2) common eligibility / logistics (dropdowns, Yes/No radios, country, location…)
       const leftover = await fillCommon(profile, log, role);
@@ -2638,7 +3130,18 @@
         await humanPause();
         const res = await send({ type: "resume", jobId: role.job_id });
         if (res && res.ok) {
-          const ok = attachResume(b64ToBytes(res.b64), res.name);
+          let ok = attachResume(b64ToBytes(res.b64), res.name);
+          // Greenhouse shows the file's name once it has taken the upload. On a page opened cold the file was once
+          // set before the form listened, and nothing went up (Vercel, 2026-11-08), so it is picked once more.
+          if (ok && /(^|\.)greenhouse\.io$/.test(location.hostname)) {
+            const uploaded = () => !!document.querySelector('[aria-labelledby="upload-label-resume"] .file-upload__filename');
+            for (let t = 0; t < 20 && !uploaded(); t++) await sleep(200);
+            if (!uploaded() && document.getElementById("resume")) {
+              ok = attachResume(b64ToBytes(res.b64), res.name, document.getElementById("resume"));
+              for (let t = 0; t < 20 && !uploaded(); t++) await sleep(200);
+            }
+            if (!uploaded()) { ok = false; log("Greenhouse did not take the résumé upload — attach it yourself", "warn"); }
+          }
           if (!ok && /jobs\.apple\.com/.test(location.hostname)) {
             // Apple keeps a PROFILE-level resume. While one is attached, the upload input
             // (#attachfile-resume-fileupload) is not rendered at all — and the attached file
@@ -2682,6 +3185,7 @@
       log("— review everything, then submit yourself.");
       } catch (e) {
         const m = String((e && e.message) || e);
+        fillOutcome = { status: m.includes(ABORT) ? "stopped" : "error", error: m };
         if (m.includes(ABORT)) log("⏹ stopped — the rest is yours.", "warn");
         else if (/context invalidated|Extension context/i.test(m)) log("JobScan was reloaded — refresh this page (⌘R), then click Fill again.", "warn");
         else log("fill error: " + m, "warn");
@@ -2690,30 +3194,299 @@
         fillBtn.classList.remove("stop");
         fillBtn.textContent = FILL_LABEL;
       }
+      return fillOutcome;
     };
+    fillBtn.onclick = pressed(runFill);
+    // In Chrome this lives in the isolated extension world, never the employer page world.
+    // The fixture loads this exact source in its own local page to exercise the real filler.
+    globalThis.JobScanRunFill = async () => {
+      if (fillBtn.dataset.filling === "1") return {status:"busy"};
+      return runFill();
+    };
+    const reviewBtn = $(".agent-review");
+    const reviewOnlyBtn = $(".agent-review-only");
+    const autoSubmitBtn = $(".agent-submit");
+    let reviewRun = null, approved = null, stopPanel = null;
+    let workflowBusy = false;
+    // Nothing more to report about a refusal on this page: Filler's own click got that answer and it went out with the
+    // result, the words were there before she did anything, or the watch has reported them.
+    let refusalSettled = false;
+    const closeSoon = () => setTimeout(() => send({ type: "closeTab" }), 1200);   // Done here: the record is saved, so the page can go.
+    // The code an employer emails after Submit (Greenhouse) goes from the mailbox straight into its boxes. No model,
+    // log or board message ever holds it. Mail can take a minute, so the mailbox is asked again for about 90 seconds.
+    const enterEmailedCode = async (stopped) => {
+      for (let tries = 0; tries < 9; tries++) {
+        checkDeadline();
+        const res = await send({ type: "emailCode", company: role.company });
+        if (res?.ok && res.code) {
+          if (!fillCode(res.code)) return {outcome:'blocked', evidence:'邮箱里的验证码找到了，但页面上没有能填的位置；请你自己填好再点提交。'};
+          log("filled the emailed code ✓", "good");
+          await sleep(600);
+          return JobScanFormAgent.submitAfterCode();
+        }
+        await sleep(10000);
+      }
+      return {outcome:'blocked', evidence:`${stopped.evidence} 等了 90 秒，邮箱里没有 ${role.company} 发来的验证码；请你去邮箱看一眼，填好再点提交。`};
+    };
+    const runReview = async (fillFirst, autoSubmit = false, eventSink = null, runnerLease = null) => {
+      if (!globalThis.JobScanFormAgent || !globalThis.JobScanWorkflow) { log("请重新加载扩展和页面。", "warn"); return; }
+      if (workflowBusy || fillBtn.dataset.filling === "1") return;
+      if (autoSubmit && (role.status !== "new" || role.no_role_match || role.top_role_default)) {
+        log("只有明确匹配的待投新岗位可以自动提交。", "warn"); return;
+      }
+      const standing = role.shared_memory?.submission_policy?.authorization === 'standing';
+      if (autoSubmit && !standing && !confirm(`仅授权这一份：${role.company} — ${role.title}\n${role.profile.first_name} ${role.profile.last_name} · ${role.profile.email}\n通过 Review 后自动提交；明确字段错误最多修正后重试一次；结果不明则停止。`)) return;
+      workflowBusy = true;
+      reviewBtn.disabled = reviewOnlyBtn.disabled = autoSubmitBtn.disabled = true;
+      let clickAttempted = false;
+      try {
+        if (reviewRun) await send({type:"agentInvalidate",runId:reviewRun.id});
+        approved = null; reviewRun = null;
+        const request = async (type, snapshot, run) => {
+          checkDeadline();
+          const res = await send({type, body:{job_id:role.job_id, apply_profile:role.apply_profile||"", snapshot,
+            run_id:run?.id||null, submit_authorized:autoSubmit,runner_lease:runnerLease}});
+          checkDeadline();
+          if (!res?.ok) throw new Error(res?.error || "协作服务无响应。");
+          reviewRun = res.run; return res.run;
+        };
+        const result = await JobScanWorkflow.run({
+          fill:async()=>{const out=fillFirst ? await runFill() : {status:"completed"};fillBtn.disabled=true;return out;},
+          prepare:()=>JobScanFormAgent.prepareAttachments?.(),
+          capture:()=>JobScanFormAgent.capture(),
+          review:(s,r)=>request('agentReview',s,r), confirm:(s,r)=>request('agentConfirm',s,r),
+          planRepair:async(snapshot,run)=>{
+            checkDeadline();
+            const res=await send({type:'agentRepair',body:{job_id:role.job_id,apply_profile:role.apply_profile||'',snapshot,run_id:run.id,runner_lease:runnerLease}});
+            checkDeadline();
+            if(!res?.ok)throw new Error(res?.error || 'Filler 修正服务无响应。');return res.run;
+          },
+          permit:(s,r)=>request('agentPermit',s,r),
+          repair:async(s,fixes)=>{checkDeadline();const changes=JobScanFormAgent.patch(s,fixes);await sleep(600);return changes;},
+          preflight:s=>{checkDeadline();return JobScanFormAgent.preflight(s);},
+          submit:async s=>{
+            checkDeadline();
+            if(runnerLease){
+              const active=await send({type:'runnerCheck',url:location.href,body:runnerLease});
+              if(!active?.ok || active.run?.job_id!==role.job_id)throw new Error('执行任务已结束，未点击提交。');
+            }
+            checkDeadline();clickAttempted=true;
+            const outcome=await JobScanFormAgent.submit(s);
+            return outcome.outcome==='blocked' && runnerLease && role.mailcode_enabled &&
+              globalThis.JobScanPageGate?.inspect()?.kind==='verification' ? enterEmailedCode(outcome) : outcome;
+          },
+          report:async(outcome,run)=>{
+            const res=await send({type:'agentResult',url:location.href,body:{...outcome,run_id:run.id,attempt_id:run.attempt_id}});
+            if(!res?.ok)throw new Error('提交回执未保存；不要重复投递。');reviewRun=res.run;return res.run;
+          },
+          record:async()=>{const res=await send({type:'markApplied',jobId:role.job_id,variant:role.resume_variant});
+            if(!res?.ok)throw new Error('记账失败');$('.submitted').disabled=true;role.status='applied';},
+          event:e=>{eventSink?.(e);log(`${e.role === 'filler' ? 'Filler' : 'Reviewer'}: ${e.text}`,e.issues?.length?'warn':'good');
+            for(const issue of e.issues||[])log((e.snapshot?.fields.find(f=>f.id===issue.field_id)?.label||'页面')+' — '+issue.reason,'warn');}
+        }, {autoSubmit});
+        approved = result.status === 'review_passed' ? result.snapshot : null;
+        const employerSaidNo = clickAttempted && /^雇主拒收/.test(result.reason || '');
+        log(result.status === 'submitted' ? '✓ 已读到雇主成功回执。'+result.reason :
+          result.status === 'review_passed' ? '✓ Review 通过，尚未提交。' :
+          employerSaidNo ? `${EMPLOYER_SAID_NO}（${result.reason.replace(/^雇主拒收：/,'')}）` : '需要处理：'+result.reason,
+          ['submitted','review_passed'].includes(result.status)?'good':'warn');
+        if (employerSaidNo) refusalSettled = true;
+        return {status:result.status,reason:result.reason || '',clicked:clickAttempted};
+      } catch (error) {
+        if (reviewRun) await send({type:"agentInvalidate",runId:reviewRun.id});
+        const reason = String(error.message || error);
+        log(reason, "warn");
+        // The service refuses a permit when an earlier click is on file: this form may already be with the employer.
+        const clicked = clickAttempted || /已提交、结果不明/.test(reason);
+        return {status:clicked?'unknown':'blocked',reason,clicked};
+      } finally {
+        workflowBusy=false;reviewBtn.disabled=reviewOnlyBtn.disabled=autoSubmitBtn.disabled=fillBtn.disabled=false;
+      }
+    };
+    reviewBtn.onclick = pressed(() => runReview(true));
+    reviewOnlyBtn.onclick = pressed(() => runReview(false));
+    autoSubmitBtn.onclick = pressed(async () => {
+      const result = await runReview(true, true);
+      // A receipt that did not get recorded keeps the page: the warning is there, and so is I submitted this.
+      if (result?.status === 'submitted' && role.status === 'applied') closeSoon();
+    });
+    globalThis.JobScanRunnerJobId = role.job_id;
+    globalThis.JobScanRunReview = async (expected) => {
+      if (workflowBusy || fillBtn.dataset.filling === '1') return {status:'blocked',reason:'此页面已有填表任务。'};
+      if (expected.apply_profile !== 'casey' || role.job_id !== expected.job_id) return {status:'blocked',reason:'岗位或名片与任务不符。'};
+      if(!expected.lease || !Number.isFinite(expected.deadline) || expected.deadline<=Date.now() || expected.deadline>Date.now()+12*60*1000)
+        return {status:'blocked',reason:'领取凭据或执行期限无效。'};
+      const gate = globalThis.JobScanPageGate?.inspect();
+      if (!gate || gate.kind !== 'ready') return {status:'blocked',reason:gate?.evidence || '页面检查组件尚未就绪。'};
+      const fresh = await send({type:'runnerLookup',url:location.href});
+      const current = fresh?.role;
+      if (!fresh?.found || current.job_id !== expected.job_id || current.apply_profile !== 'casey' ||
+          current.status !== 'new' || current.tailor_status !== 'ready' || !current.has_tailored_pdf ||
+          current.cooldown || current.top_role_default || current.shared_memory?.submission_policy?.authorization !== 'standing')
+        return {status:'blocked',reason:'岗位、简历、身份、冷却期或持续授权已改变，停止本份任务。'};
+      role = current;
+      const leased=await send({type:'runnerCheck',url:location.href,body:expected.lease});
+      if(!leased?.ok || leased.run?.job_id!==role.job_id)return {status:'blocked',reason:'领取任务已失效。'};
+      runnerDeadline=Math.min(expected.deadline,leased.run.expires_at*1000-30000);
+      // The board shows the same findings the panel log does, field by field.
+      const boardText=e=>[e.text,...(e.issues||[]).map(issue=>`· ${e.snapshot?.fields.find(f=>f.id===issue.field_id)?.label||'页面'}：${issue.reason}`+
+        (issue.replacement==null?'':` → ${issue.replacement}`))].join('\n');
+      try {
+        checkDeadline();
+        const result = await runReview(true,true,e=>send({type:'jobscanRunnerEvent',event:{role:e.role,text:boardText(e),to:e.to}}),expected.lease) ||
+          {status:'blocked',reason:'填表审查入口拒绝启动。'};
+        if (['needs_user','blocked','unknown'].includes(result.status) && !/^雇主拒收/.test(result.reason || '')) showStop(result);
+        return result;
+      } finally {runnerDeadline=0;}
+    };
+    // She may finish a form by hand at any time: after a stop, after a batch's gate held this tab back before any fill,
+    // or after reloading a stopped tab. A requeue would then send it again unless the role stops being new, so her own
+    // action followed by the employer's own receipt records it. A script on the page can write a receipt, but it cannot
+    // fake her action, so a receipt already there at the start or at her first action proves nothing.
+    const receiptShown = () => {
+      try { return RECEIPT_SEEN.test(JobScanFormAgent.preflight(JobScanFormAgent.capture()).reason || ''); }
+      catch { return false; }
+    };
+    const refusalOnPage = () => {
+      try { return JobScanFormAgent.refusalShown() || ''; }
+      catch { return ''; }
+    };
+    const watchHandSubmit = () => {
+      endHandWatch?.();
+      if (receiptShown()) return;
+      // An SPA can move to another posting in this tab, and a receipt there is about that one.
+      const posting = location.pathname.replace(/\/application.*$/, '');
+      let acted = false, pressedSubmit = false, hinted = false, marking = false, failures = 0, refusalFailures = 0;
+      // Refusal words are free text anywhere on a page. A filter, an FAQ or a follow-up question can show the same words after
+      // any click, and acting on that closes a role and freezes a company when nothing was sent. So they answer only Submit.
+      const pressesSubmit = event => {
+        if (event.type === 'keydown') return event.key === 'Enter' && event.target?.tagName === 'INPUT';
+        try { return JobScanFormAgent.candidates().includes(event.target?.closest?.('button,input[type=submit]')); }
+        catch { return false; }
+      };
+      const act = event => {
+        if (!event.isTrusted || event.target?.closest?.('[id^="jobscan-"]')) return;
+        if (!acted && receiptShown()) { end(); return; }
+        acted = true;
+        if (pressesSubmit(event)) {
+          // Refusal words already on the page came before this press, so they are not an answer to it.
+          if (!pressedSubmit && refusalOnPage()) refusalSettled = true;
+          pressedSubmit = true;
+        }
+      };
+      document.addEventListener('click', act, true);
+      document.addEventListener('keydown', act, true);
+      const end = () => {
+        clearInterval(timer);
+        document.removeEventListener('click', act, true);
+        document.removeEventListener('keydown', act, true);
+        endHandWatch = null;
+      };
+      // Same trade as the receipt: a script faking these words costs one company a cooldown and sends nothing. The tab stays, so she can read it.
+      const reportRefusal = async words => {
+        // A pin says only that this page is on the same site, so the words may be about another posting. She can read them; the role stays as it is.
+        if (role.from_pin || role.pin_override) {
+          refusalSettled = true;
+          const text = '这一页写着雇主不收，但这份岗位是靠你点开的链接认出来的，不一定是这个岗位，所以没有记。是的话，请在右上角面板的「不让投了？冷却」那里选天数。';
+          log(text,'warn'); stopPanel?.note(text);
+          return;
+        }
+        marking = true;
+        const res = await send({type:'handRefusal',jobId:role.job_id,evidence:words,url:location.href});
+        marking = false;
+        if (res?.ok) {
+          refusalSettled = true;
+          log(EMPLOYER_SAID_NO,'warn'); stopPanel?.refused(EMPLOYER_SAID_NO);
+        } else if (++refusalFailures >= 5) {
+          refusalSettled = true;
+          const text = '雇主说不收这份，但没记上：请在右上角面板的「不让投了？冷却」那里选天数。';
+          log(text,'warn'); stopPanel?.note(text);
+        }
+      };
+      const timer = setInterval(async () => {
+        // During a workflow its own record step speaks for the receipt.
+        if (marking || workflowBusy) return;
+        if (role.status !== 'new' || !location.pathname.startsWith(posting)) return end();
+        if (!acted) return;
+        if (!receiptShown()) {
+          const words = refusalSettled ? '' : refusalOnPage();
+          if (words && pressedSubmit) await reportRefusal(words);
+          else if (words && !hinted) {
+            hinted = true;
+            log('这一页写着像雇主不收的话，但你还没点提交，所以什么都没记。真是这样的话，请在右上角面板的「不让投了？冷却」那里选天数。','warn');
+          }
+          return;
+        }
+        marking = true;
+        const res = await send({type:'markApplied',jobId:role.job_id,variant:role.resume_variant});
+        marking = false;
+        if (res?.ok) {
+          end(); role.status = 'applied'; $('.submitted').disabled = true;
+          const text = '读到了雇主的成功回执，已自动记为已投。不要再提交，这一页马上自动关掉。';
+          log('✓ '+text,'good'); stopPanel?.applied(text);
+          closeSoon();
+        } else if (++failures >= 5) {
+          end();
+          const text = '读到了雇主的成功回执，但没记上：请点「I submitted this」，否则重跑时会再投一次。';
+          log(text,'warn'); stopPanel?.note(text);
+        }
+      },1000);
+      endHandWatch = end;
+    };
+    // The tab stays open after a stop, so the page itself says what is missing and takes the reply.
+    const showStop = result => {
+      try {
+        const fields = JobScanFormAgent.capture().fields;
+        const open = (reviewRun?.result?.issues || []).filter(issue => !issue.auto_fix);
+        const {items, pageIssues} = globalThis.JobScanStopPanel.rowsFrom({issues: open, fields, jobId: role.job_id});
+        // After a click this page asking for a code is the employer's next step, not a possible second send.
+        const codeStep = !!result.clicked && globalThis.JobScanPageGate?.inspect()?.kind === 'verification';
+        stopPanel = globalThis.JobScanStopPanel.show({company:`${role.company} · ${role.title}`, reason:result.reason, items, pageIssues,
+                                                      clicked:!!result.clicked, verification:codeStep, mailcode:!!role.mailcode_enabled,
+                                                      elementsFor:id => JobScanFormAgent.elementsFor(id), send});
+      } catch (error) { log('停止面板没能打开：'+String(error.message || error),'warn'); }
+    };
+    const staleTimer = setInterval(() => {
+      if (!host.isConnected) { clearInterval(staleTimer); return; }
+      if (!approved || !globalThis.JobScanFormAgent) return;
+      if (JobScanFormAgent.fingerprint(JobScanFormAgent.capture()) !== JobScanFormAgent.fingerprint(approved)) {
+        approved = null; log("表单改变，原 Review 已失效。请重新检查。", "warn");
+        send({type:"agentInvalidate",runId:reviewRun.id});
+      }
+    },1000);
 
     // Email verification-code button — only when mailcode is configured (app password present).
     if (role.mailcode_enabled) {
       const codeBtn = $(".code");
       codeBtn.hidden = false;
-      codeBtn.onclick = async () => {
+      codeBtn.onclick = pressed(async () => {
+        // Only this company's own code. Anyone else's stays in her mailbox: it has no business on an
+        // employer's page, and with no company named the service would hand back the newest from anyone.
+        const mailbox = () => log("没读到这家公司发来的验证码。可能还没到，也可能发件人对不上：请自己去邮箱看。别的发件人的验证码不会显示在这里。", "warn");
+        if (!role.company) { mailbox(); return; }
         codeBtn.disabled = true; const orig = codeBtn.textContent; codeBtn.textContent = "📧 checking…";
-        const res = await send({ type: "emailCode" });
+        const res = await send({ type: "emailCode", company: role.company });
         codeBtn.disabled = false; codeBtn.textContent = orig;
         if (!res || !res.ok) { log("email-code failed: " + (res && res.error), "warn"); return; }
-        if (!res.code) { log("no recent verification code found — trigger 'send code', then retry", "warn"); return; }
+        if (!res.code) { mailbox(); return; }
         const ok = fillCode(res.code);
-        log(ok ? `filled code ${res.code} ✓ (${res.subject || "email"})` : `code is ${res.code} — no code field found, paste it`, ok ? "good" : "warn");
-      };
+        log(ok ? `filled the code from ${role.company} ✓` : `code is ${res.code} — no code field found, paste it`, ok ? "good" : "warn");
+      });
     }
 
 
-    $(".submitted").onclick = async () => {
+    $(".submitted").onclick = pressed(async () => {
       const res = await send({ type: "markApplied", jobId: role.job_id, variant: role.resume_variant });
-      if (res && res.ok) { log("marked applied in JobScan ✓ (" + role.resume_variant + ")", "good"); $(".submitted").disabled = true; }
+      if (res && res.ok) {
+        log("marked applied in JobScan ✓ (" + role.resume_variant + ")", "good"); $(".submitted").disabled = true;
+        role.status = "applied";
+        closeSoon();
+      }
       else if (isContextDead(res)) log("JobScan was reloaded — refresh this page (⌘R), then click ✓ again.", "warn");
       else log("mark-applied failed: " + (res && res.error), "warn");
-    };
+    });
+    // A role the page does not identify (a guess at the company's top role, or no role at all) is not hers to mark from here.
+    if (role.status === "new" && role.job_id && !role.no_role_match && !role.top_role_default) watchHandSubmit();
     return host;
   }
 
@@ -2856,7 +3629,7 @@
     c.style.cssText = "position:fixed;display:none;width:24px;height:24px;padding:0;" +
       "border:1px solid #d0d5dd;border-radius:999px;background:#fff;color:#111;cursor:pointer;" +
       "font-size:13px;line-height:22px;text-align:center;box-shadow:0 1px 4px rgba(0,0,0,.18);";
-    c.onclick = (ev) => { ev.preventDefault(); ev.stopPropagation(); sparkleDraft(el, c); };
+    c.onclick = pressed((ev) => { ev.preventDefault(); ev.stopPropagation(); sparkleDraft(el, c); });
     sparkleHost.appendChild(c);
     return c;
   }
@@ -3204,7 +3977,7 @@
     if (document.getElementById("jobscan-capture")) return;
     const host = document.createElement("div");
     host.id = "jobscan-capture";
-    const shadow = host.attachShadow({ mode: "open" });
+    const shadow = host.attachShadow({ mode: "closed" });
     shadow.innerHTML = `
       <style>
         :host{ all:initial; }
@@ -3223,7 +3996,7 @@
       + "left:auto !important; top:auto !important; z-index:2147483646 !important; margin:0 !important;";
     document.documentElement.appendChild(host);
     const cap = shadow.querySelector(".cap"), out = shadow.querySelector(".out");
-    cap.onclick = async () => {
+    cap.onclick = pressed(async () => {
       if (cap.classList.contains("busy")) return;
       cap.classList.add("busy"); cap.textContent = "📥 reading…";
       const ex = await extractJob();
@@ -3245,7 +4018,7 @@
         out.className = "out warn";
         out.textContent = "capture failed: " + ((res && res.error) || "no response");
       }
-    };
+    });
   }
   // The pill belongs on every careers page the daily scanner can NOT reach. Scanner-covered
   // ATS hosts stay pill-free (capturing those would just duplicate scanned roles). Google and

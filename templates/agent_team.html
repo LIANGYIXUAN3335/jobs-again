@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>JobScan · 已完成的真实投递记录</title>
+  <link rel="stylesheet" href="/agent-lab/assets/lab.css">
+  <style>
+    .team{display:grid;grid-template-columns:285px minmax(0,1fr);gap:22px}.agent{padding:23px;margin-bottom:16px}.agent h2{font-size:20px;margin:8px 0}.agent p{color:var(--muted);font-size:13px}.badge{display:inline-block;border-radius:20px;background:#e7f1e9;padding:5px 10px;color:#316b50;font-size:11px}.activity{height:670px}.message.coordinator .avatar{background:#e9edf3;color:#5a718c}.notice{margin-bottom:22px}.intro{align-items:flex-start}.facts{font-size:12px;line-height:2}.facts b{font-weight:600}.archive-links{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px}#last-update{font-size:11px;color:var(--muted)}#refresh-log{font:inherit;font-size:12px;cursor:pointer}.status{white-space:nowrap}@media(max-width:800px){.team{grid-template-columns:1fr}.roles{display:flex;gap:12px}.agent{flex:1;padding:14px}.activity{height:650px}.intro{display:block}}
+  </style>
+</head>
+<body>
+  <header class="top"><a class="brand" href="/"><span class="logo">J</span> JobScan <span class="divider">/</span> Agent Team</a><span class="local"><i></i> 已完成 · 历史记录</span></header>
+  <main>
+    <div class="intro">
+      <div>
+        <p class="eyebrow">2026-11-03 · BASETEN</p>
+        <h1>一次真实投递，已经完成。</h1>
+        <p class="lead">Filler 与 Reviewer 分别操作 Chrome，完成修正、独立核对与提交。Baseten 显示成功回执，JobScan 已记为 applied。</p>
+        <div class="archive-links"><a class="text-btn" href="/">返回 JobScan 首页 →</a><a class="text-btn" href="/agent-lab/independent">打开独立运行验收 →</a></div>
+      </div>
+      <div><p id="last-update">正在载入历史记录…</p><button id="refresh-log" class="text-btn" type="button">刷新历史记录</button></div>
+    </div>
+    <div class="notice"><span class="tag">已归档测试</span> 下方是当时两个独立聊天子 agent 的真实交接。此页不会启动新投递。Chrome 独立执行台的真实网站端到端验收另行进行；本机独立练习使用虚构资料。</div>
+    <div class="team">
+      <aside>
+        <div class="roles">
+          <section class="card agent"><span class="badge">本次角色 · 已完成</span><h2>Filler</h2><p>筛选岗位、操作填表插件和定制简历。接收审核反馈，修正后交回检查。</p></section>
+          <section class="card agent"><span class="badge">本次角色 · 已完成</span><h2>Reviewer</h2><p>独立读取表单与实际简历。通过后提交，并确认雇主成功回执。</p></section>
+        </div>
+        <section class="card agent facts"><b>本次申请</b><br>Baseten<br>Software Engineer - Partner Platform<br>Casey Example<br>sample-5fbfd918@example.com<br>法定姓名：Alex Example<br><br><b>记录状态</b><br>已取得成功回执并记为 applied。<br>本页保留历史，不重复投递。</section>
+      </aside>
+      <section class="card activity">
+        <div class="card-head"><div><h2>真实协作历史</h2><span id="count" class="count">0</span></div><span id="status" class="status">已完成</span></div>
+        <div id="feed" aria-live="polite"><div class="empty">正在载入已保存的交接记录…</div></div>
+      </section>
+    </div>
+    <footer><span>消息来自实际执行日志。当前页面只读取历史记录，不表示仍在执行。</span><a class="text-btn" href="/agent-lab">填表实验室与插件配对 →</a></footer>
+  </main>
+  <script src="/agent-lab/assets/team.js"></script>
+</body>
+</html>

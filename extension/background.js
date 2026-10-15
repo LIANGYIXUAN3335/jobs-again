@@ -8,6 +8,14 @@
 // Owner 2026-09-23: there is NO default. Until a workspace is picked in the popup, every API
 // call fails with NO_WORKSPACE and the content script fills nothing — the one way to make sure
 // a form is never filled with the wrong person's data.
+// The runner page reloads the extension to pick up a new version, which closes that page.
+chrome.runtime.onInstalled.addListener(async () => {
+  const { jobscanReopenRunner } = await chrome.storage.local.get({ jobscanReopenRunner: false });
+  if (!jobscanReopenRunner) return;
+  await chrome.storage.local.remove("jobscanReopenRunner");
+  chrome.tabs.create({ url: chrome.runtime.getURL("runner.html") });
+});
+
 async function selectedPort() {
   try { return Number((await chrome.storage.local.get({ jobscanPort: 0 })).jobscanPort) || 0; } catch (_) { return 0; }
 }
@@ -28,10 +36,10 @@ async function withIdentity(path) {
   return path + (path.includes("?") ? "&" : "?") + "identity=" + encodeURIComponent(id);
 }
 
-async function apiFetch(path, init) {
+async function apiFetch(path, init, identity = true) {
   const bases = await serverBases();
   if (!bases.length) throw new Error("NO_WORKSPACE");
-  path = await withIdentity(path);
+  if (identity) path = await withIdentity(path);
   let lastErr;
   for (const base of bases) {
     try {
@@ -75,8 +83,8 @@ async function answer(jobId, questions) {
   return r.json(); // { answers: {question: text} }
 }
 
-async function emailCode() {
-  const r = await apiFetch(`/api/email-code`);
+async function emailCode(company) {
+  const r = await apiFetch(`/api/email-code${company ? `?company=${encodeURIComponent(company)}` : ""}`);
   if (!r.ok) {
     let detail = `email-code ${r.status}`;
     try { detail = (await r.json()).detail || detail; } catch (e) { /* keep default */ }
@@ -218,10 +226,61 @@ async function capture(payload) {
   return r.json(); // { ok, job_id, company, title, score, verdict }
 }
 
+async function agentRequest(path, body) {
+  const port = await selectedPort();
+  const saved = await chrome.storage.local.get({jobscanReviewTokens:{}});
+  const token = saved.jobscanReviewTokens[String(port)];
+  if (!token) throw new Error("请在 JobScan 的填表实验室生成连接码，并在扩展弹窗里连接。");
+  const r = await apiFetch('/api/agent-lab/' + path, {method:'POST',headers:{
+    'Content-Type':'application/json','X-JobScan-Review':token},body:JSON.stringify(body||{})});
+  const data = await r.json();
+  if (!r.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Review 请求失败。');
+  return {ok:true,run:data};
+}
+
+// A saved login goes only to the top frame of an https tab. Saving demands https, but the content
+// script also runs on http:// of the same hostname, which anyone on the network can serve. The
+// page that asked must be the one the tab shows: a tab can move on while the message is on its way.
+function loginHost(sender) {
+  const tab = new URL(sender.tab?.url || 'about:blank');
+  const page = new URL(sender.url || 'about:blank');
+  if (sender.frameId !== 0 || tab.protocol !== 'https:' || page.origin !== tab.origin) throw new Error('Login refused for this frame');
+  return tab.hostname;
+}
+
+// Keep pairing credentials out of the content-script world.
+chrome.storage.local.setAccessLevel?.({accessLevel:'TRUSTED_CONTEXTS'});
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
-      if (msg.type === "lookup") sendResponse(await lookup(msg.url));
+      if (["agentReview", "agentConfirm", "agentPermit", "agentRepair"].includes(msg.type)) {
+        if (!_sender.tab || !/^https?:/.test(_sender.url || '')) throw new Error('Invalid application frame');
+        if (msg.body.snapshot.url !== _sender.url) throw new Error('Application page changed');
+        const route = {agentReview:'review',agentConfirm:'confirm',agentPermit:'submit-permit',agentRepair:'repair-plan'}[msg.type];
+        sendResponse(await agentRequest(route, {...msg.body,demo:false}));
+      }
+      else if (msg.type === "agentResult") {
+        if (!_sender.tab || !/^https?:/.test(_sender.url || '') || msg.url !== _sender.url) throw new Error('Application page changed');
+        sendResponse(await agentRequest('submission-result', msg.body));
+      }
+      // The words an employer showed after her own hand submit. No run stands behind this one, so it names the job.
+      else if (msg.type === "handRefusal") {
+        if (!_sender.tab || _sender.frameId !== 0 || !/^https?:/.test(_sender.url || '') || msg.url !== _sender.url) throw new Error('Application page changed');
+        sendResponse(await agentRequest('hand-refusal', {job_id: msg.jobId, evidence: msg.evidence, url: msg.url}));
+      }
+      else if (msg.type === "agentInvalidate") sendResponse(await agentRequest('invalidate/' + encodeURIComponent(msg.runId)));
+      else if (msg.type === "jobscanRunnerEvent") sendResponse({ok:true}); // Worker page also receives and records the event.
+      else if (msg.type === "runnerCheck") {
+        if (!_sender.tab || _sender.url !== msg.url) throw new Error('Application page changed');
+        sendResponse(await agentRequest('runner/check', msg.body));
+      }
+      else if (msg.type === "runnerLookup") {
+        if (!_sender.tab || _sender.url !== msg.url) throw new Error('Application page changed');
+        const response = await apiFetch(`/api/lookup?url=${encodeURIComponent(msg.url)}`, undefined, false);
+        sendResponse(response.ok ? {found:true,role:await response.json()} : {found:false});
+      }
+      else if (msg.type === "lookup") sendResponse(await lookup(msg.url));
       else if (msg.type === "profile") sendResponse({ ok: true, ...(await profileOnly()) });
       else if (msg.type === "topRole") sendResponse(await topRole(msg.company));
       else if (msg.type === "pinned") sendResponse(await pinned());
@@ -229,11 +288,23 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       else if (msg.type === "unpin") sendResponse({ ok: true, ...(await unpin(msg.jobId)) });
       else if (msg.type === "resume") sendResponse({ ok: true, ...(await resumeBase64(msg.jobId)) });
       else if (msg.type === "answer") sendResponse({ ok: true, ...(await answer(msg.jobId, msg.questions)) });
-      else if (msg.type === "emailCode") sendResponse({ ok: true, ...(await emailCode()) });
+      else if (msg.type === "emailCode") sendResponse({ ok: true, ...(await emailCode(msg.company)) });
       else if (msg.type === "salary") sendResponse({ ok: true, ...(await salary(msg.jobId)) });
       else if (msg.type === "coverLetter") sendResponse({ ok: true, ...(await coverLetter(msg.jobId, msg.words)) });
       else if (msg.type === "pickOption") sendResponse({ ok: true, ...(await pickOption(msg.jobId, msg.question, msg.options)) });
       else if (msg.type === "markApplied") sendResponse({ ok: true, ...(await markApplied(msg.jobId, msg.variant)) });
+      else if (msg.type === "closeTab") { if (_sender.tab) await chrome.tabs.remove(_sender.tab.id); sendResponse({ ok: true }); }
+      else if (msg.type === "agentAnswer") sendResponse(await agentRequest("stuck-answer", msg.body));
+      // The host comes from the tab Chrome says sent this, never from the message.
+      else if (msg.type === "loginStatus" || msg.type === "loginFill") {
+        const reply = await agentRequest(msg.type === "loginFill" ? "logins/fill" : "logins/status", { host: loginHost(_sender) });
+        sendResponse({ ok: true, ...reply.run });
+      }
+      else if (msg.type === "openBoardAndClose") {
+        await chrome.tabs.create({ url: `http://127.0.0.1:${await selectedPort()}/agent-lab/runner` });
+        if (_sender.tab) await chrome.tabs.remove(_sender.tab.id);
+        sendResponse({ ok: true });
+      }
       else if (msg.type === "setProfile") sendResponse(await setApplyProfile(msg.jobId, msg.profile, msg.url));
       else if (msg.type === "cooldown") sendResponse(await setCooldown(msg.company, msg.days, msg.until, msg.reason, msg.skipJobId));
       else if (msg.type === "cooldownClear") sendResponse(await clearCooldown(msg.company));

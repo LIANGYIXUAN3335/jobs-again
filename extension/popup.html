@@ -26,6 +26,9 @@
         <option value="8788|">Taylor · 8788</option>
       </select>
     </label>
+    <button id="independent-runner" style="margin-top:10px;width:100%;padding:9px;font:inherit;font-weight:600;
+      cursor:pointer;border:1px solid #1f6f5c;border-radius:8px;background:#1f6f5c;color:#fff;">
+      打开独立执行台</button>
     <ol>
       <li>Open a <b>Greenhouse / Lever / Ashby</b> application page.</li>
       <li>The <b>JobScan</b> panel appears if the role is in your DB.</li>
@@ -38,6 +41,12 @@
     <p style="color:#6b7280;margin:6px 0 0;font-size:12px;">公司自家马甲域名（如 careers.withwaymo.com）
       面板不会自动弹——点上面按钮手动启动，任何网站都行。</p>
     <p class="muted" id="hint" style="color:#6b7280;margin:8px 0 0;"></p>
+    <details style="margin-top:12px"><summary>连接 Fill + Review</summary>
+      <p>打开 JobScan → 填表实验室 → 连接真实插件，生成连接码。</p>
+      <input id="review-code" placeholder="粘贴连接码" autocomplete="off" style="width:100%;box-sizing:border-box">
+      <button id="review-pair" style="margin-top:6px">连接</button>
+      <div id="review-pair-status"></div>
+    </details>
   </div>
   <script src="popup.js"></script>
 </body>

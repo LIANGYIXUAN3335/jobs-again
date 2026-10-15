@@ -1,6 +1,23 @@
 async function getPort() {
   try { return Number((await chrome.storage.local.get({ jobscanPort: 0 })).jobscanPort) || 0; } catch (_) { return 0; }
 }
+
+document.getElementById('review-pair').onclick = async () => {
+  const status = document.getElementById('review-pair-status');
+  try {
+    const base = await check();
+    if (!base) throw new Error('请先连接 JobScan 工作台。');
+    const r = await fetch(base + '/api/agent-lab/pair', {method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({code:document.getElementById('review-code').value})});
+    const result = await r.json();
+    if (!r.ok) throw new Error(result.detail || '连接失败');
+    const saved = await chrome.storage.local.get({jobscanReviewTokens:{}});
+    saved.jobscanReviewTokens[String(await getPort())] = result.token;
+    await chrome.storage.local.set(saved);
+    document.getElementById('review-code').value='';
+    status.textContent='已连接；刷新申请页后使用 Fill + Review。';
+  } catch(e) {status.textContent=e.message;}
+};
 // 身份（apply profile）：同一个工作台可以用不同名片投（她的小号 alex = 法名 + candidate）。
 // 存在这个 Chrome profile 里，background 把它当 identity= 参数带给服务器。
 async function getIdentity() {
@@ -21,11 +38,12 @@ async function check() {
 // 万能兜底（owner 2026-09-10，Waymo 马甲域名引出）：manifest 名单外的招聘页，点一下
 // 把 content.js 现场注入当前标签页。activeTab + scripting 权限组合不需要任何新域名授权；
 // content.js 自带 __jobscanLoaded 防重复注入护栏，在已注入页面上点了也无害。
+document.getElementById('independent-runner').onclick = () => {chrome.tabs.create({url:chrome.runtime.getURL('runner.html')});window.close();};
 document.getElementById("inject").addEventListener("click", async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab || !/^https?:/.test(tab.url || "")) return;
   try {
-    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content.js"] });
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["page_gate.js", "form_agent.js", "agent_workflow.js", "content.js"] });
     window.close();
   } catch (e) {
     document.getElementById("hint").textContent = "注入失败：" + e.message;
