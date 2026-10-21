@@ -14,12 +14,15 @@ import os
 import sys
 import pathlib
 import re
+import time
 
 import yaml
 
 from . import answer_log
 from . import config as cfgmod
+from . import confirmed_answers
 from . import tailoring
+from . import store
 from . import trust
 
 # Questions the model must never answer — mirrors extension/content.js EXCLUDE.
@@ -161,7 +164,21 @@ def _hard_reject(text: str, cfg: dict | None = None) -> str | None:
     return None
 
 
-def _personalize(text: str, cfg: dict) -> str:
+def _role_identity(cfg: dict, role: dict, base: dict) -> tuple[str, dict]:
+    """Resolve the same role card used by the PDF and form, without mutating config."""
+    key = store.effective_profile_key(cfg, role)
+    # The default card deliberately keeps this workspace's base/profile unchanged,
+    # matching the PDF renderer and avoiding inherited-card leakage into other users.
+    card = tailoring.apply_profile_identity(cfg, key) or {}
+    prof = dict(cfg.get("profile") or {})
+    for field in ("first_name", "last_name", "preferred_name", "preferred_last_name",
+                  "email", "phone", "phone_national"):
+        if card.get(field):
+            prof[field] = card[field]
+    return card.get("display_name") or base.get("name") or "the candidate", prof
+
+
+def _personalize(text: str, cfg: dict, role: dict | None = None) -> str:
     """Fill the __NAME__ / __EMPLOYER_n__ / __SCHOOL__ tokens in a prompt from the workspace's
     résumé base, so the same code serves any candidate (owner 2026-09-23)."""
     try:
@@ -170,7 +187,8 @@ def _personalize(text: str, cfg: dict) -> str:
         base = {}
     jobs = [j.get("company", "") for j in base.get("experience", []) if j.get("company")]
     edu = base.get("education") or []
-    return (text.replace("__NAME__", base.get("name") or "the candidate")
+    name = _role_identity(cfg, role, base)[0] if role is not None else base.get("name") or "the candidate"
+    return (text.replace("__NAME__", name)
                 .replace("__EMPLOYER_1__", jobs[0] if jobs else "my current employer")
                 .replace("__EMPLOYER_2__", jobs[1] if len(jobs) > 1 else (jobs[0] if jobs else "my previous employer"))
                 .replace("__SCHOOL__", (edu[0].get("school") if edu else "") or "my university"))
@@ -231,9 +249,31 @@ def model_label(cfg: dict) -> str:
     return str(ai.get("model") or "claude-opus-4-8")
 
 
+USAGE_LOG = "data/logs/model_usage.jsonl"
+cli_trouble: dict = {}   # Set while the subscription path fails, so the board can say the calls now cost money.
 _CLAUDE_BIN = os.path.expanduser("~/.local/bin/claude")
 _CLI_MODEL = "claude-opus-5-5"
 _CLI_CWD = cfgmod.resolve_path("data/cli_cwd")      # an EMPTY dir: no CLAUDE.md, no repo context leaks into the answer
+
+
+def log_usage(model: str, usage, cost: float | None = None) -> None:
+    """One line per model call, counts only, so what an application costs is measured instead of guessed."""
+    if not usage:
+        return
+    read = usage.get if isinstance(usage, dict) else lambda key, default=0: getattr(usage, key, default)
+    # Name what asked for the call, not the plumbing it went through.
+    frame = sys._getframe(1)
+    while frame.f_back and frame.f_code.co_name in {"_complete_cli", "_complete_api", "complete", "_gen", "call_model"}:
+        frame = frame.f_back
+    row = {"at": time.time(), "caller": frame.f_code.co_name, "model": model, "cost_usd": cost,
+           **{key: read(key, 0) or 0 for key in ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")}}
+    try:
+        path = cfgmod.resolve_path(USAGE_LOG)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as out:
+            out.write(json.dumps(row) + "\n")
+    except OSError:
+        pass   # A lost count must never stop an application.
 
 
 def _complete_cli(cfg: dict, system: str, user: str, *, effort: str | None, timeout: int) -> str:
@@ -257,6 +297,7 @@ def _complete_cli(cfg: dict, system: str, user: str, *, effort: str | None, time
         raise RuntimeError(f"claude -p returned no JSON envelope: {r.stdout[:200]!r}")
     if d.get("is_error"):
         raise RuntimeError(f"claude -p error: {str(d.get('result'))[:300]}")
+    log_usage("cli:" + model, d.get("usage") or {}, cost=d.get("total_cost_usd"))
     return str(d.get("result") or "")
 
 
@@ -276,6 +317,7 @@ def _complete_api(cfg: dict, system: str, user: str, *, max_tokens: int, model: 
             kwargs["thinking"] = {"type": "adaptive"}
         kwargs["output_config"] = {"effort": effort or ai.get("effort", "high")}
     resp = client.messages.create(**kwargs)
+    log_usage(model, getattr(resp, "usage", None))
     return "".join(b.text for b in resp.content if b.type == "text")
 
 
@@ -288,9 +330,12 @@ def complete(cfg: dict, *, system: str, user: str, max_tokens: int = 1500, model
     ai = cfg.get("ai") or {}
     if backend(cfg) == "cli" and cli_available():
         try:
-            return _complete_cli(cfg, system, user, effort=effort or ai.get("effort"),
+            text = _complete_cli(cfg, system, user, effort=effort or ai.get("effort"),
                                  timeout=int(ai.get("cli_timeout_sec", 120)))
+            cli_trouble.clear()
+            return text
         except Exception as e:  # noqa: BLE001 — fall back, but say so
+            cli_trouble.update(at=time.time(), expired="authenticate" in str(e).lower())
             print(f"ai: claude CLI failed ({type(e).__name__}: {str(e)[:160]}); "
                   f"{'falling back to the API key' if load_key(cfg) else 'no API key to fall back to'}", file=sys.stderr)
             if not load_key(cfg):
@@ -300,15 +345,19 @@ def complete(cfg: dict, *, system: str, user: str, max_tokens: int = 1500, model
 
 def _facts(cfg: dict, role: dict) -> str:
     base = tailoring.load_base(cfg)
-    parts = [f"Name: {base['name']}"]
+    name, prof = _role_identity(cfg, role, base)
+    parts = [f"Name: {name}"]
+    if prof.get("email"):
+        parts.append(f"Application email: {prof['email']}")
+    parts.append("Use the application Name for ordinary name fields and introductions. "
+                 "Use Legal name only when explicitly requested or for an electronic signature.")
     # Personal facts + the owner's OWN stated answers. Without these the model would answer a
     # demographic question from profile.ethnicity ("Asian") even though the owner's eeo config
     # says decline — so the preference has to travel with the fact.
-    prof = cfg.get("profile") or {}
     if prof.get("legal_first_name"):
         parts.append(f"Legal name: {prof['legal_first_name']} {prof.get('last_name', '')}".strip())
     if prof.get("preferred_name"):
-        parts.append(f"Preferred name: {prof['preferred_name']} {prof.get('preferred_last_name', '')}".strip())
+        parts.append(f"Preferred name: {prof['preferred_name']} {prof.get('preferred_last_name') or prof.get('last_name', '')}".strip())
     for k, label in (("location", "Location"), ("country", "Country"),
                      ("work_authorization", "Work authorization"),
                      ("years_of_experience",
@@ -339,6 +388,10 @@ def _facts(cfg: dict, role: dict) -> str:
                  "internship, vendor, contractor or temp relationship with any company")
     parts.append("Legal / eligibility facts (definite — answer such questions from these; anything "
                  "NOT listed here is not a fact on file):\n" + "\n".join(f"  - {x}" for x in legal))
+    confirmed = confirmed_answers.for_company(cfg, role.get("company"))
+    if confirmed:
+        parts.append("Answers the candidate confirmed in person (definite; use them for the same or a "
+                     "similar question):\n" + "\n".join(f"  - {confirmed_answers.fact_text(a)}" for a in confirmed))
     for k, label in (("ethnicity", "Race/ethnicity self-identification"),
                      ("veteran_status", "Veteran status"),
                      ("disability_status", "Disability status")):
@@ -432,7 +485,7 @@ def answer_questions(cfg: dict, role: dict, questions: list[str]) -> dict[str, s
     rejected: dict[str, str] = {}   # answers killed by the deterministic validator, by reason
 
     def _gen(extra: str) -> dict[str, str]:
-        text = complete(cfg, system=_personalize(_SYSTEM, cfg) + _lessons(), user=base_user + extra, max_tokens=2500)
+        text = complete(cfg, system=_personalize(_SYSTEM, cfg, role) + _lessons(), user=base_user + extra, max_tokens=2500)
         data = json.loads(_extract_json(text))
         out: dict[str, str] = {}
         for i, q in todo:
@@ -680,7 +733,7 @@ def cover_letter(cfg: dict, role: dict, max_words: int = 180) -> str | None:
         f"Write the paragraph in under {max_words} words."
     )
     def _gen(extra: str) -> str:
-        return complete(cfg, system=_personalize(_LETTER_SYSTEM, cfg) + _lessons(), user=base_user + extra, max_tokens=1500).strip()
+        return complete(cfg, system=_personalize(_LETTER_SYSTEM, cfg, role) + _lessons(), user=base_user + extra, max_tokens=1500).strip()
 
     def _finish(text: str | None, tries_used: int, verdict: dict | None) -> str | None:
         if text:
@@ -724,6 +777,18 @@ def cover_letter(cfg: dict, role: dict, max_words: int = 180) -> str | None:
     return _finish(best, used, best_verdict)
 
 
+# Owner 2026-11-05: 硬性条件没办法说可以，软性条件可以。Filler's picker and Reviewer share this wording.
+CONDITION_KINDS = (
+    "SOFT means how the candidate is willing to work, which they can adapt to: days in the office, "
+    "anchor days, a hybrid or fully on-site schedule, commuting inside the San Francisco Bay Area, on-call, "
+    "occasional travel within the US, being comfortable with or excited about how the team works, and "
+    "which programming language to use in an interview.\n"
+    "HARD means what willingness cannot change: immigration and work authorization, citizenship, "
+    "clearance, international travel, living or working outside the San Francisco Bay Area, past employers, "
+    "degrees, years of experience, languages, and what they have actually built."
+)
+
+
 def _legal_guidance(cfg: dict) -> str:
     """One line telling the picker how THIS candidate answers the two legal yes/no questions and
     a visa-status list — from profile.work_authorized / needs_sponsorship / visa_status_pick."""
@@ -755,12 +820,16 @@ def pick_option(cfg: dict, role: dict, question: str, options: list[str]) -> int
     user = (
         f"Candidate facts:\n{_facts(cfg, role)}\n\n"
         f"Application question: {question}\n\nOptions:\n{numbered}\n\n"
-        "Pick the ONE option that is correct for this candidate given the facts. Legal / "
-        f"eligibility questions ARE answerable from the facts: {_legal_guidance(cfg)}; demographic "
-        "self-ID → exactly the recorded preference. If it's a relocation/on-site question, follow "
-        f"the recorded relocation fact ({(cfg.get('profile') or {}).get('relocation') or 'not on file'}). "
-        "Answer -1 ONLY for salary/compensation, referral source, signature fields, or when no "
-        "option is correct for the facts on file.\n"
+        "Pick the ONE option that is correct for this candidate given the facts. First decide which "
+        f"kind of question it is.\n{CONDITION_KINDS}\n"
+        "SOFT: pick the option that says yes. HARD: answer ONLY from the facts. If the facts say the "
+        "candidate cannot or has not, pick the option that says so, never a yes. If the facts do not "
+        "mention it, answer -1: silence is not a no.\n"
+        f"Legal / eligibility questions ARE answerable from the facts: {_legal_guidance(cfg)}; demographic "
+        "self-ID → exactly the recorded preference. "
+        "Answer -1 for salary/compensation, referral source, signature fields, a statement to accept "
+        "or consent to (privacy policy, arbitration, AI evaluation), or when no option is correct for "
+        "the facts on file.\n"
         "Reply with ONLY the option number (an integer), nothing else."
     )
     text = complete(cfg, system="You map a candidate's facts to the single correct dropdown option. Answer with one integer.",

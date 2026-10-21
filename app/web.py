@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from . import ai as aimod
 from . import company_board as boardmod
 from . import config as cfgmod
+from . import confirmed_answers
 from . import followup as followupmod
 from . import gcal as gcalmod
 from . import google_auth as gauthmod
@@ -47,12 +48,31 @@ if cfg.get("answers_log"):
     from . import answer_log as _alog
     _alog.LOG_REL = cfg["answers_log"]
 app = FastAPI(title="JobScan")
-# The browser extension's service worker calls this local API. Server binds 127.0.0.1
-# only, so a permissive CORS policy here is not remotely reachable.
+# The browser extension's service worker calls this local API. Employer pages share that browser
+# and can reach localhost, so only the extension and pages on this machine may read the answers.
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware, allow_origin_regex=r"^(chrome-extension://[a-p]{32}|http://(127\.0\.0\.1|localhost)(:\d+)?)$",
+    allow_methods=["*"], allow_headers=["*"],
 )
 app.include_router(platform_router)
+
+# Local fill/review workbench; no final submission or business-status writes.
+from .agent_lab import build_router as build_agent_router, real_context as agent_context
+app.include_router(build_agent_router(cfg, lambda job_id, identity, url: agent_context(cfg, job_id, identity, url)))
+
+
+@app.middleware("http")
+async def refuse_cross_site_writes(request: Request, call_next):
+    """Any web page can POST at this loopback service with no-cors: no body, no Origin it can be judged by.
+
+    A route with no body to validate would just run, as /api/google/auth/revoke did. A page cannot hide Sec-Fetch-Site.
+    The extension declares itself by its Origin; curl and the service's own tools send no such header at all.
+    """
+    if (request.method not in {"GET", "HEAD", "OPTIONS"} and os.environ.get("JOBSCAN_SAAS_ONLY") != "1"
+            and request.headers.get("sec-fetch-site") in {"cross-site", "same-site"}
+            and not request.headers.get("origin", "").startswith("chrome-extension://")):
+        return JSONResponse({"detail": "This service only takes changes from its own pages and the extension."}, status_code=403)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -778,6 +798,15 @@ def _profile_for_role(role: dict) -> dict:
                          ("email", "email"), ("phone_national", "phone")):
             if card.get(src):
                 prof[dst] = card[src]
+    from .application_memory import validate_identity
+    try:
+        validate_identity(prof)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    prof["confirmed_answers"] = confirmed_answers.for_company(cfg, role.get("company"))
+    # A batch reads the board's essay switch here: with it off, model text stays out of optional boxes.
+    from .form_preflight import allow_essays
+    prof["allow_unread_essays"] = allow_essays(cfg)
     return prof
 
 
@@ -797,6 +826,7 @@ def _lookup_payload(conn, role: dict, top_role_default: bool = False) -> dict:
         (role["job_id"], role["job_id"]),
     ).fetchall()
     ai_cfg = cfg.get("ai") or {}
+    from .application_memory import memory_pack
     return {
         "job_id": role["job_id"], "company": role["company"], "title": role["title"],
         "status": role["status"], "tailor_status": role.get("tailor_status") or "none",
@@ -816,6 +846,7 @@ def _lookup_payload(conn, role: dict, top_role_default: bool = False) -> dict:
         "eeo_decline": bool(cfg.get("eeo_decline", True)),
         "eeo": cfg.get("eeo") or {},          # per-field self-ID preference; unset → decline
         "profile": _profile_for_role(role),   # this role's apply profile overlaid (法名 roles fill 法名)
+        "shared_memory": memory_pack(_profile_for_role(role), tailoring.load_base(cfg)),
         "apply_profile": store.effective_profile_key(cfg, role),
         # 名片夹摘要：面板用来显示「这份要用哪个身份填」+ 渲染切换按钮，不用发第二个请求
         "apply_profiles": _profiles_summary(),
@@ -975,7 +1006,7 @@ def api_top_role(company: str, identity: str = "", conn=Depends(view_conn)):
     row = conn.execute(
         "SELECT r.job_id FROM jobs.roles r LEFT JOIN role_state s ON s.job_id=r.job_id"
         " WHERE r.company_norm=? AND s.tailor_status='ready' AND s.tailored_resume_path IS NOT NULL"
-        " AND COALESCE(s.status,'new') NOT IN ('applied','interviewing','rejected')"
+        " AND COALESCE(s.status,'new') NOT IN ('applied','interviewing','rejected','expired')"
         " ORDER BY r.weighted_score DESC LIMIT 1", (cn,)).fetchone()
     if not row:
         raise HTTPException(404, f"no un-applied tailored role for {company!r}")
@@ -997,6 +1028,7 @@ def api_profile(identity: str = ""):
                          ("email", "email"), ("phone_national", "phone")):
             if card.get(src):
                 prof[dst] = card[src]
+    prof["confirmed_answers"] = confirmed_answers.for_company(cfg)
     return {
         "profile_only": True,
         "profile": prof,
@@ -1116,11 +1148,22 @@ def api_answer(body: AnswerIn, conn=Depends(view_conn)):
 
 
 @app.get("/api/email-code")
-def api_email_code():
+def api_email_code(request: Request, company: str = ""):
     """Fetch the newest email verification code (opt-in; reads inbox over IMAP)."""
+    # A page that rebinds its own domain to this machine counts as same-origin and sends no Origin
+    # on a GET. Only its Host gives it away. Same check as workbench_page in agent_lab.py.
+    if request.url.hostname not in {"localhost", "127.0.0.1", "testserver"}:
+        raise HTTPException(403, "email-code is local only")
+    # A web page's no-cors request sends no Origin, but it cannot hide Sec-Fetch-Site.
+    origin = request.headers.get("origin", "")
+    if (origin and not origin.startswith("chrome-extension://")) or request.headers.get("sec-fetch-site") in {"cross-site", "same-site"}:
+        raise HTTPException(403, "email-code only answers the extension")
     if not mailmod.available(cfg):
         raise HTTPException(503, "email-code disabled (set mailcode.enabled + gmail_app_password, or authorize Google on /settings)")
     try:
+        if company:
+            after = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=mailmod.within_minutes(cfg))
+            return mailmod.fetch_code_for(cfg, company, after)
         return mailmod.fetch_latest_code_any(cfg)
     except Exception as e:
         raise HTTPException(502, f"email-code failed: {type(e).__name__}: {e}")

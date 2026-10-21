@@ -17,7 +17,7 @@ from . import scoring
 from .config import db_path, norm_key, user_db_path
 
 LA = ZoneInfo("America/Los_Angeles")
-STATUSES = ["new", "applied", "interviewing", "skip", "rejected"]
+STATUSES = ["new", "applied", "interviewing", "skip", "rejected", "expired"]
 
 # The tailored PDF's résumé↔JD fit score (0-100, from resume_score.py) is baked into the
 # filename tail as " - NN.pdf" at ingest time. Parse it back out for display — this is a
@@ -32,7 +32,7 @@ def resume_score_from_path(path: str | None) -> int | None:
     m = _RESUME_SCORE_RE.search(str(path))
     return int(m.group(1)) if m else None
 
-CLOSED_STATUSES = {"applied", "skip", "rejected"}
+CLOSED_STATUSES = {"applied", "skip", "rejected", "expired"}
 
 # What happened AFTER applying. `status` answers "is this still in my review queue"; these
 # answer "did it work", which is the only thing that can tell you whether the four-dimension
@@ -344,6 +344,15 @@ def _merge_cooldowns(cfg: dict, manual: dict[str, dict], today: str) -> dict[str
         if cn not in out or cd["until"] > out[cn]["until"]:   # both sides → the later date wins
             out[cn] = cd
     return out
+
+
+def last_applied_by_company(conn) -> dict[str, str]:
+    """company_norm → the latest date the owner applied there, as stored.
+
+    Reads the date, not the status: a role that moved on to interviewing or rejected was still applied to."""
+    rows = conn.execute("SELECT r.company_norm, max(s.applied_date) FROM role_state s JOIN jobs.roles r ON r.job_id=s.job_id "
+                        "WHERE COALESCE(s.applied_date, '')<>'' GROUP BY r.company_norm").fetchall()
+    return {row[0]: row[1] for row in rows if row[0]}
 
 
 def active_cooldowns(conn, cfg: dict, today: str | None = None) -> dict[str, dict]:
@@ -710,6 +719,7 @@ def _record_link(conn, a: str, b: str) -> None:
 
 # Statuses that describe a real-world event on the ONE physical posting, so they must hold on
 # both rows of a linked pair. 'new'/'skip' are review bookkeeping and never cascade.
+# 'expired' records evidence for exactly one URL; it must not close a live repost or twin.
 _CASCADE_STATUSES = {"applied", "interviewing", "rejected"}
 
 
@@ -1202,7 +1212,8 @@ def fetch_view(
 
     closed_by_sig: dict[tuple, dict] = {}
     for r in rows:
-        if (r["own_status"] or "new") in CLOSED_STATUSES:
+        # A closed posting does not prove a later posting with the same title is closed.
+        if (r["own_status"] or "new") in CLOSED_STATUSES - {"expired"}:
             closed_by_sig.setdefault((r["company_norm"], r["title_norm"]), r)
 
     today = la_today()
@@ -1211,7 +1222,7 @@ def fetch_view(
     month_ago = (datetime.date.fromisoformat(today) - datetime.timedelta(days=29)).isoformat()
 
     out = []
-    counts = {"new": 0, "applied": 0, "interviewing": 0, "skip": 0, "rejected": 0}
+    counts = {status_name: 0 for status_name in STATUSES}
     # For the duplicate_of hide below: only honour a link whose canonical row still exists —
     # purge tools DELETE FROM roles, and a dangling link must not vanish a live posting
     # (followup.py:105 guards the same way).

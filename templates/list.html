@@ -37,6 +37,9 @@
     {# Module 3 — analytics & extras #}
     <a href="/health" title="定时任务体检表：谁按时跑了、谁失联、谁上次失败">🩺 体检</a>
     <a href="/settings" title="工作台设置：一键授权 Google（Gmail + Calendar）、邮箱/日历接通状态">⚙ 设置</a>
+    <a class="dim" href="/agent-lab" title="填表与独立 Review 工作台">填表实验室</a>
+    <a class="dim" href="/agent-lab/runner" title="真实队列状态、协作消息与 Chrome 执行台连接">自动投递</a>
+    <a class="dim" href="/agent-lab/independent" title="先用虚构资料验收独立领取、填表与审核；真实执行台从 Chrome 扩展打开">独立运行验收</a>
     <a class="dim" href="/ideas" title="daily idea radar: Show HN · GH Trending · Product Hunt">💡</a>
     <a href="/trends" title="鸭先知：市场在招什么技能、哪类岗最缺人（挂龄）、新词雷达、公司发岗突变">🦆 trend</a>
   </nav>
@@ -241,7 +244,7 @@ try { if (localStorage.getItem("jobscan.filterpane") === "1") document.currentSc
   <td class="notes-cell" title="click to edit notes">{{ r.notes or '+' }}</td>
 </tr>
 {% else %}
-<tr><td colspan="9" class="empty">nothing here — adjust filters, or run <code>python -m app.scan</code></td></tr>
+<tr><td colspan="9" class="empty">当前筛选没有匹配岗位。名片、日期、简历和每日显示数量会影响结果。<a href="/?identity=&amp;showall=1&amp;seen=all&amp;status=new">重置筛选，查看全部待投岗位</a>。</td></tr>
 {% endfor %}
 </tbody>
 </table>

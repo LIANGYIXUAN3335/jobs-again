@@ -160,7 +160,7 @@ def test_pick_option_instructs_legal_answers_instead_of_forbidding_them(cfg, mon
     assert "Do not answer work authorization" not in prompt
     assert re.search(r"authorized to work in the US\?", prompt)
     assert "Employment Authorization Document" in prompt
-    assert "-1 ONLY for salary" in prompt
+    assert "-1 for salary" in prompt
     rec = _records(log_path)[-1]
     assert rec["kind"] == "pick_option" and rec["answer"] == "No" and "reason" not in rec
     # salary is still machine-blank
@@ -226,3 +226,10 @@ def test_never_filter_does_not_catch_preferred():
     assert not ai._NEVER.search("Which of the preferred qualifications have you acquired?")
     assert ai._NEVER.search("Were you referred by an employee? Referral name:")
     assert ai._NEVER.search("What is your desired salary?")
+
+
+def test_the_suite_never_writes_the_real_answer_log(tmp_path):
+    # tests/conftest.py points it at this test's own folder, so a generator called by any test stays out of data/logs.
+    assert answer_log.LOG_REL == str(tmp_path / "answers.jsonl")
+    answer_log.log("outreach", {"job_id": "j"}, answer="x")
+    assert _records(tmp_path / "answers.jsonl")[0]["kind"] == "outreach"
