@@ -370,3 +370,40 @@ def test_gcal_service_skips_workspace_token_without_calendar_scope(monkeypatch, 
     monkeypatch.setattr(disc, "build", lambda *a, **kw: "SVC")
     monkeypatch.setattr(gcal, "TOKEN_PATH", str(tmp_path / "missing_legacy.json"))
     assert gcal._service({"user_db_path": "x"}) is None
+
+
+# ── no web page may write here ───────────────────────────────────────────────────────────
+@pytest.fixture
+def revoke_calls(monkeypatch):
+    from app import web
+    calls = []
+    monkeypatch.setattr(web.gauthmod, "revoke", lambda _cfg: calls.append(1) or {"ok": True})
+    return calls
+
+
+@pytest.mark.parametrize("site", ["cross-site", "same-site"])
+def test_a_web_pages_no_cors_post_is_refused_on_every_route(revoke_calls, site):
+    from fastapi.testclient import TestClient
+    from app import web
+    client = TestClient(web.app)
+    headers = {"Sec-Fetch-Site": site, "Origin": "https://employer.example"}
+    assert client.post("/api/google/auth/revoke", headers=headers).status_code == 403
+    assert client.post("/api/google/auth/revoke", headers={"Sec-Fetch-Site": site}).status_code == 403
+    assert client.post("/api/ingest", headers=headers).status_code == 403
+    assert client.delete("/api/applied-companies/x", headers=headers).status_code == 403
+    assert revoke_calls == []
+
+
+@pytest.mark.parametrize("headers", [{"Sec-Fetch-Site": "same-origin", "Origin": "http://testserver"}, {"Sec-Fetch-Site": "none"}, {},
+                                     {"Sec-Fetch-Site": "cross-site", "Origin": "chrome-extension://" + "a" * 32}])
+def test_its_own_pages_the_extension_and_local_tools_still_write(revoke_calls, headers):
+    from fastapi.testclient import TestClient
+    from app import web
+    assert TestClient(web.app).post("/api/google/auth/revoke", headers=headers).status_code == 200
+    assert revoke_calls == [1]
+
+
+def test_reading_is_not_refused(revoke_calls):
+    from fastapi.testclient import TestClient
+    from app import web
+    assert TestClient(web.app).get("/api/applied-companies", headers={"Sec-Fetch-Site": "cross-site"}).status_code != 403

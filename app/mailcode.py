@@ -8,8 +8,11 @@ from __future__ import annotations
 import datetime
 import email
 import email.utils
+import hashlib
 import imaplib
+import json
 import re
+import threading
 from email.header import decode_header, make_header
 
 import yaml
@@ -165,6 +168,15 @@ def _accounts(cfg: dict) -> list[tuple[dict, str, str | OAuthSecret]]:
     return out
 
 
+def within_minutes(cfg: dict) -> int:
+    """How old a code mail may be and still count. Some senders' codes arrive after 15 minutes, hence the setting."""
+    try:
+        minutes = int((cfg.get("mailcode") or {}).get("within_minutes") or 15)
+    except (TypeError, ValueError):
+        return 15
+    return minutes if minutes > 0 else 15
+
+
 def available(cfg: dict) -> bool:
     """True when the mailbox is switched on AND has a credential: the app password or a
     Google OAuth token with the Gmail scope (an unauthorized workspace stays quietly off)."""
@@ -192,6 +204,96 @@ def _body_text(msg) -> str:
     return re.sub(r"<[^>]+>", " ", text)  # strip HTML tags for keyword search
 
 
+def _mails_with_codes(account: tuple[dict, str, str], cutoff: datetime.datetime):
+    """Newest first, every mail since the cutoff that carries a code. Reading leaves them unread."""
+    mc, addr, pw = account
+    from . import mail as _mail            # local: mail imports this module (avoid the cycle)
+    M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"))
+    try:
+        _mail.imap_login(M, addr, pw)
+        M.select("INBOX", readonly=True)
+        since = cutoff.strftime("%d-%b-%Y")
+        typ, data = M.search(None, f"(SINCE {since})")
+        for num in reversed(data[0].split()[-40:]):
+            typ, d = M.fetch(num, "(BODY.PEEK[])")
+            if not d or not d[0]:
+                continue
+            msg = email.message_from_bytes(d[0][1])
+            try:
+                arrived = email.utils.parsedate_to_datetime(msg.get("Date"))
+                if arrived.tzinfo is None:
+                    arrived = arrived.replace(tzinfo=datetime.timezone.utc)
+            except Exception:
+                continue                              # no date: nothing proves it came after the request
+            if arrived < cutoff:
+                break
+            subject = _decode(msg.get("Subject"))
+            if _SKIP_SUBJECT.search(subject) or any(part.get_content_type() == "text/calendar" for part in msg.walk()):
+                continue
+            code = _extract_code(subject + " " + _body_text(msg))
+            if code:
+                yield {"id": msg.get("Message-ID") or f"{addr}:{num.decode()}", "arrived": arrived, "subject": subject,
+                       "from": _decode(msg.get("From")), "code": code}
+    finally:
+        try:
+            M.logout()
+        except Exception:
+            pass
+
+
+_used_lock = threading.Lock()
+
+
+def _used_path(cfg: dict):
+    name = re.sub(r"\W+", "_", cfgmod.workspace_name(cfg)).strip("_").lower()
+    return cfgmod.ROOT / "data" / "agent_lab" / f"used_code_mails.{name}.json"
+
+
+def _company_name(company: str):
+    """A whole-word test for this company's name in raw text, or None if the name is too short to
+    trust. "Ro" sits inside "Microsoft", "Exa" inside "example", "Fal" inside "Falcon". Only the gap
+    between the name's own words may vary, so "Acme Labs" still finds acme-labs.com and acmelabs.com.
+    [^\\W_] is a letter or a digit: an underscore separates words here, as in exa_jobs@."""
+    if len(cfgmod.norm_key(company)) < 3:
+        return None
+    words = re.findall(r"[^\W_]+", company)
+    return re.compile(r"(?<![^\W_])" + r"[\W_]*".join(words) + r"(?![^\W_])", re.IGNORECASE)
+
+
+def fetch_code_for(cfg: dict, company: str, after: datetime.datetime, scan=_mails_with_codes) -> dict:
+    """The code this company sent after `after`, or none at all.
+
+    A wrong code typed into a form cannot be taken back, so a mail from anyone else never counts,
+    two different codes mean nobody can tell which is right, and a mail is used only once.
+    Only hashes of Message-IDs are stored. The code itself goes to the caller and nowhere else.
+    """
+    name = _company_name(company)
+    if not name:
+        return {"code": None, "matches": 0}
+    path = _used_path(cfg)
+    with _used_lock:
+        try:
+            used = set(json.loads(path.read_text()))
+        except (OSError, ValueError):
+            used = set()
+        hits = []
+        for account in _accounts(cfg):
+            try:
+                for item in scan(account, after):
+                    mark = hashlib.sha256(item["id"].encode()).hexdigest()
+                    # Each on its own: a name must not form across the end of one and the start of the other.
+                    if mark not in used and (name.search(item["subject"]) or name.search(item["from"])):
+                        hits.append({**item, "mark": mark})
+            except Exception:  # noqa: BLE001 — one mailbox down must not hide the other
+                continue
+        if len({hit["code"] for hit in hits}) != 1:
+            return {"code": None, "matches": len({hit["code"] for hit in hits})}
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.write_text(json.dumps(sorted(used | {hit["mark"] for hit in hits})))
+        path.chmod(0o600)
+        return {"code": hits[0]["code"], "subject": hits[0]["subject"], "from": hits[0]["from"]}
+
+
 def fetch_latest_code(cfg: dict, account: tuple[dict, str, str] | None = None) -> dict:
     """Return {code, subject, from, date} for the newest verification email within the window,
     or {code: None} if none found. Raises on connection/login failure. `account` overrides
@@ -200,20 +302,19 @@ def fetch_latest_code(cfg: dict, account: tuple[dict, str, str] | None = None) -
     if not (addr and pw):
         raise RuntimeError("no mailbox credential: gmail_app_password in secrets.yaml or a Google "
                            "OAuth token from /settings (or mailcode.email unset)")
-    within = int(mc.get("within_minutes", 15))
     now = datetime.datetime.now(datetime.timezone.utc)
-    cutoff = now - datetime.timedelta(minutes=within)
+    cutoff = now - datetime.timedelta(minutes=within_minutes({"mailcode": mc}))
 
     from . import mail as _mail            # local: mail imports this module (avoid the cycle)
     M = imaplib.IMAP4_SSL(mc.get("imap_host", "imap.gmail.com"))
     try:
         _mail.imap_login(M, addr, pw)
-        M.select("INBOX")
+        M.select("INBOX", readonly=True)                # checking for a code must not mark mail as read
         since = (now - datetime.timedelta(days=1)).strftime("%d-%b-%Y")
         typ, data = M.search(None, f"(SINCE {since})")
         ids = data[0].split()
         for num in reversed(ids[-40:]):                 # newest first, cap the scan
-            typ, d = M.fetch(num, "(RFC822)")
+            typ, d = M.fetch(num, "(BODY.PEEK[])")
             if not d or not d[0]:
                 continue
             msg = email.message_from_bytes(d[0][1])
