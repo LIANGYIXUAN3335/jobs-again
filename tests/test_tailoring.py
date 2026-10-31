@@ -202,9 +202,9 @@ def test_provenance_names_the_offending_token_and_the_supported_values(cfg):
     """A rejection nobody can debug is a rejection that gets bypassed."""
     base = tailoring.load_base(cfg)
     v = tailoring.provenance_violations(
-        _tailored({"Meta": ["Cut onboarding-flow failures by 50% in production."]}), base)
+        _tailored({"Meta": ["Cut onboarding-flow failures by 77% in production."]}), base)
     assert len(v) == 1
-    assert "50" in v[0] and "Meta" in v[0]
+    assert "77" in v[0] and "Meta" in v[0]
     assert "90" in v[0]                      # tells her which numbers Meta's bullets DO support
 
 

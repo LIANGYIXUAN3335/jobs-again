@@ -21,18 +21,21 @@
   #v(3pt, weak: true)
   #let c = data.contact
   #text(size: 9pt)[
-    // Display the clean short form, but point the hyperlink at the canonical www + trailing-slash
-    // URL — the bare/no-slash form gets rejected as "invalid" by some validators. Assumes
-    // contact.linkedin is stored as "linkedin.com/in/<handle>" (no scheme/www/slash).
-    // github is optional (owner 2026-09-23: a candidate whose projects live on GitHub keeps the
-    // link). With two profile links the line no longer fits, so the links move to a second
-    // centered line instead of wrapping mid-URL.
+    // Optional fields render only when present. This lets a candidate deliberately keep the
+    // public header to phone + email without leaving empty separators or broken links.
+    #let loc = c.at("location", default: "")
+    #let li = c.at("linkedin", default: "")
     #let gh = c.at("github", default: "")
     #if gh != none and gh != "" [
-      #c.phone #h(5pt) · #h(5pt) #link("mailto:" + c.email)[#c.email] #h(5pt) · #h(5pt) #c.location \
-      #link("https://www." + c.linkedin + "/")[#c.linkedin] #h(5pt) · #h(5pt) #link("https://" + gh)[#gh]
+      #c.phone #h(5pt) · #h(5pt) #link("mailto:" + c.email)[#c.email]
+      #if loc != none and loc != "" [#h(5pt) · #h(5pt) #loc]
+      \
+      #if li != none and li != "" [#link("https://www." + li + "/")[#li] #h(5pt) · #h(5pt)]
+      #link("https://" + gh)[#gh]
     ] else [
-      #c.phone #h(5pt) · #h(5pt) #link("mailto:" + c.email)[#c.email] #h(5pt) · #h(5pt) #c.location #h(5pt) · #h(5pt) #link("https://www." + c.linkedin + "/")[#c.linkedin]
+      #c.phone #h(5pt) · #h(5pt) #link("mailto:" + c.email)[#c.email]
+      #if loc != none and loc != "" [#h(5pt) · #h(5pt) #loc]
+      #if li != none and li != "" [#h(5pt) · #h(5pt) #link("https://www." + li + "/")[#li]]
     ]
   ]
 ]
@@ -64,36 +67,56 @@
   #text(weight: "bold")[#group.label: ] #group.items.join(", ")
 ]))
 
+// --- optional projects ---
+// A role-specific resume may anchor the section after a named company. This lets a career-
+// direction project sit immediately after the recent experience that establishes its context,
+// without changing the default order for other resumes.
+#let projects = data.at("projects", default: ())
+#let projects_after_company = data.at("projects_after_company", default: "")
+#let projects_start_new_page = data.at("projects_start_new_page", default: false)
+#let project_section = [
+  #section("Projects")
+  #for pr in projects [
+    #block(breakable: false)[
+      #grid(columns: (1fr, auto),
+        [#text(weight: "bold")[#pr.name] #if pr.at("link", default: "") != "" [ #h(5pt) #text(size: 9pt)[#link(pr.link)[#pr.at("link_label", default: pr.link)]] ]],
+        text(weight: "bold")[#pr.at("year", default: "")])
+      #if pr.at("stack", default: "") != "" [ #v(2pt) #text(style: "italic", size: 9.5pt)[#pr.stack] ]
+      #v(4pt)
+      #set list(marker: text(fill: navy)[•], indent: 2pt, body-indent: 6pt, spacing: 3.5pt)
+      #list(..pr.bullets.map(b => [#b]))
+      #v(5pt)
+    ]
+  ]
+]
+
 // --- experience ---
 #section("Professional Experience")
 #for job in data.experience [
-  #grid(columns: (1fr, auto),
-    text(weight: "bold")[#job.company], text(weight: "bold")[#job.dates])
-  #v(2.5pt)                              // gap under the company line
-  #grid(columns: (1fr, auto),
-    text(style: "italic", size: 9.5pt)[#job.title],
-    text(style: "italic", size: 9.5pt)[#job.location])
-  #v(4.5pt)                              // gap under the title/location line, before bullets
-  #set list(marker: text(fill: navy)[•], indent: 2pt, body-indent: 6pt, spacing: 3.5pt)
-  #list(..job.bullets.map(b => [#b]))
-  #v(5pt)                      // gap between experience entries (≈ font-size 5)
+  #block(breakable: false)[
+    #grid(columns: (1fr, auto),
+      text(weight: "bold")[#job.company], text(weight: "bold")[#job.dates])
+    #v(2.5pt)                              // gap under the company line
+    #grid(columns: (1fr, auto),
+      text(style: "italic", size: 9.5pt)[#job.title],
+      text(style: "italic", size: 9.5pt)[#job.location])
+    #v(4.5pt)                              // gap under the title/location line, before bullets
+    #set list(marker: text(fill: navy)[•], indent: 2pt, body-indent: 6pt, spacing: 3.5pt)
+    #list(..job.bullets.map(b => [#b]))
+    #v(5pt)                      // gap between experience entries (≈ font-size 5)
+  ]
+  #if projects.len() > 0 and projects_after_company != "" and job.company == projects_after_company [
+    #if projects_start_new_page [#pagebreak()]
+    #project_section
+    #if data.at("additional_experience_heading", default: "") != "" [
+      #section(data.additional_experience_heading)
+    ]
+  ]
 ]
 
-// --- projects (optional; only when merge() put them in — base `render_projects: true`) ---
-// Each: name + link, stack in italics, 1-3 bullets. GitHub links stay: they are the evidence.
-#let projects = data.at("projects", default: ())
-#if projects.len() > 0 [
-  #section("Projects")
-  #for pr in projects [
-    #grid(columns: (1fr, auto),
-      [#text(weight: "bold")[#pr.name] #if pr.at("link", default: "") != "" [ #h(5pt) #text(size: 9pt)[#link(pr.link)[#pr.at("link_label", default: pr.link)]] ]],
-      text(weight: "bold")[#pr.at("year", default: "")])
-    #if pr.at("stack", default: "") != "" [ #v(2pt) #text(style: "italic", size: 9.5pt)[#pr.stack] ]
-    #v(4pt)
-    #set list(marker: text(fill: navy)[•], indent: 2pt, body-indent: 6pt, spacing: 3.5pt)
-    #list(..pr.bullets.map(b => [#b]))
-    #v(5pt)
-  ]
+// Default placement for resumes that do not set a company anchor.
+#if projects.len() > 0 and projects_after_company == "" [
+  #project_section
 ]
 
 // --- education (last, by design) ---

@@ -936,12 +936,15 @@ def merge(base: dict, tailored: dict, identity: dict | None = None) -> dict:
         "name": name, "contact": contact,
         "summary": tailored.get("summary", ""),
         "education": base["education"], "skills": skills, "experience": experience,
+        "projects_after_company": tailored.get("projects_after_company", ""),
+        "projects_start_new_page": bool(tailored.get("projects_start_new_page", False)),
+        "additional_experience_heading": tailored.get("additional_experience_heading", ""),
     }
-    # Projects (owner 2026-09-23): only when the base opts in — a candidate whose evidence lives
-    # in GitHub projects keeps them, with the links. The tailored file may pick/reorder/re-aim
-    # the bullets (validated against the base facts); without a `projects` key every base
-    # project renders with its own facts. Never invented: names must match the base.
-    if base.get("render_projects") and base.get("side_projects"):
+    # Projects (owner 2026-09-23): render when the base opts in globally OR when a role-specific
+    # resume deliberately selects projects. This keeps ordinary resumes unchanged while allowing
+    # a targeted resume to surface a real project that closes a JD-specific evidence gap.
+    # Never invented: names must match the base.
+    if (base.get("render_projects") or tailored.get("projects")) and base.get("side_projects"):
         by_name = {pr.get("name"): pr for pr in (tailored.get("projects") or []) if isinstance(pr, dict)}
         chosen = [pr for pr in base["side_projects"] if not by_name or pr.get("name") in by_name]
         out["projects"] = [{
