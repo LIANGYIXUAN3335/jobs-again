@@ -46,8 +46,64 @@ including like new one two three grow make take own well highly working closely 
 schedules preference periods professionally seasoned responsibly commitments diploma
 affordable entrepreneurs onsite-first generalist generalists
 teams product products platform platforms systems system service services customers users
-data月 comp pay insurance dental vision pto holidays perks culture mission值""".split())
+data月 comp pay insurance dental vision pto holidays perks culture mission值
+proposed elt machinery tracked optical sheet sheets fragile physically dimensional halt misses
+contractual less-experienced network-related att lighting productions routinely hypothesis
+installed rebuilding grit tail tails size sizes count counts multiplier relentless objective
+objectives procedure procedures revision revisions trust trusts frame frames consultative weigh
+uncover expiry expedite prerequisite prerequisites wage wages turnover disposition drops
+promotion promotions innovator tenacious scrappy gritty hungry humble resilient""".split())
+# ↑ 最后七行 = 2026-11-03 新词雷达复查扩充：周报报出过的泛英文/流程/性格词（elt 是歧义缩写，
+#   一半是 Executive Leadership Team）。形态上能判的（-ly/-ed）另由 _nounish 兜，不靠逐个点名。
 _TOKEN_RE = re.compile(r"[a-z][a-z0-9+#-]{2,29}|[a-z]?\d{3,4}[a-z]\d*")  # 含 h100/gb200；不吃点号（域名=噪音）
+_GENERIC_AFFIX = {"less", "more", "most", "well", "non", "ever", "related", "based", "driven",
+                  "oriented", "focused", "minded", "facing", "specific", "wide", "like", "ready",
+                  "friendly", "centric", "aware", "experienced"}
+
+
+def _nounish(t: str) -> bool:
+    """新词雷达只要名词形状的词（2026-11-03）：副词 -ly、过去分词 -ed 不是风向；连字符
+    复合词首尾是泛化词缀的（less-experienced / network-related）也不是。forward-deployed
+    这种真信号带连字符，不走 -ed 规则。"""
+    if "-" in t:
+        parts = t.split("-")
+        return parts[0] not in _GENERIC_AFFIX and parts[-1] not in _GENERIC_AFFIX
+    if len(t) > 4 and t.endswith("ly") and not t.endswith(("ply", "bly", "aly", "oly")):
+        return False                       # physically/routinely 出局；assembly/supply/anomaly 留
+    return not (len(t) > 4 and t.endswith("ed") and not t.endswith("eed"))
+
+
+# 哨兵岗位按短语判定（2026-11-03）：拆单词会把 "Senior Construction Scheduler, Data Center"
+# 报成新词 "center"。标题先按标点/空格连字符/介词切段，职级·泛岗位词当断点，段内连续实词取
+# 1–3 词 n-gram；key 去空格去复数尾 s，所以 Datacenter / Data Centers / data center 是同一个。
+_TITLE_SPLIT_RE = re.compile(
+    r"\s[-–—]+\s|[,;:/|()\[\]&–—]|\b(?:and|or|with|for|of|in|at|on|to|the|a|an|via|from)\b")
+_TITLE_NOISE = set("""senior sr staff principal lead junior jr mid midlevel entry level expert
+distinguished associate engineer engineers engineering software developer developers swe sde
+programmer backend frontend fullstack full stack remote hybrid onsite contract contractor
+temporary intern internship new grad team ii iii iv vi""".split())
+
+
+def _pkey(words: list[str]) -> str:
+    return "".join(w[:-1] if len(w) > 3 and w.endswith("s") and not w.endswith("ss") else w
+                   for w in words)
+
+
+def _title_phrases(title: str) -> dict[str, tuple[str, int]]:
+    """title → {key: (原样短语, 词数)}。n=1 只用来认「老 title 里见过」，判新只认 n≥2。"""
+    out: dict[str, tuple[str, int]] = {}
+    t = re.sub(r"(?<=\w)-(?=\w)", "", (title or "").lower())     # full-stack → fullstack
+    for seg in _TITLE_SPLIT_RE.split(t):
+        run: list[str] = []
+        for w in re.findall(r"[a-z0-9+#]+", seg) + [""]:
+            if len(w) > 1 and not w.isdigit() and w not in _TITLE_NOISE:
+                run.append(w)
+                continue
+            for n in (1, 2, 3):
+                for i in range(len(run) - n + 1):
+                    out.setdefault(_pkey(run[i:i + n]), (" ".join(run[i:i + n]), n))
+            run = []
+    return out
 
 
 def _themes(cfg: dict) -> dict[str, re.Pattern]:
@@ -177,21 +233,27 @@ def novel_terms(cfg: dict, rows, today: datetime.date, top: int = 20) -> list[di
 
     双口径：文档频次 + **公司数**。同一家公司的 JD 模板会在它每个岗位里重复
     （首版被 Applied Intuition 的 75 份 boilerplate 刷屏），所以一个词必须有
-    ≥4 家不同公司的新岗提到才算风向，单一公司的口头禅不算。"""
+    ≥N 家不同公司的新岗提到才算风向，单一公司的口头禅不算。
+
+    2026-11-03 再加两道门（10/05 周报报出 proposed / elt / machinery / tracked / optical /
+    sheets / fragile）：① 公司数只数 JD 正文，title 里的起名词不算；N = thresholds.
+    novel_min_cos（默认 5，原来是 title+JD ≥4）；② 扩充后的 _STOP + _nounish 只留名词形状。"""
     d14 = (today - datetime.timedelta(days=14)).isoformat()
     old_df: collections.Counter = collections.Counter()
     new_df: collections.Counter = collections.Counter()
     new_cos: dict[str, set] = collections.defaultdict(set)
     n_old = n_new = 0
     stop = _stop_set(cfg)
+    min_cos = int(_thr(cfg, "novel_min_cos", 5))
     stable_ids = {r["job_id"] for r in _stable_panel(rows, today)}
     for r in rows:
         if (r["first_seen"] or "") >= d14 and r["job_id"] not in stable_ids:
             continue                      # 新接入公司的存量回填不算「新岗」
-        toks = set(_TOKEN_RE.findall(f"{r['title'] or ''} {r['jd_text']}".lower())) - stop
+        body = set(_TOKEN_RE.findall(r["jd_text"].lower())) - stop
+        toks = body | (set(_TOKEN_RE.findall((r["title"] or "").lower())) - stop)
         if (r["first_seen"] or "") >= d14:
             new_df.update(toks); n_new += 1
-            for t in toks:
+            for t in body:
                 new_cos[t].add(r["company_norm"] or r["company"])
         else:
             old_df.update(toks); n_old += 1
@@ -199,7 +261,7 @@ def novel_terms(cfg: dict, rows, today: datetime.date, top: int = 20) -> list[di
         return []
     scored = []
     for t, c in new_df.items():
-        if c < 5 or len(new_cos[t]) < 4:   # ≥5 个新岗 且 ≥4 家公司，模板口头禅出局
+        if c < 5 or len(new_cos[t]) < min_cos or not _nounish(t):   # 模板口头禅/非名词出局
             continue
         old_rate = old_df.get(t, 0) / n_old
         new_rate = c / n_new
@@ -241,26 +303,35 @@ def company_velocity(rows, today: datetime.date, top: int = 12) -> list[dict]:
 
 def sentinel_titles(rows, today: datetime.date, top: int = 10) -> list[dict]:
     """哨兵岗位（Bloomberg 读 OpenAI 招 power-trading 岗那招）：某公司第一次出现
-    某个 title 词 = 战略动向。词须是行业通用词（≥5 家公司用过），否则是起名噪音。"""
+    某个 title 短语 = 战略动向。短语须是行业通用词（≥5 家公司的 title 用过），否则是起名噪音。
+
+    2026-11-03：只认 2–3 词短语（切法见 _title_phrases）—— 单词口径把 "Data Center" 报成
+    "center"、"Data Loss Prevention" 报成 "data"。另外只看老面板公司（_stable_panel）：
+    刚接入的和只有 LinkedIn 影子行的公司没有历史，「第一次」恒成立（11/03 实测 10 条全是）。"""
     d7 = (today - datetime.timedelta(days=7)).isoformat()
+    stable_ids = {r["job_id"] for r in _stable_panel(rows, today)}
     vocab_co: dict[str, set] = collections.defaultdict(set)
     old_by_co: dict[str, set] = collections.defaultdict(set)
     fresh = []
     for r in rows:
-        toks = set(_TOKEN_RE.findall((r["title"] or "").lower())) - _STOP
+        phrases = _title_phrases(r["title"])
         co = r["company_norm"] or r["company"]
-        for t in toks:
-            vocab_co[t].add(co)
+        for k in phrases:
+            vocab_co[k].add(co)
         if (r["first_seen"] or "") >= d7:
-            fresh.append((r, toks, co))
+            if r["job_id"] in stable_ids:
+                fresh.append((r, phrases, co))
         else:
-            old_by_co[co] |= toks
+            old_by_co[co] |= phrases.keys()
     out = []
-    for r, toks, co in fresh:
-        novel = [t for t in toks
-                 if t not in old_by_co[co] and len(vocab_co[t]) >= 5]
+    for r, phrases, co in fresh:
+        novel = [(len(vocab_co[k]), p) for k, (p, n) in phrases.items()
+                 if n >= 2 and k not in old_by_co[co] and len(vocab_co[k]) >= 5]
+        # "data loss" 和 "data loss prevention" 同时新 → 只留最长的那个
+        novel = [(c, p) for c, p in novel if not any(p != q and f" {p} " in f" {q} " for _, q in novel)]
         if novel:
-            out.append({"company": r["company"], "title": r["title"], "new_words": novel})
+            out.append({"company": r["company"], "title": r["title"],
+                        "new_words": [p for _, p in sorted(novel, reverse=True)]})
     seen = set()
     uniq = []
     for o in out:                                  # 一家公司只报最有代表性的一条
