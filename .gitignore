@@ -59,3 +59,14 @@ data/recite_lessons.md
 data/seeds/openers.json
 rough_queue.md
 data/recite/**
+
+# User-specific settings, exported records, and run artifacts.
+/config.yaml
+/config.*.yaml
+!/config.example.yaml
+/company_notes.yaml
+/resumes/*
+!/resumes/resume_base.example.yaml
+/outreach/
+/logs/
+/scratch_priors/
