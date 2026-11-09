@@ -27,6 +27,5 @@ def demo_board(_client, company, slug, *, retries):
 if __name__ == "__main__":
     cfg = config.load_config("config.example.yaml")
     cfg["companies"] = [{"name": "Demo Systems", "ats": "greenhouse", "slug": "demo-systems"}]
-    cfg["filters"] = {"role_include": ["backend", "infrastructure"]}
     with patch.dict(scan.FETCHERS, greenhouse=demo_board):
         scan.run_scan(cfg, mode="demo")

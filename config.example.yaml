@@ -12,10 +12,10 @@ http:
   reload: false
 
 weights:
-  tech: 0.35
-  product: 0.25
-  company: 0.2
-  logistics: 0.2
+  depth: 0.35
+  stability: 0.25
+  culture: 0.20
+  wlb: 0.20
 
 verdict_thresholds:
   strong: 70
@@ -82,46 +82,35 @@ eeo:
   pronouns: ""
   sponsorship: "customize-me"
 
-companies:
-  - name: ExampleCo
-    ats: greenhouse
-    slug: example
-    enabled: false
+companies: []
+
+# Add a board with keys like: {name: ExampleCo, ats: greenhouse, slug: example}
 
 filters:
-  locations_allow:
-    - United States
-    - Remote
-  locations_deny: []
-  seniority_include:
-    - software engineer
-    - backend
-    - full stack
-  seniority_exclude:
-    - staff
-    - principal
-    - director
-  title_exclude: []
-  title_include: []
-  remote_ok: true
-  sponsorship_required: false
-  drop_contract: false
+  seniority_exclude: [staff, principal, director, manager, intern, junior]
+  role_include: [engineer, developer, backend, infrastructure, member of technical staff]
+  role_exclude: [frontend, ios, machine learning, solutions engineer]
+  location:
+    non_us_signals: [amsterdam, emea, london]
 
 scoring:
-  tech_keywords: {}
-  product_keywords: {}
-  company_keywords: {}
-  logistics_keywords: {}
-  negative_keywords: {}
+  depth:
+    distributed systems: 0.8
+    kafka: 0.5
+    ledger: 0.5
+    throughput: 0.3
+    go: 0.3
+    postgresql: 0.3
+    infrastructure: 0.4
+    kubernetes: 0.4
+    terraform: 0.4
+    css: -0.4
+  stability:
+    payments: 0.4
   freshness:
     bonus: 10
     full_days: 2
     zero_days: 14
-  strong_signals: []
-  weak_signals: []
-  penalties: {}
-  boosts: {}
-  notes: ""
 
 resume_scoring:
   enabled: true
