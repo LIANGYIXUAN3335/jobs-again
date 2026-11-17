@@ -64,6 +64,7 @@ data/recite/**
 /config.yaml
 /config.*.yaml
 !/config.example.yaml
+!/config.demo.yaml
 /company_notes.yaml
 /resumes/*
 !/resumes/resume_base.example.yaml

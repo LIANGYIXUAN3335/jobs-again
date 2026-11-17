@@ -1,0 +1,6 @@
+extends: config.example.yaml
+db_path: data/demo/jobscan.db
+user_db_path: data/demo/user_state.db
+output_dirs:
+  prompts: data/demo/prompts
+  resumes: data/demo/resumes

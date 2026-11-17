@@ -12,7 +12,7 @@ Requires Python 3.11 or newer.
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-export JOBSCAN_CONFIG=config.example.yaml
+export JOBSCAN_CONFIG=config.demo.yaml
 python tools/demo_scan.py
 python -m app.web
 ```
